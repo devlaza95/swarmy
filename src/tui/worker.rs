@@ -14,7 +14,6 @@ use super::jobs::{
 };
 use super::{Msg, SystemView, Wants, debug, lock};
 use crate::app::context::Ctx;
-use crate::claude::procs::ProcTable;
 use crate::claude::registry::{self, LiveSession};
 use crate::core::harness::Harness;
 use crate::core::period::Period;
@@ -23,6 +22,7 @@ use crate::index::query::{Dim, Filter};
 use crate::index::{Index, Progress};
 use crate::limits;
 use crate::live;
+use crate::procs::ProcTable;
 
 pub(super) fn worker(
     mut ctx: Ctx,
@@ -99,6 +99,8 @@ pub(super) fn worker(
         let tick_start = Instant::now();
         let mut marks: Vec<(&str, Instant)> = Vec::new();
         ctx.now = Utc::now();
+        // One instant per tick, for the index too (reviews A-M6, B-M17).
+        idx.set_now(ctx.now);
         let tp = Instant::now();
         let want_system = lock(&wants).system;
         if let Some(s) = sys.as_mut() {
@@ -162,7 +164,7 @@ pub(super) fn worker(
                     let locked = agy_live.locked_conversations(&s.dir);
                     if !locked.is_empty() {
                         agy_live.resolve_procs(&s.dir, &locked);
-                        let metas = crate::index::agy_summaries::read_all(&s.dir);
+                        let metas = crate::agy::summaries::read_all(&s.dir);
                         live_sessions.extend(crate::agy::live::build_live_sessions(
                             &s.id, &locked, &metas, &agy_live, &ctx.procs, ctx.now,
                         ));
@@ -302,7 +304,14 @@ pub(super) fn worker(
             }
         }
         marks.push(("build+send", Instant::now()));
-        let w = lock(&wants).clone();
+        // The UI's requests, read and cleared under one lock: a request made while this pass
+        // runs stays for the next (review B-L5: three locks lost one or used a stale copy).
+        let w = {
+            let mut g = lock(&wants);
+            let w = g.clone();
+            g.refresh_analytics = false;
+            w
+        };
         let tt = Instant::now();
         // Read again only when the agent changed or the selection moved: the UI keeps the last.
         let sent = w
@@ -346,13 +355,12 @@ pub(super) fn worker(
                 }
                 jobs.done(Job::DiskSizes);
             }
-            if lock(&wants).refresh_analytics {
+            if w.refresh_analytics {
                 // A login may have just changed: re-read the seats' accounts.
                 if let Err(e) = ctx.reload_seat_info() {
                     send(Msg::Error(format!("{e:#}")));
                 }
             }
-            lock(&wants).refresh_analytics = false;
             let ta = Instant::now();
             if jobs.due(Job::DaysHeat)
                 && let Some(parts) = days_and_heat(&ctx, &idx)
@@ -580,7 +588,7 @@ fn fleet_of(
         };
         let week = limits
             .iter()
-            .find(|r| r.account_uuid == acct)
+            .find(|r| r.account.as_str() == acct)
             .and_then(|r| {
                 r.windows.iter().find(|w| {
                     w.reading.kind == crate::core::limits::WindowKind::SevenDay && !w.reset_passed
@@ -721,6 +729,7 @@ mod tests {
             own_usd_per_point: None,
             usd_per_point: None,
             reference: None,
+            reference_id: None,
             cost_in_window: Usd::ZERO,
             estimate_now: Pct::new(70.0),
             visible_points: None,

@@ -2,13 +2,12 @@
 //! (`observe`), keeping the saved copy of a mounted login current (`sync_seat`), and telling a
 //! rotated refresh token of the same grant from another login (`is_rotation`).
 
-use chrono::Utc;
-
 use super::logins::SeatSeen;
 use super::{Login, SeatLogin, SeatState, VaultTx, read_seat};
 use crate::claude::credentials::{LoginMeta, Secret};
 use crate::claude::seats::{Seat, SeatId};
 use crate::core::harness::Harness;
+use crate::core::ids::LoginId;
 
 /// Refresh tokens are issued for 30 days: a token issued after the profile was read means a new
 /// login the profile does not describe yet.
@@ -62,7 +61,7 @@ impl VaultTx<'_> {
                 if profile_at > p.profile_at || known {
                     None
                 } else {
-                    Some(Utc::now())
+                    Some(self.now)
                 }
             }
             Some(p) => p.unverified_since.filter(|_| profile_at <= p.profile_at),
@@ -157,7 +156,7 @@ impl VaultTx<'_> {
     /// takes whichever is newer (`keep_current`). Should one seat rotate the refresh token, the
     /// login follows that seat; the others then hold a token the vault no longer knows ("not
     /// saved"), which the next switch saves first like any other.
-    fn sync_seat(&mut self, seat: &Seat, s: &SeatLogin) {
+    pub(super) fn sync_seat(&mut self, seat: &Seat, s: &SeatLogin) {
         let mounted = self
             .index
             .logins
@@ -171,13 +170,23 @@ impl VaultTx<'_> {
             return;
         };
         let meta = sec.meta();
+        // A grant the vault holds already is that login, never a rotation of another one: a
+        // switch that died after writing the credentials (`.claude.json` still naming the old
+        // account) looks like a rotation otherwise, and would overwrite the old login's tokens
+        // with the other grant (review B-H1).
+        let saved = self
+            .index
+            .logins
+            .iter()
+            .find(|l| l.harness == seat.harness && l.meta.fingerprint == meta.fingerprint)
+            .map(|l| (l.id.clone(), l.label.clone()));
         match &mounted {
             Some(m) if m.meta.fingerprint == meta.fingerprint => {
                 // Same grant, maybe a fresher access token: keep the copy current.
                 self.keep_current(&m.id, sec);
                 return;
             }
-            Some(m) if is_rotation(m, &meta, s) => {
+            Some(m) if saved.is_none() && is_rotation(m, &meta, s) => {
                 self.keep_current(&m.id, sec);
                 self.journal(&format!(
                     "seat={}: the refresh token of '{}' was rotated; the saved login follows it",
@@ -196,12 +205,6 @@ impl VaultTx<'_> {
             }
             None => {}
         }
-        let saved = self
-            .index
-            .logins
-            .iter()
-            .find(|l| l.harness == seat.harness && l.meta.fingerprint == meta.fingerprint)
-            .map(|l| (l.id.clone(), l.label.clone()));
         if let Some((id, label)) = saved {
             self.mount(&id, &seat.id);
             self.keep_current(&id, sec);
@@ -215,7 +218,7 @@ impl VaultTx<'_> {
     /// The saved copy of `id` takes the seat's tokens when they are newer: a rotated grant, or an
     /// access token that expires later. Two seats sharing a grant each refresh their own access
     /// token; taking any differing copy would rewrite the vault (and its backups) back and forth.
-    fn keep_current(&mut self, id: &str, sec: &Secret) {
+    fn keep_current(&mut self, id: &LoginId, sec: &Secret) {
         let saved = self.secret(id);
         if saved.as_ref() == Some(sec) {
             return;
@@ -236,7 +239,7 @@ impl VaultTx<'_> {
             self.set_secret(id, sec);
             if let Some(l) = self.index.find_mut(id) {
                 l.meta = sec.meta();
-                l.updated_at = Utc::now();
+                l.updated_at = self.now;
             }
         }
     }

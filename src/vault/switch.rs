@@ -9,6 +9,7 @@ use crate::claude::config_json;
 use crate::claude::credentials;
 use crate::claude::seats::{Seat, SeatId};
 use crate::core::harness::Harness;
+use crate::core::ids::LoginId;
 
 /// How many times a switch starts again because Claude Code rewrote the seat's credentials
 /// between swarmy saving them and replacing them.
@@ -28,7 +29,8 @@ impl VaultTx<'_> {
     /// vault and the seat never disagree about which grant is where (and [`VaultTx::sync`]
     /// repairs the same after a crash between the two writes).
     pub fn switch(&mut self, seat: &Seat, login_key: &str) -> anyhow::Result<SwitchReport> {
-        self.switch_in(seat, login_key, false)
+        let target = self.target_for(seat, login_key)?;
+        self.switch_in(seat, &target.id, false)
     }
 
     /// The login `login_key` names for `seat`: a label names one login per harness, the seat's
@@ -45,7 +47,13 @@ impl VaultTx<'_> {
     /// another of `seats` moves instead of being refused: that seat takes the login `seat` held
     /// (the two swap), or is left without one when `seat` held none (its copy stays saved). The
     /// other seat's copy is saved first: it is the newest (Codex refreshes in place). Nothing may
-    /// run in either seat (the callers check).
+    /// run in any of the seats: checked here, under the vault lock, right before the writes.
+    ///
+    /// The order keeps every single-use token in one seat at most, whichever step fails (reviews
+    /// A-H2, B-M1): the seats the login moves out of are emptied first (each saved from the very
+    /// text that is removed), then the login goes into `seat` (whose own login is saved), then
+    /// that login goes into the first seat emptied. A failure after a seat was emptied is a
+    /// [`VaultError::SwitchIncomplete`] that says which seat is empty; the vault records it.
     pub fn switch_moving(
         &mut self,
         seat: &Seat,
@@ -65,6 +73,9 @@ impl VaultTx<'_> {
         if seat.harness.shares_logins() || others.is_empty() || !all_at_hand {
             return self.switch(seat, login_key);
         }
+        for s in std::iter::once(seat).chain(&others) {
+            ensure_idle(s)?;
+        }
         // The seat's own login, saved first: it goes to the other seat.
         self.sync(std::slice::from_ref(seat))?;
         let (prev, saved_now) = match read_seat(seat)?.secret {
@@ -75,55 +86,112 @@ impl VaultTx<'_> {
             }
             None => (None, false),
         };
-        self.sync(&others)?;
-        let mut rep = self.switch_in(seat, &target.id, true)?;
+        let mut emptied: Vec<&Seat> = Vec::new();
+        for o in &others {
+            if let Err(e) = self.clear_seat(o) {
+                return Err(self.move_incomplete(seat, &emptied, e));
+            }
+            emptied.push(o);
+        }
+        let mut rep = match self.switch_in(seat, &target.id, true) {
+            Ok(r) => r,
+            Err(e) => return Err(self.move_incomplete(seat, &emptied, e)),
+        };
         if saved_now {
-            rep.auto_saved = prev.as_deref().and_then(|p| self.index.label_of(p));
+            rep.auto_saved = prev.as_ref().and_then(|p| self.index.label_of(p));
         }
         for (i, o) in others.iter().enumerate() {
-            match prev.as_deref().filter(|p| *p != target.id && i == 0) {
+            match prev.as_ref().filter(|p| **p != target.id && i == 0) {
                 Some(p) => {
-                    self.switch_in(o, p, true)?;
+                    if let Err(e) = self.switch_in(o, p, true) {
+                        return Err(self.move_incomplete(seat, &emptied[i..], e));
+                    }
                     rep.moved.push((o.label.clone(), self.index.label_of(p)));
                 }
-                None => {
-                    self.clear_seat(o)?;
-                    rep.moved.push((o.label.clone(), None));
-                }
+                None => rep.moved.push((o.label.clone(), None)),
             }
         }
         rep.shared_with.clear();
         Ok(rep)
     }
 
-    /// Takes the login out of `seat` (after a backup): its copy is in the vault already.
-    fn clear_seat(&mut self, seat: &Seat) -> anyhow::Result<()> {
-        let path = seat.credentials_file();
-        let text = store::read_optional(&path)?;
-        let bdir = self.seat_backups(seat)?;
-        let name = match path.file_name() {
-            Some(n) => n.to_string_lossy().into_owned(),
-            None => "login".to_string(),
-        };
-        store::backup(&bdir, &[(name.as_str(), text.as_deref())], SEAT_BACKUPS)?;
-        if !store::replace_if_unchanged(&path, text.as_deref(), None)? {
-            return Err(VaultError::SeatBusy(path).into());
+    /// A move that stopped after `emptied` lost their login: the vault is saved as the seats
+    /// are now (`edit` would drop it with the error), and the error says which seats are empty.
+    fn move_incomplete(
+        &mut self,
+        seat: &Seat,
+        emptied: &[&Seat],
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        if emptied.is_empty() {
+            return err;
         }
-        for l in &mut self.index.logins {
-            l.mounted.retain(|m| *m != seat.id);
+        let saved = self.save();
+        let names: Vec<&str> = emptied.iter().map(|s| s.label.as_str()).collect();
+        let mut what = format!(
+            "{err:#}; seat {} is left without a login (its login is saved in the vault)",
+            names.join(", ")
+        );
+        if let Err(e) = saved {
+            what.push_str(&format!("; the vault was not saved ({e:#})"));
         }
-        self.index.seats.remove(&seat.id);
-        self.journal(&format!("clear seat={}", seat.label));
-        Ok(())
+        self.journal(&format!("move to seat={} incomplete: {what}", seat.label));
+        VaultError::SwitchIncomplete {
+            seat: seat.label.clone(),
+            what,
+        }
+        .into()
     }
 
+    /// Takes the login out of `seat` (after a backup). Its newest copy is saved first, read from
+    /// the very text that is then removed: a refresh after that read makes the removal refuse
+    /// and start again, so no token is deleted unsaved (review B-M2).
+    fn clear_seat(&mut self, seat: &Seat) -> anyhow::Result<()> {
+        let path = seat.credentials_file();
+        for _ in 0..SWITCH_ATTEMPTS {
+            let text = store::read_optional(&path)?;
+            let now = read_seat(seat)?;
+            if store::read_optional(&path)? != text {
+                continue;
+            }
+            self.sync_seat(seat, &now);
+            self.save()?;
+            let bdir = self.seat_backups(seat)?;
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => "login".to_string(),
+            };
+            store::backup(&bdir, &[(name.as_str(), text.as_deref())], SEAT_BACKUPS)?;
+            #[cfg(test)]
+            super::tests::hooks::before_seat_write();
+            if !store::replace_if_unchanged(&path, text.as_deref(), None)? {
+                continue;
+            }
+            for l in &mut self.index.logins {
+                l.mounted.retain(|m| *m != seat.id);
+            }
+            self.index.seats.remove(&seat.id);
+            self.journal(&format!("clear seat={}", seat.label));
+            return Ok(());
+        }
+        Err(VaultError::SeatBusy(path).into())
+    }
+
+    /// The switch itself, of a login named by its id: the user's words (a label, an email) are
+    /// resolved before (`target_for`), never inside (review B-M5).
     fn switch_in(
         &mut self,
         seat: &Seat,
-        login_key: &str,
+        login: &LoginId,
         moving: bool,
     ) -> anyhow::Result<SwitchReport> {
-        let target = self.target_for(seat, login_key)?;
+        let target = self
+            .index
+            .logins
+            .iter()
+            .find(|l| l.id == *login)
+            .cloned()
+            .ok_or_else(|| VaultError::NoLogin(login.to_string()))?;
         if target.harness != seat.harness {
             return Err(VaultError::WrongHarness {
                 login: target.label,
@@ -150,6 +218,7 @@ impl VaultTx<'_> {
         let secret = self
             .secret(&target.id)
             .ok_or_else(|| VaultError::MissingSecret(target.label.clone()))?;
+        ensure_idle(seat)?;
         let mut auto_saved: Option<String> = None;
         for _ in 0..SWITCH_ATTEMPTS {
             // 1. Save what the seat holds now, on disk before the seat is overwritten.
@@ -177,7 +246,7 @@ impl VaultTx<'_> {
             if auto_saved.is_none() && !known_before {
                 auto_saved = previous.as_ref().and_then(|id| self.index.label_of(id));
             }
-            if previous.as_deref() == Some(target.id.as_str()) {
+            if previous.as_ref() == Some(&target.id) {
                 return Ok(SwitchReport {
                     auto_saved: None,
                     seat: seat.label.clone(),
@@ -257,7 +326,7 @@ impl VaultTx<'_> {
                 .and_then(|a| a.profile_fetched_at);
             // Without a saved profile, `.claude.json` still names the previous account: the
             // seat's account is unknown until Claude Code reads the new login's profile.
-            let now = chrono::Utc::now();
+            let now = self.now;
             // An agy token file names its own account.
             let known_profile = target.account_uuid.is_some()
                 && (matches!(seat.harness, Harness::Agy | Harness::Codex)
@@ -295,9 +364,9 @@ impl VaultTx<'_> {
 
     /// Records `id` as the login in `seat` (a seat holds one login; the login may be in other
     /// seats as well).
-    pub(super) fn mount(&mut self, id: &str, seat: &SeatId) {
+    pub(super) fn mount(&mut self, id: &LoginId, seat: &SeatId) {
         for l in &mut self.index.logins {
-            if l.id != id {
+            if l.id != *id {
                 l.mounted.retain(|m| m != seat);
             }
         }
@@ -356,6 +425,48 @@ impl VaultTx<'_> {
         }
         .into()
     }
+}
+
+/// Refuses a switch into a Codex seat where Codex runs: it keeps the login it loaded and would
+/// write a refresh of it back, spending the single-use refresh token the vault holds. Looked at
+/// by the vault itself, under its lock, right before the writes; the callers' own looks are
+/// hints only (reviews A-H3, B-M3: they looked when a dialog opened, and saw threads only).
+fn ensure_idle(seat: &Seat) -> Result<(), VaultError> {
+    if seat.harness != Harness::Codex {
+        return Ok(());
+    }
+    let (threads, procs) = codex_running(seat);
+    if threads == 0 && procs == 0 {
+        return Ok(());
+    }
+    Err(VaultError::HarnessRunning {
+        seat: seat.label.clone(),
+        harness: seat.harness.display_name().into(),
+        what: if threads > 0 {
+            format!("{threads} open thread(s)")
+        } else {
+            format!("{procs} process(es)")
+        },
+    })
+}
+
+/// Open threads (writer locks held) and `codex` processes whose home is `seat`.
+fn codex_running(seat: &Seat) -> (usize, usize) {
+    #[cfg(test)]
+    if let Some(n) = super::tests::hooks::codex_running(seat) {
+        return n;
+    }
+    let threads = crate::codex::live::open_threads_once(&seat.dir).len();
+    let procs = crate::procs::ProcTable::snapshot()
+        .codex
+        .iter()
+        .filter(|p| {
+            p.home
+                .as_deref()
+                .is_some_and(|h| crate::fsutil::canonical(h).is_ok_and(|h| h == seat.dir))
+        })
+        .count();
+    (threads, procs)
 }
 
 #[derive(Debug)]

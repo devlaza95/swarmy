@@ -1,7 +1,7 @@
 //! Conversation metadata for Google Antigravity (`agy`): titles, workspace URIs (cwds),
 //! run status and parent-child subagent links.
 //!
-//! SQLite reads of `conversation_summaries.db` live in `index::agy_summaries` (the crate
+//! SQLite reads of `conversation_summaries.db` live in `agy::summaries` (the crate
 //! keeps all SQL inside `src/index/`); this module holds the shared types, URI decoding, tree
 //! resolution and the JSON fallback (`cache/conversation_metadata.json`).
 
@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::claude::files::{AgentMeta, FileKind, TranscriptFile};
 use crate::core::harness::Harness;
 use crate::core::ids::SeatId;
+use crate::model::files::{AgentMeta, FileKind, TranscriptFile};
 
 /// Live run state reported by Antigravity in `conversation_summaries.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

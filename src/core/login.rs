@@ -47,7 +47,16 @@ impl Secret {
     pub fn meta(&self) -> LoginMeta {
         LoginMeta::of(self.harness, &self.value)
     }
+
+    /// Whether it holds a token at all: a file without one names no grant, and is no login
+    /// (review B-M5: two tokenless secrets got the id `lnone` and one replaced the other).
+    pub fn has_token(&self) -> bool {
+        self.meta().fingerprint != NO_TOKEN
+    }
 }
+
+/// The fingerprint of a secret without any token ([`Secret::has_token`]).
+pub const NO_TOKEN: &str = "none";
 
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -113,7 +122,7 @@ fn claude_meta(v: &Value) -> LoginMeta {
         .and_then(Value::as_str)
         .or_else(|| v.get("accessToken").and_then(Value::as_str));
     LoginMeta {
-        fingerprint: token.map(fingerprint).unwrap_or_else(|| "none".into()),
+        fingerprint: token.map(fingerprint).unwrap_or_else(|| NO_TOKEN.into()),
         subscription_type: s("subscriptionType"),
         rate_limit_tier: s("rateLimitTier"),
         access_expires_at: t("expiresAt"),
@@ -142,7 +151,7 @@ fn agy_meta(v: &Value) -> LoginMeta {
         fingerprint: s("refresh_token")
             .or_else(|| s("access_token"))
             .map(fingerprint)
-            .unwrap_or_else(|| "none".into()),
+            .unwrap_or_else(|| NO_TOKEN.into()),
         subscription_type: v
             .get("auth_method")
             .and_then(Value::as_str)
@@ -182,7 +191,7 @@ fn codex_meta(v: &Value) -> LoginMeta {
             .or_else(|| s("access_token"))
             .or(api_key)
             .map(fingerprint)
-            .unwrap_or_else(|| "none".into()),
+            .unwrap_or_else(|| NO_TOKEN.into()),
         subscription_type: id
             .get("https://api.openai.com/auth")
             .and_then(|a| a.get("chatgpt_plan_type"))

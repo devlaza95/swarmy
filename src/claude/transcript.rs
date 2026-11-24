@@ -5,7 +5,6 @@
 //! never stops the file. Large records (tool results, request blobs) are skipped without being
 //! materialised where possible.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
@@ -16,96 +15,7 @@ use serde_json::value::RawValue;
 
 use crate::core::tools::ToolClass;
 use crate::core::usage::Usage;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolUse {
-    pub id: String,
-    pub name: String,
-    /// One line describing the call: the command, the file, the pattern…
-    pub summary: String,
-    /// The file a Read/Edit/Write call touches.
-    pub target: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Request {
-    pub msg_id: String,
-    pub request_id: Option<String>,
-    pub ts: DateTime<Utc>,
-    pub model: String,
-    pub requested_model: Option<String>,
-    pub effort: Option<String>,
-    pub fast: bool,
-    pub usage: Usage,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub agent_id: Option<String>,
-    pub tool_uses: Vec<ToolUse>,
-    pub stop_reason: Option<String>,
-    /// The beginning of the last text block, for activity display.
-    pub text: Option<String>,
-    pub thinking: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum TitleKind {
-    Custom,
-    Ai,
-    AgentName,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "short-lived parse output; boxing every request costs more than it saves"
-)]
-pub enum Event {
-    Request(Request),
-    ToolResult {
-        tool_use_id: String,
-        ts: Option<DateTime<Utc>>,
-        is_error: bool,
-    },
-    /// A prompt typed by the human.
-    Prompt {
-        ts: Option<DateTime<Utc>>,
-        text: String,
-    },
-    /// `session-owner`: the account (and organization) this session runs under from here on.
-    Owner {
-        account: crate::core::ids::AccountId,
-    },
-    Title {
-        kind: TitleKind,
-        text: String,
-    },
-    TurnEnd {
-        ts: Option<DateTime<Utc>>,
-        duration_ms: u64,
-        pending_background: u64,
-    },
-    Compact {
-        ts: Option<DateTime<Utc>>,
-    },
-    AgentLaunch {
-        ts: Option<DateTime<Utc>>,
-        tool_use_id: Option<String>,
-        agent_id: String,
-        status: Option<String>,
-    },
-    /// An API error shown to the user (rate limit, auth, overload…).
-    ApiError {
-        ts: Option<DateTime<Utc>>,
-        kind: String,
-        text: String,
-    },
-    /// Claude Code's own running cost total for the process (`cost-state`), including background
-    /// calls (titles, summaries) that never appear as transcript records.
-    CostState {
-        total_usd: f64,
-        models: Vec<(String, f64)>,
-    },
-}
+pub use crate::model::event::{Chunk, Event, MALFORMED, ParseStats, Request, TitleKind, ToolUse};
 
 /// Record types that carry nothing this tool needs; skipped without parsing.
 const SKIP: &[&str] = &[
@@ -142,6 +52,7 @@ struct RawRecord<'a> {
     kind: Option<String>,
     subtype: Option<String>,
     timestamp: Option<String>,
+    uuid: Option<String>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
     cwd: Option<String>,
@@ -192,12 +103,26 @@ struct RawMessage<'a> {
     stop_reason: Option<String>,
 }
 
+/// A token count written as `null` reads as 0: `#[serde(default)]` covers a missing key only,
+/// and one `null` made the whole record malformed, its spend gone (review B-M22).
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
+}
+
+/// An assistant record with usage but no message id or no timestamp: it cannot be counted, so
+/// it is counted here instead (`doctor` lists it), never dropped silently (review B-M22).
+pub const UNUSABLE: &str = "(assistant without id or timestamp)";
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawUsage {
+    #[serde(deserialize_with = "null_as_zero")]
     input_tokens: u64,
+    #[serde(deserialize_with = "null_as_zero")]
     output_tokens: u64,
+    #[serde(deserialize_with = "null_as_zero")]
     cache_creation_input_tokens: u64,
+    #[serde(deserialize_with = "null_as_zero")]
     cache_read_input_tokens: u64,
     cache_creation: Option<RawCacheCreation>,
     output_tokens_details: Option<RawOutputDetails>,
@@ -208,19 +133,23 @@ struct RawUsage {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawCacheCreation {
+    #[serde(deserialize_with = "null_as_zero")]
     ephemeral_5m_input_tokens: u64,
+    #[serde(deserialize_with = "null_as_zero")]
     ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawOutputDetails {
+    #[serde(deserialize_with = "null_as_zero")]
     thinking_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawServerTools {
+    #[serde(deserialize_with = "null_as_zero")]
     web_search_requests: u64,
 }
 
@@ -319,19 +248,6 @@ fn summarize_tool(name: &str, input: Option<&RawValue>) -> (String, Option<Strin
     (summary, target)
 }
 
-/// Statistics of a parse, for `doctor` (format-drift detection).
-#[derive(Debug, Default, Clone)]
-pub struct ParseStats {
-    pub lines: u64,
-    pub malformed: u64,
-    pub by_type: BTreeMap<String, u64>,
-}
-
-/// The name under which the index keeps a file's count of damaged records (next to its record
-/// types): lines that were no JSON record, and records with numbers out of range. What they held
-/// is not counted, and `doctor` says so.
-pub const MALFORMED: &str = "(malformed line)";
-
 const KNOWN: &[&str] = &[
     "assistant",
     "user",
@@ -346,6 +262,7 @@ const KNOWN: &[&str] = &[
 
 impl ParseStats {
     /// Record types neither handled nor deliberately skipped: a sign the format moved on.
+    #[cfg(test)]
     pub fn unknown_types(&self) -> Vec<(&str, u64)> {
         self.by_type
             .iter()
@@ -357,6 +274,11 @@ impl ParseStats {
             .map(|(k, v)| (k.as_str(), *v))
             .collect()
     }
+}
+
+/// Whether this reader knows a record type (reads it, or skips it on purpose).
+pub fn is_known_type(t: &str) -> bool {
+    KNOWN.contains(&t) || SKIP.contains(&t) || t == MALFORMED
 }
 
 pub fn parse_line(line: &str, out: &mut Vec<Event>, stats: &mut ParseStats) {
@@ -379,7 +301,11 @@ pub fn parse_line(line: &str, out: &mut Vec<Event>, stats: &mut ParseStats) {
     *stats.by_type.entry(kind.to_string()).or_default() += 1;
     let ts = parse_ts(r.timestamp.as_deref());
     match kind {
-        "assistant" => parse_assistant(r, ts, out),
+        "assistant" => {
+            if !parse_assistant(r, ts, out) {
+                *stats.by_type.entry(UNUSABLE.to_string()).or_default() += 1;
+            }
+        }
         "user" => parse_user(r, ts, out),
         "system" => match r.subtype.as_deref() {
             Some("turn_duration") => out.push(Event::TurnEnd {
@@ -448,8 +374,9 @@ pub fn parse_line(line: &str, out: &mut Vec<Event>, stats: &mut ParseStats) {
     }
 }
 
-fn parse_assistant(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>) {
-    let Some(msg) = r.message else { return };
+/// Whether the record could be read (false: a response without id or timestamp).
+fn parse_assistant(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>) -> bool {
+    let Some(msg) = r.message else { return true };
     let blocks: Vec<RawBlock> = msg
         .content
         .and_then(|c| serde_json::from_str(c.get()).ok())
@@ -464,11 +391,12 @@ fn parse_assistant(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>
             ts,
             kind: r.error.unwrap_or_else(|| "api_error".into()),
             text,
+            id: r.uuid,
         });
-        return;
+        return true;
     }
     let (Some(msg_id), Some(ts)) = (msg.id, ts) else {
-        return;
+        return false;
     };
     let u = msg.usage.unwrap_or_default();
     let cc = u.cache_creation.unwrap_or_default();
@@ -536,6 +464,7 @@ fn parse_assistant(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>
         text,
         thinking,
     }));
+    true
 }
 
 fn parse_user(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>) {
@@ -564,13 +493,13 @@ fn parse_user(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>) {
                     .filter_map(|b| b.text.as_deref())
                     .collect::<Vec<_>>()
                     .join(" ");
-                push_prompt(ts, &text, out);
+                push_prompt(ts, &text, r.uuid.clone(), out);
             }
         } else if let Ok(text) = serde_json::from_str::<String>(c.get())
             && !r.is_meta
             && r.tool_use_result.is_none()
         {
-            push_prompt(ts, &text, out);
+            push_prompt(ts, &text, r.uuid.clone(), out);
         }
     }
     if let Some(res) = r.tool_use_result
@@ -586,7 +515,7 @@ fn parse_user(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>) {
     }
 }
 
-fn push_prompt(ts: Option<DateTime<Utc>>, text: &str, out: &mut Vec<Event>) {
+fn push_prompt(ts: Option<DateTime<Utc>>, text: &str, id: Option<String>, out: &mut Vec<Event>) {
     let t = text.trim_start();
     // Injected by the harness, not typed by a person.
     let injected = [
@@ -603,16 +532,8 @@ fn push_prompt(ts: Option<DateTime<Utc>>, text: &str, out: &mut Vec<Event>) {
     out.push(Event::Prompt {
         ts,
         text: truncate(t, 200),
+        id,
     });
-}
-
-/// The result of reading a file from an offset.
-#[derive(Debug, Default)]
-pub struct Chunk {
-    pub events: Vec<Event>,
-    /// Byte offset just past the last complete line read.
-    pub end: u64,
-    pub stats: ParseStats,
 }
 
 /// Reads complete lines from `offset` to the end. A last line without a newline is still being
@@ -648,6 +569,23 @@ pub fn read_from(path: &Path, offset: u64) -> std::io::Result<Chunk> {
 pub struct Tail {
     pub owner: Option<crate::core::ids::AccountId>,
     pub last_response: Option<DateTime<Utc>>,
+}
+
+/// The last text response in the tail of a transcript (the AGENT card).
+pub fn last_message(path: &Path) -> Option<String> {
+    let buf = crate::fsutil::tail_lines(path, 256 * 1024).ok()?;
+    let mut events = Vec::new();
+    let mut stats = ParseStats::default();
+    for line in buf.lines() {
+        parse_line(line, &mut events, &mut stats);
+    }
+    events.iter().rev().find_map(|e| {
+        if let Event::Request(r) = e {
+            r.text.clone()
+        } else {
+            None
+        }
+    })
 }
 
 /// Reads the end of a transcript: 64 KiB, then four times more each step up to `max` bytes,
@@ -881,6 +819,25 @@ mod tests {
         assert_eq!(ev.len(), 5);
         assert_eq!(st.malformed, 1);
         assert_eq!(st.unknown_types(), vec![("brand-new-thing", 1)]);
+    }
+
+    /// Review B-M22: a `null` count reads as 0 (the record and its spend are kept); a response
+    /// without a message id is counted as unusable, never dropped silently.
+    #[test]
+    fn null_counts_and_responses_without_id_are_not_lost() {
+        let mut out = Vec::new();
+        let mut stats = ParseStats::default();
+        let with_null = r#"{"type":"assistant","timestamp":"2026-11-20T10:00:00Z","message":{"id":"m1","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":null,"cache_read_input_tokens":0}}}"#;
+        parse_line(with_null, &mut out, &mut stats);
+        assert_eq!(stats.malformed, 0);
+        assert!(
+            matches!(&out[..], [Event::Request(r)] if r.usage.input == 10 && r.usage.cache_write_5m == 0)
+        );
+        let no_id = r#"{"type":"assistant","timestamp":"2026-11-20T10:00:00Z","message":{"model":"claude-opus-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        parse_line(no_id, &mut out, &mut stats);
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.by_type.get(UNUSABLE), Some(&1));
+        assert!(!is_known_type(UNUSABLE), "doctor lists it");
     }
 
     #[test]

@@ -232,6 +232,41 @@ mod tests {
         }
     }
 
+    /// Review B-M10: a hot refresh that does not know a file's seat (a harness disabled, a seat
+    /// found only through another process's environment) leaves the file alone. It used to read
+    /// a Codex rollout with Claude Code's parser and move the offset past the new spend.
+    #[test]
+    fn a_hot_refresh_leaves_files_of_an_unknown_seat_alone() {
+        let (_dir, seats, info, mut idx, rollout) = world();
+        let offset = |idx: &Index| {
+            crate::index::scenarios::dump(
+                idx,
+                &format!(
+                    "SELECT offset FROM files WHERE path = '{}'",
+                    rollout.display()
+                ),
+            )
+        };
+        let before = offset(&idx);
+        append(
+            &rollout,
+            &response("2026-10-01T10:05:00Z", 140_000, 130_000, 1_000, 398_000),
+        );
+        let claude_only = &seats[..1];
+        let mut res = Resolver::new(Vec::new());
+        idx.refresh_hot(claude_only, &[], &info, &mut res, &PriceBook::builtin())
+            .unwrap();
+        assert_eq!(offset(&idx), before);
+        // The full refresh that knows the seat then reads the new response.
+        idx.refresh(&seats, &info, &mut res, &PriceBook::builtin(), &mut |_| {})
+            .unwrap();
+        let codex_only = Filter {
+            harness: Some(Harness::Codex),
+            ..Default::default()
+        };
+        assert_eq!(idx.total(oct1(), &codex_only).unwrap().requests, 3);
+    }
+
     #[test]
     fn codex_spend_is_counted_once_per_response_and_joins_the_project() {
         let (_dir, seats, info, mut idx, rollout) = world();

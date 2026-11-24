@@ -30,6 +30,13 @@ pub struct Pct(f64);
 #[repr(transparent)]
 pub struct UsdPerPct(f64);
 
+/// A pace of utilization: points of a limit per hour. Its own type, so a percent and a pace
+/// cannot change places (review B-M12: `eta(current, points_per_hour)` took two `f64`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct PctPerHour(f64);
+
 macro_rules! scalar {
     ($t:ident) => {
         impl $t {
@@ -139,15 +146,58 @@ impl UsdPerPct {
         self.0
     }
 
-    /// The rate from spend that moved the limit by `points` (`None` below one point or without
-    /// spend: too little to tell).
+    /// Visible spend below which one reading says nothing about the rate: an account used
+    /// mostly elsewhere (claude.ai) reads 40% with cents spent here, and a rate of cents per
+    /// point turned the next dollars into thousands of percent (review B-H2).
+    pub const MIN_CALIBRATION_SPEND: Usd = Usd::new(1.0);
+
+    /// The rate from spend that moved the limit by `points` (`None` below one point or below
+    /// [`UsdPerPct::MIN_CALIBRATION_SPEND`]: too little to tell).
     pub fn measured(spend: Usd, points: Pct) -> Option<UsdPerPct> {
-        (points.0 >= 1.0 && spend.0 > 0.0).then(|| UsdPerPct(spend.0 / points.0))
+        (points.0 >= 1.0 && spend.0 >= Self::MIN_CALIBRATION_SPEND.0)
+            .then(|| UsdPerPct(spend.0 / points.0))
     }
 
     /// Whether it can convert at all (finite and above zero).
     pub fn is_usable(self) -> bool {
         self.0.is_finite() && self.0 > 0.0
+    }
+}
+
+impl PctPerHour {
+    pub const fn new(v: f64) -> PctPerHour {
+        PctPerHour(v)
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+
+    /// The pace of a burn rate, converted at `rate`.
+    pub fn of_burn(usd_per_hour: Usd, rate: UsdPerPct) -> PctPerHour {
+        PctPerHour(usd_per_hour.0 / rate.0)
+    }
+
+    /// Hours until `points` more are used at this pace (`None` at no pace to speak of).
+    pub fn hours_for(self, points: Pct) -> Option<f64> {
+        (self.0.is_finite() && self.0 > 1e-9).then(|| points.0.max(0.0) / self.0)
+    }
+
+    /// Points used over `hours` at this pace.
+    pub fn over(self, hours: f64) -> Pct {
+        Pct(self.0 * hours)
+    }
+}
+
+impl std::fmt::Display for PctPerHour {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<PctPerHour> for f64 {
+    fn from(v: PctPerHour) -> f64 {
+        v.0
     }
 }
 
@@ -201,6 +251,7 @@ mod tests {
         assert_eq!(Pct::new(100.0) * r, Usd::new(300.0));
         assert_eq!(UsdPerPct::measured(Usd::new(30.0), Pct::new(0.5)), None);
         assert_eq!(UsdPerPct::measured(Usd::ZERO, Pct::new(10.0)), None);
+        assert_eq!(UsdPerPct::measured(Usd::new(0.004), Pct::new(40.0)), None);
         let total: Usd = [Usd::new(1.5), Usd::new(2.5)].iter().sum();
         assert_eq!(total, Usd::new(4.0));
         assert_eq!(Usd::new(1.0) / Usd::new(4.0), 0.25);

@@ -108,13 +108,22 @@ impl Span {
 }
 
 /// The UTC instant of the local midnight that starts day `d` (a quarter hour in every zone).
+/// The one rule for "today" (review B-M20: the dashboard's own copies fell back to `now` on a
+/// day whose midnight does not exist, and showed today's spend as about $0).
 pub fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
+    local_midnight_in(d, &Local)
+}
+
+/// [`local_midnight`] in zone `tz`. Where DST starts at midnight (Chile, Cuba, Paraguay) the
+/// day starts at the first local time that exists.
+pub fn local_midnight_in<Tz: TimeZone>(d: NaiveDate, tz: &Tz) -> DateTime<Utc> {
     let naive = d.and_time(chrono::NaiveTime::MIN);
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .unwrap_or_else(|| Local.from_utc_datetime(&naive))
-        .with_timezone(&Utc)
+    (0..=4)
+        .find_map(|q| {
+            tz.from_local_datetime(&(naive + Duration::minutes(15 * q)))
+                .earliest()
+        })
+        .map_or_else(|| naive.and_utc(), |t| t.with_timezone(&Utc))
 }
 
 impl Period {
@@ -184,6 +193,16 @@ impl Period {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_midnight_in_a_fixed_zone() {
+        let kyiv = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        assert_eq!(
+            local_midnight_in(d, &kyiv).to_rfc3339(),
+            "2026-11-23T22:00:00+00:00"
+        );
+    }
 
     #[test]
     fn parses() {

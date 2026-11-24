@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-pub use crate::core::login::{LoginMeta, Secret, fingerprint};
+pub use crate::core::login::{LoginMeta, Secret};
 
 /// Extracts `claudeAiOauth` from the text of a credentials file or of a backup holding just
 /// `{"claudeAiOauth": {...}}`.
@@ -13,7 +13,8 @@ pub fn parse_login(text: &str) -> anyhow::Result<Option<Secret>> {
     Ok(v.get("claudeAiOauth")
         .filter(|x| x.is_object())
         .cloned()
-        .map(Secret::new))
+        .map(Secret::new)
+        .filter(Secret::has_token))
 }
 
 /// Puts `login` into the credentials file text, keeping every other key (`mcpOAuth` tokens belong
@@ -40,7 +41,7 @@ mod tests {
     fn parses_meta_without_exposing_tokens() {
         let s = parse_login(CREDS).unwrap().unwrap();
         let m = s.meta();
-        assert_eq!(m.fingerprint, fingerprint("sk-r"));
+        assert_eq!(m.fingerprint, crate::core::login::fingerprint("sk-r"));
         assert_eq!(m.fingerprint.len(), 16);
         assert_eq!(m.subscription_type.as_deref(), Some("max"));
         assert!(m.refresh_expires_at.is_some());

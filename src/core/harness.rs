@@ -112,6 +112,44 @@ impl Harness {
         }
     }
 
+    /// Files and dirs that only this harness writes into its config dir. Shared names (Claude
+    /// Code and Codex both write `sessions/` and `history.jsonl`) are no evidence.
+    pub fn markers(self) -> &'static [&'static str] {
+        match self {
+            Harness::Claude => &["projects", ".credentials.json", ".claude.json"],
+            Harness::Agy => &[
+                "conversation_summaries.db",
+                "presence",
+                "antigravity-oauth-token",
+                "jetski_state.pbtxt",
+                "brain",
+            ],
+            Harness::Codex => &[
+                "session_index.jsonl",
+                "auth.json",
+                "version.json",
+                "models_cache.json",
+                "thread-writer-locks",
+            ],
+        }
+    }
+
+    /// The harness that wrote a config dir, judged by its [`Harness::markers`] (`has` says
+    /// whether the dir holds a file or dir of that name). A dir with no marker is a Claude Code
+    /// seat (what a `[[seat]]` without `harness` meant first); markers of several harnesses are
+    /// ambiguous, and `Err` names them.
+    pub fn detect(has: impl Fn(&str) -> bool) -> Result<Harness, Vec<Harness>> {
+        let found: Vec<Harness> = Harness::ALL
+            .into_iter()
+            .filter(|h| h.markers().iter().any(|m| has(m)))
+            .collect();
+        match found.as_slice() {
+            [] => Ok(Harness::Claude),
+            [h] => Ok(*h),
+            [_, _, ..] => Err(found),
+        }
+    }
+
     /// Whether this harness deletes old transcripts automatically (constraining `keep_raw_days`).
     pub fn has_transcript_retention(self) -> bool {
         match self {
@@ -148,5 +186,47 @@ mod tests {
         assert!(!Harness::Agy.supports_limits());
         assert!(!Harness::Agy.supports_statusline());
         assert!(!Harness::Agy.has_transcript_retention());
+    }
+
+    fn dir(files: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |f| files.contains(&f)
+    }
+
+    #[test]
+    fn a_dir_is_judged_by_the_files_only_its_harness_writes() {
+        // What a used Claude Code config dir holds: `sessions/` and `history.jsonl` too, which
+        // Codex also writes (review: such a `[[seat]]` was read as a Codex home).
+        let claude = dir(&["projects", "sessions", "history.jsonl", "settings.json"]);
+        assert_eq!(Harness::detect(claude), Ok(Harness::Claude));
+        let codex = dir(&[
+            "sessions",
+            "history.jsonl",
+            "session_index.jsonl",
+            "auth.json",
+        ]);
+        assert_eq!(Harness::detect(codex), Ok(Harness::Codex));
+        let agy = dir(&["brain", "antigravity-oauth-token"]);
+        assert_eq!(Harness::detect(agy), Ok(Harness::Agy));
+        // Not used yet: a Claude Code seat, as `[[seat]]` meant before `harness` existed.
+        assert_eq!(Harness::detect(dir(&[])), Ok(Harness::Claude));
+        assert_eq!(
+            Harness::detect(dir(&["sessions", "history.jsonl"])),
+            Ok(Harness::Claude)
+        );
+        assert_eq!(
+            Harness::detect(dir(&["projects", "auth.json"])),
+            Err(vec![Harness::Claude, Harness::Codex])
+        );
+    }
+
+    #[test]
+    fn markers_belong_to_one_harness() {
+        for a in Harness::ALL {
+            for b in Harness::ALL.into_iter().filter(|b| *b != a) {
+                for m in a.markers() {
+                    assert!(!b.markers().contains(m), "{m} names {a} and {b}");
+                }
+            }
+        }
     }
 }

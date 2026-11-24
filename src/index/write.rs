@@ -34,10 +34,34 @@ pub(super) struct Written {
 /// Writes what was read of one file. Records the index rolled up already are skipped (requests
 /// with their tool calls, prompts, API errors; see `marks`); everything else about them (times,
 /// working directory, owner) still counts, as if they had been read.
+/// What a transcript's side files say (a session's custom title, an agent's `meta.json`): read
+/// with the transcript, before the write transaction, so the lock another process and the
+/// compactor wait on is not held over file reads (review B-M23).
+pub(super) struct Side {
+    title: Option<String>,
+    meta: files::AgentMeta,
+}
+
+pub(super) fn read_side(f: &crate::model::files::TranscriptFile) -> Side {
+    let title = (f.kind == FileKind::Main)
+        .then(|| f.path.parent().map(|p| p.join(&f.session_id)))
+        .flatten()
+        .and_then(|dir| files::read_custom_title(&dir));
+    let meta = match &f.inline_meta {
+        Some(m) => m.clone(),
+        None => f
+            .meta_path()
+            .and_then(|p| files::read_meta(&p))
+            .unwrap_or_default(),
+    };
+    Side { title, meta }
+}
+
 pub(super) fn write_file(
     tx: &rusqlite::Transaction,
     w: &Work,
     chunk: transcript::Chunk,
+    side: Side,
     cwds: &mut std::collections::HashSet<String>,
     at: At,
     rowid: &mut i64,
@@ -223,13 +247,15 @@ pub(super) fn write_file(
                 }
                 upd_tool.execute(params![ts.map(ms), is_error as i64, tool_use_id])?;
             }
-            Event::Prompt { ts, text } => {
+            Event::Prompt { ts, text, id } => {
                 if let Some(t) = ts {
                     last_ts = last_ts.max(ms(t));
                     if main && rolled(ms(t)) {
                         skipped += 1;
                     } else if main {
-                        tx.prepare_cached("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
+                        // A record id already counted (a fork, a moved config dir) is not counted again
+                        // (review B-M8): `ON CONFLICT` covers the unique `record_id` too.
+                        tx.prepare_cached("INSERT INTO prompts(seat, session_id, ts, chars, record_id) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, ms(t), text.chars().count() as i64, id])?;
                     }
                 }
             }
@@ -254,18 +280,21 @@ pub(super) fn write_file(
             Event::AgentLaunch { .. } => {}
             Event::CostState { total_usd, models } => {
                 // Cumulative per process; a resumed session starts a new count, so keep the largest.
+                // A map that cannot be written is an error, never an empty text in the column
+                // (review A-M8).
+                let models = serde_json::to_string(&models)?;
                 tx.prepare_cached("INSERT INTO cost_states(seat, session_id, total_usd, models) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(seat, session_id) DO UPDATE SET total_usd = excluded.total_usd, models = excluded.models
-                     WHERE excluded.total_usd >= cost_states.total_usd")?.execute(params![f.seat, f.session_id, total_usd, serde_json::to_string(&models).unwrap_or_default()])?;
+                     WHERE excluded.total_usd >= cost_states.total_usd")?.execute(params![f.seat, f.session_id, total_usd, models])?;
             }
-            Event::ApiError { ts, kind, text } => {
+            Event::ApiError { ts, kind, text, id } => {
                 let t = ts.map(ms).unwrap_or(last_ts);
                 if rolled(t) {
                     skipped += 1;
                     continue;
                 }
-                tx.prepare_cached("INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, f.agent_id, t, kind, text])?;
+                tx.prepare_cached("INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text, record_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, f.agent_id, t, kind, text, id])?;
             }
         }
     }
@@ -282,9 +311,7 @@ pub(super) fn write_file(
         ])?;
     }
     if main {
-        if let Some(dir) = f.path.parent().map(|p| p.join(&f.session_id))
-            && let Some(t) = files::read_custom_title(&dir)
-        {
+        if let Some(t) = side.title {
             agg.title = Some(t);
         }
         if agg.title.is_none() && f.session_title.is_some() {
@@ -306,16 +333,10 @@ pub(super) fn write_file(
                last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
                compactions = excluded.compactions")?.execute(params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts])?;
     }
-    let meta = match &f.inline_meta {
-        Some(m) => m.clone(),
-        None => f
-            .meta_path()
-            .and_then(|p| files::read_meta(&p))
-            .unwrap_or_default(),
-    };
+    let meta = side.meta;
     let workflow_run = match &f.kind {
         FileKind::Workflow(r) => Some(r.clone()),
-        _ => None,
+        FileKind::Main | FileKind::Subagent => None,
     };
     tx.prepare_cached("INSERT INTO agents(seat, session_id, agent_id, kind, workflow_run, agent_type, description, tool_use_id, parent_agent_id, depth,
                             requested_model, effort, finished, first_ts, last_ts)

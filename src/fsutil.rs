@@ -85,6 +85,7 @@ pub fn stage(path: &Path, bytes: &[u8], mode: Mode) -> std::io::Result<Staged> {
 }
 
 impl Staged {
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.tmp
     }
@@ -182,6 +183,27 @@ pub fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// `std::fs::canonicalize` without Windows' verbatim prefix (`\\?\C:\…` → `C:\…`), so paths
 /// shown to people and hashed into seat ids look the same as the ones they typed.
+/// The last `max` bytes of a file as text, from the first whole line: the cut may fall inside a
+/// line or inside a UTF-8 character (review B-M21: `read_to_string` failed on a cut inside
+/// "é" or "—", and the AGENT card showed no last message), so a partial first line is dropped
+/// and any invalid byte read as U+FFFD.
+pub fn tail_lines(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let start = f.metadata()?.len().saturating_sub(max);
+    f.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(if start > 0 {
+        text.split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .to_string()
+    } else {
+        text.into_owned()
+    })
+}
+
 pub fn canonical(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let c = std::fs::canonicalize(p)?;
     if cfg!(windows) {
@@ -195,9 +217,43 @@ pub fn canonical(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     Ok(c)
 }
 
+/// The identity of a file (its inode on Unix): a file replaced at the same path has another.
+#[cfg(unix)]
+pub fn file_id(_path: &Path, m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.ino()
+}
+
+/// Windows has no inode in `Metadata`: the file index of an open handle (mixed with the
+/// volume serial) tells a replaced file from one appended to, as the inode does on Unix.
+#[cfg(windows)]
+pub fn file_id(path: &Path, _m: &std::fs::Metadata) -> u64 {
+    winapi_util::Handle::from_path_any(path)
+        .and_then(|h| winapi_util::file::information(&h))
+        .map_or(0, |i| {
+            i.file_index() ^ i.volume_serial_number().rotate_left(48)
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn file_id(_path: &Path, _m: &std::fs::Metadata) -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tail_cut_inside_a_character_is_read() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("t.jsonl");
+        // 21 bytes; "é" is bytes 6 and 7, so a 14-byte window starts inside it.
+        std::fs::write(&p, "first é line\nsecond\n").unwrap();
+        assert_eq!(tail_lines(&p, 14).unwrap(), "second\n");
+        assert_eq!(tail_lines(&p, 9).unwrap(), "second\n");
+        assert_eq!(tail_lines(&p, 1000).unwrap(), "first é line\nsecond\n");
+    }
 
     fn leftovers(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)

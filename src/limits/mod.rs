@@ -7,13 +7,25 @@
 //! spend per point of utilization shows the least hidden usage; its ratio is used as the
 //! reference for the others, and the gap is reported as usage outside this machine.
 
+// A new variant of a domain enum (a harness, a window kind, a dim) must be handled where it
+// is matched, not fall into a catch-all (reviews A-H7, B-M24, B-L3).
+#![deny(clippy::wildcard_enum_match_arm)]
+// No result ignored, no string cut by bytes, and (where there are none) no silent numeric
+// casts: the strict lints switched on, in production code, where they hold already (reviews
+// A-H7, B-M24).
+#![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
+#![cfg_attr(not(test), deny(clippy::string_slice))]
+#![cfg_attr(not(test), deny(clippy::cast_possible_truncation))]
+#![cfg_attr(not(test), deny(clippy::cast_possible_wrap))]
+#![cfg_attr(not(test), deny(clippy::cast_sign_loss))]
+
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::app::context::Ctx;
-use crate::core::limits::{self, Level, Reading, Share, WindowInputs, WindowKind};
+use crate::core::ids::AccountId;
+use crate::core::limits::{self, Level, Reading, Share, WindowInputs};
 use crate::core::period::Span;
 use crate::core::units::{Pct, Usd, UsdPerPct};
 use crate::index::Index;
@@ -30,8 +42,11 @@ pub struct WindowReport {
     pub own_usd_per_point: Option<UsdPerPct>,
     /// USD per point used for the estimates (own, or the tier reference).
     pub usd_per_point: Option<UsdPerPct>,
-    /// The account whose ratio served as the reference, when not this one.
+    /// The account whose ratio served as the reference, when not this one: its name, and its
+    /// id (for a front end that names it again, masked).
     pub reference: Option<String>,
+    #[serde(skip)]
+    pub reference_id: Option<String>,
     pub cost_in_window: Usd,
     pub estimate_now: Pct,
     /// ≈ points explained by spend visible on this machine.
@@ -41,7 +56,7 @@ pub struct WindowReport {
     /// Dollars per hour.
     pub burn_usd_per_hour: Usd,
     /// Points per hour.
-    pub points_per_hour: Option<Pct>,
+    pub points_per_hour: Option<crate::core::units::PctPerHour>,
     #[serde(skip)]
     pub eta: Option<Duration>,
     /// When it runs out, fixed at the limits pass (`core::limits::WindowEstimate::runs_out_at`).
@@ -71,18 +86,20 @@ impl WindowReport {
     /// Utilization at the reset at the current pace (see `core::limits::projection_at_reset`).
     pub fn projection_at_reset(&self, now: chrono::DateTime<chrono::Utc>) -> Option<Pct> {
         limits::projection_at_reset(
-            self.estimate_now.get(),
-            self.points_per_hour.map(Pct::get),
+            self.estimate_now,
+            self.points_per_hour,
             now,
             self.window.end,
         )
-        .map(Pct::new)
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountReport {
-    pub account_uuid: String,
+    /// The account (`<accountUuid>/<organizationUuid>`, `agy:…`, `cdx:…`), as an id: names and
+    /// labels are other fields (reviews A-M5, B-M12).
+    #[serde(rename = "account_uuid")]
+    pub account: AccountId,
     pub name: String,
     pub tier: Option<String>,
     pub windows: Vec<WindowReport>,
@@ -94,7 +111,7 @@ type Marks = Vec<(DateTime<Utc>, f64)>;
 /// Queries what [`limits::window_estimate`] needs for one reading of an account.
 /// `history` holds the stored readings of the reading's kind, oldest first.
 fn load_window(
-    ctx: &Ctx,
+    now: DateTime<Utc>,
     idx: &Index,
     account: &str,
     r: &Reading,
@@ -104,16 +121,16 @@ fn load_window(
         account: Some(crate::core::ids::AccountId::new(account)),
         ..Default::default()
     };
-    let now_end = ctx.now + Duration::seconds(1);
+    let now_end = now + Duration::seconds(1);
     let until_now = |start| Span {
         start,
         end: now_end,
     };
-    let place = limits::window_of(r, history, ctx.now);
+    let place = limits::window_of(r, history, now);
     let window = place.window;
     let mut points = Vec::new();
     for (span, utilization) in limits::calibration_points(history, r) {
-        let spent = Usd::new(idx.settled_total(account, span, ctx.now)?);
+        let spent = Usd::new(idx.settled_total(account, span, now)?);
         points.push((Pct::new(utilization), spent));
     }
     let (_, since) = limits::counting_from(r, &place);
@@ -122,7 +139,7 @@ fn load_window(
     let cost_in_window = Usd::new(idx.total(until_now(window.start), &filter)?.cost);
     let cost_burn = Usd::new(
         idx.total(
-            until_now(ctx.now - Duration::minutes(limits::BURN_MINUTES)),
+            until_now(now - Duration::minutes(limits::BURN_MINUTES)),
             &filter,
         )?
         .cost,
@@ -130,15 +147,11 @@ fn load_window(
     let by_project = idx
         .spend_by(Dim::Project, until_now(window.start), &filter)?
         .into_iter()
-        .map(|row| {
-            (
-                if ctx.mask {
-                    ctx.show_path(&row.label)
-                } else {
-                    row.label
-                },
-                Usd::new(row.cost),
-            )
+        // Joined by key, named for display; `--mask` is the front ends' business.
+        .map(|row| limits::ProjectSpend {
+            project: crate::core::ids::ProjectKey::from_stored(row.key),
+            name: row.label,
+            cost: Usd::new(row.cost),
         })
         .collect();
     let (series, series_step, marks) = if place.reset_passed {
@@ -152,7 +165,7 @@ fn load_window(
             .collect();
         let marks = history
             .iter()
-            .filter(|x| x.fetched_at >= window.start && x.fetched_at <= ctx.now)
+            .filter(|x| x.fetched_at >= window.start && x.fetched_at <= now)
             .map(|x| (x.fetched_at, x.utilization))
             .collect();
         (series, step, marks)
@@ -178,12 +191,12 @@ pub struct Reference {
 }
 
 fn report_window(
-    ctx: &Ctx,
+    input: &LimitsInputs,
     i: WindowInputs,
     marks: Marks,
     reference: Option<&Reference>,
 ) -> WindowReport {
-    let e = limits::window_estimate(&i, reference.map(|x| x.usd_per_point), ctx.now);
+    let e = limits::window_estimate(&i, reference.map(|x| x.usd_per_point), input.now);
     WindowReport {
         reading: i.reading,
         reset_passed: i.place.reset_passed,
@@ -191,7 +204,8 @@ fn report_window(
         manual_reset: i.place.manual_reset,
         own_usd_per_point: i.own_usd_per_point,
         usd_per_point: e.usd_per_point,
-        reference: reference.map(|x| ctx.account_name(&x.account)),
+        reference: reference.map(|x| input.name_of(&x.account)),
+        reference_id: reference.map(|x| x.account.clone()),
         cost_in_window: i.cost_in_window,
         estimate_now: e.estimate_now,
         visible_points: e.visible_points,
@@ -209,61 +223,64 @@ fn report_window(
     }
 }
 
-fn tier_of(ctx: &Ctx, account: &str) -> Option<String> {
-    if let Some(t) = ctx
-        .seat_info
-        .iter()
-        .filter_map(|s| s.account.as_ref())
-        .find(|a| a.id().as_str() == account)
-        .and_then(|a| a.effective_tier())
-    {
-        return Some(t);
-    }
-    ctx.login_tiers.get(account).cloned()
+/// What the limit analysis takes from its caller (`Ctx::limits_inputs`): the instant, every
+/// account's latest readings, and the plan tier and name of each. The analysis does not reach
+/// into the composition root (reviews A-M1, B-M16: it took the whole `Ctx`, presentation
+/// included).
+#[derive(Debug, Clone, Default)]
+pub struct LimitsInputs {
+    pub now: DateTime<Utc>,
+    /// Per account, its latest reading of each window kind (`Ctx::latest_readings`).
+    pub readings: Vec<(String, Vec<Reading>)>,
+    pub tiers: HashMap<String, String>,
+    /// Unmasked: front ends mask what they print.
+    pub names: HashMap<String, String>,
 }
 
-/// Analyses every account with a reading ([`Ctx::latest_readings`]), using cross-account
-/// references per tier: first the queries for every window, then the pure estimates.
-pub fn all_reports(ctx: &Ctx, idx: &Index) -> anyhow::Result<Vec<AccountReport>> {
+impl LimitsInputs {
+    fn name_of(&self, account: &str) -> String {
+        self.names
+            .get(account)
+            .cloned()
+            .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short_account(account)))
+    }
+}
+
+/// Analyses every account with a reading, using cross-account references per tier
+/// ([`limits::pick_references`]): first the queries for every window, then the pure estimates.
+pub fn all_reports(input: &LimitsInputs, idx: &Index) -> anyhow::Result<Vec<AccountReport>> {
     type Loaded = (
         String,
         Option<String>,
         Vec<(WindowInputs, Vec<(DateTime<Utc>, f64)>)>,
     );
     let mut loaded: Vec<Loaded> = Vec::new();
-    for (acct, rs) in ctx.latest_readings(idx)? {
+    for (acct, rs) in &input.readings {
         if rs.is_empty() {
             continue;
         }
         let mut windows = Vec::new();
-        for r in &rs {
-            let history = idx.readings(&acct, r.kind)?;
-            windows.push(load_window(ctx, idx, &acct, r, &history)?);
+        for r in rs {
+            let history = idx.readings(acct, r.kind)?;
+            windows.push(load_window(input.now, idx, acct, r, &history)?);
         }
-        let tier = tier_of(ctx, &acct);
-        loaded.push((acct, tier, windows));
+        loaded.push((acct.clone(), input.tiers.get(acct).cloned(), windows));
     }
-    let mut refs: HashMap<(String, WindowKind), Reference> = HashMap::new();
-    for (acct, tier, windows) in &loaded {
-        let Some(tier) = tier else { continue };
-        for (i, _) in windows {
-            let Some(u) = i.own_usd_per_point else {
-                continue;
-            };
-            let e = refs
-                .entry((tier.clone(), i.reading.kind))
-                .or_insert(Reference {
-                    usd_per_point: u,
+    let calibrations: Vec<limits::Calibration> = loaded
+        .iter()
+        .flat_map(|(acct, tier, windows)| {
+            windows.iter().filter_map(move |(i, _)| {
+                Some(limits::Calibration {
                     account: acct.clone(),
-                });
-            if u > e.usd_per_point {
-                *e = Reference {
-                    usd_per_point: u,
-                    account: acct.clone(),
-                };
-            }
-        }
-    }
+                    tier: limits::PlanTier::of(acct, tier.clone()?),
+                    kind: i.reading.kind,
+                    usd_per_point: i.own_usd_per_point?,
+                    at: i.reading.fetched_at,
+                })
+            })
+        })
+        .collect();
+    let refs = limits::pick_references(&calibrations, input.now);
     Ok(loaded
         .into_iter()
         .map(|(acct, tier, windows)| {
@@ -272,17 +289,23 @@ pub fn all_reports(ctx: &Ctx, idx: &Index) -> anyhow::Result<Vec<AccountReport>>
                 .map(|(i, marks)| {
                     let reference = tier
                         .as_ref()
-                        .and_then(|t| refs.get(&(t.clone(), i.reading.kind)))
+                        .and_then(|t| {
+                            refs.get(&(limits::PlanTier::of(&acct, t.clone()), i.reading.kind))
+                        })
                         .filter(|x| {
                             x.account != acct
                                 && limits::reference_wins(i.own_usd_per_point, x.usd_per_point)
+                        })
+                        .map(|x| Reference {
+                            usd_per_point: x.usd_per_point,
+                            account: x.account.clone(),
                         });
-                    report_window(ctx, i, marks, reference)
+                    report_window(input, i, marks, reference.as_ref())
                 })
                 .collect();
             AccountReport {
-                name: ctx.account_name(&acct),
-                account_uuid: acct,
+                name: input.name_of(&acct),
+                account: AccountId::new(acct),
                 tier,
                 windows,
             }
@@ -293,11 +316,12 @@ pub fn all_reports(ctx: &Ctx, idx: &Index) -> anyhow::Result<Vec<AccountReport>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::procs::ProcTable;
+    use crate::app::context::Ctx;
     use crate::config::{Config, Dirs};
     use crate::core::pricing::PriceBook;
     use crate::index::SeatInfo;
     use crate::index::scenarios::{World, account, assistant, at, owner, weekly};
+    use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
 
     fn close(a: impl Into<f64>, b: impl Into<f64>) -> bool {
@@ -364,7 +388,7 @@ mod tests {
         assert_eq!(latest[0].1[0].fetched_at, at("2026-11-20T00:00:00Z"));
         // The analysis (what every surface shows): no spend recorded, so the estimate is the
         // reading itself, 8%, in the window that resets 11-24.
-        let reports = all_reports(&ctx, &idx).unwrap();
+        let reports = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
         let week = &reports[0].windows[0];
         assert_eq!(week.reading.utilization, 8.0);
         assert!(close(week.estimate_now, 8.0), "{}", week.estimate_now);
@@ -420,7 +444,9 @@ mod tests {
             &PriceBook::builtin(),
         );
         let ctx = ctx_of(&w, vec![now_seat], "2026-11-20T12:00:00Z");
-        let rep = all_reports(&ctx, &idx).unwrap().remove(0);
+        let rep = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx)
+            .unwrap()
+            .remove(0);
         let win = &rep.windows[0];
         assert!(!win.reset_passed);
         assert_eq!(win.window.start, at("2026-11-17T00:00:00Z"));
@@ -454,11 +480,86 @@ mod tests {
         assert!(close(win.window_usd.unwrap(), 1300.0 / 30.0));
         // Shares of the visible 540/13 points: shop $13 of $19, docs $6 of $19.
         assert_eq!(win.shares.len(), 2);
-        assert_eq!(win.shares[0].key, "shop");
+        assert_eq!(win.shares[0].name, "shop");
         assert!(close(win.shares[0].cost, 13.0));
         assert!(close(win.shares[0].limit_points, 540.0 / 19.0));
-        assert_eq!(win.shares[1].key, "docs");
+        assert_eq!(win.shares[1].name, "docs");
         assert!(close(win.shares[1].limit_points, 3240.0 / 247.0));
+    }
+
+    /// Review B-H3: two repositories with the same dir name are two projects. The shares were
+    /// keyed by name, and the PROJECTS panel then showed each "api" the sum of both. Masking is
+    /// no longer applied here either: the report is the same with `--mask`.
+    #[test]
+    fn projects_of_the_same_name_keep_their_own_share() {
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        let req = |id: &str, ts: &str, cwd: &str, usd: u64| {
+            assistant(id, ts, m, cwd, (usd * 500_000, 0), &[])
+        };
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                req("q1", "2026-11-18T06:00:00Z", "/work/api", 6),
+                req("q2", "2026-11-19T06:00:00Z", "/oss/api", 2),
+            ],
+        );
+        let seat = SeatInfo {
+            seat: Default::default(),
+            label: "work".into(),
+            account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            utilization: Some(weekly(
+                "acc-a",
+                "2026-11-20T00:00:00Z",
+                20.0,
+                "2026-11-24T00:00:00Z",
+            )),
+        };
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, std::slice::from_ref(&seat), &PriceBook::builtin());
+        let mut ctx = ctx_of(&w, vec![seat], "2026-11-20T12:00:00Z");
+        let plain = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
+        let win = &plain[0].windows[0];
+        let shares: Vec<(&str, &str, f64)> = win
+            .shares
+            .iter()
+            .map(|s| (s.project.as_str(), s.name.as_str(), s.cost.get()))
+            .collect();
+        // $8 explain the 20 points: /work/api $6 → 15, /oss/api $2 → 5.
+        assert_eq!(
+            shares,
+            [("/work/api", "api", 6.0), ("/oss/api", "api", 2.0)]
+        );
+        assert!(close(win.shares[0].limit_points, 15.0));
+        assert!(close(win.shares[1].limit_points, 5.0));
+        ctx.mask = true;
+        let masked = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
+        assert_eq!(masked[0].windows[0].shares, win.shares);
+    }
+
+    /// Review A-H4: names are masked where they are printed, not in the context the analysis
+    /// reads, so a `[subscription]` keyed by a login label still matches with `--mask`.
+    #[test]
+    fn account_names_are_masked_when_shown_only() {
+        let w = World::new(&["work"]);
+        let mut ctx = ctx_of(&w, Vec::new(), "2026-11-20T12:00:00Z");
+        ctx.mask = true;
+        ctx.login_labels.insert(
+            "acc-a/org-1".into(),
+            crate::app::context::LoginName {
+                label: "alice-2".into(),
+                email: Some("alice@example.com".into()),
+            },
+        );
+        assert_eq!(ctx.account_name("acc-a/org-1"), "alice-2");
+        assert_eq!(
+            ctx.shown_account_name("acc-a/org-1"),
+            crate::ui::mask::HIDDEN
+        );
+        ctx.mask = false;
+        assert_eq!(ctx.shown_account_name("acc-a/org-1"), "alice-2");
     }
 
     #[test]
@@ -493,7 +594,7 @@ mod tests {
         w.refresh(&mut idx, std::slice::from_ref(&now_seat), &book);
         let ctx = ctx_of(&w, vec![now_seat.clone()], "2026-11-20T12:00:00Z");
         let own = |idx: &Index| {
-            all_reports(&ctx, idx).unwrap()[0].windows[0]
+            all_reports(&ctx.limits_inputs(idx).unwrap(), idx).unwrap()[0].windows[0]
                 .own_usd_per_point
                 .unwrap()
         };
@@ -564,7 +665,8 @@ mod tests {
             vec![seat(3.0, "2026-11-19T02:00:00Z")],
             "2026-11-20T12:00:00Z",
         );
-        let limits_window = all_reports(&ctx, &idx).unwrap()[0].windows[0].window;
+        let limits_window =
+            all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap()[0].windows[0].window;
         assert_eq!(limits_window.start, at("2026-11-19T00:00:00Z"));
         for account in [Some("acc-a".into()), None] {
             let week = ctx.limit_week(&idx, account.as_ref()).unwrap().unwrap();

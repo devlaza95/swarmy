@@ -276,7 +276,12 @@ fn differences(before: &Numbers, after: &Numbers) -> Vec<String> {
 fn verify(ctx: &Ctx, idx: &Index, keep: i64, out: &mut dyn Write) -> anyhow::Result<()> {
     let dir = ctx.dirs.data.join("tmp");
     std::fs::create_dir_all(&dir)?;
-    let scratch = dir.join("verify.sqlite");
+    // Per run: two `compact --verify` at once never share a copy (review A-L2).
+    let scratch = dir.join(format!(
+        "verify-{}-{}.sqlite",
+        std::process::id(),
+        ctx.now.timestamp_millis()
+    ));
     let remove = || {
         for ext in ["", "-wal", "-shm"] {
             let p = std::path::PathBuf::from(format!("{}{ext}", scratch.display()));
@@ -355,12 +360,12 @@ fn verify(ctx: &Ctx, idx: &Index, keep: i64, out: &mut dyn Write) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::procs::ProcTable;
     use crate::config::{Config, Dirs};
     use crate::core::pricing::PriceBook;
     use crate::index::archive_scenarios::{NOW, populate, readings, refresh};
     use crate::index::query::Counted;
     use crate::index::scenarios::{World, at};
+    use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
 
     fn ctx(w: &World) -> Ctx {
@@ -471,13 +476,14 @@ mod tests {
         );
         let mut strict = super::tests::ctx(&w);
         strict.config.storage.keep_raw_days = Some(40);
-        let e = run(&strict, &mut idx, CompactArgs::default())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.starts_with("[storage] in config.toml: keep_raw_days = 40"),
-            "{e}"
-        );
+        let err = run(&strict, &mut idx, CompactArgs::default()).unwrap_err();
+        let e = err.to_string();
+        assert!(e.contains("[storage] keep_raw_days = 40"), "{e}");
+        // A config error with its code (review B-L10).
+        assert!(matches!(
+            err.downcast_ref::<crate::errors::ConfigError>(),
+            Some(crate::errors::ConfigError::Invalid { .. })
+        ));
         assert_eq!(rows(&idx), raw, "refused before anything moved");
 
         let out = run(

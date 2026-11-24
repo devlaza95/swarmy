@@ -4,12 +4,13 @@
 use chrono::{DateTime, Utc};
 
 use super::input::{Input, Window};
+use crate::config::StatusSegment;
 use crate::core::ids::SeatId;
 use crate::core::limits::Level;
 
 /// One piece of the line: its forms from full to shortest (text with colour, plain width).
 struct Segment {
-    key: &'static str,
+    key: StatusSegment,
     forms: Vec<(String, usize)>,
     form: usize,
     dropped: bool,
@@ -25,7 +26,7 @@ pub struct Extra {
     pub seat_key: SeatId,
     pub mask: bool,
     pub color: bool,
-    pub segments: Vec<String>,
+    pub segments: Vec<StatusSegment>,
     pub width: usize,
     pub lines: u8,
     /// The git branch of the session's directory (second line only).
@@ -93,9 +94,9 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
     let me = input.session_id.clone().unwrap_or_default();
     let seat = x.fleet.as_ref().and_then(|f| f.seats.get(&x.seat_key));
     let mut segs: Vec<Segment> = Vec::new();
-    for key in &x.segments {
-        let forms: Vec<(String, usize)> = match key.as_str() {
-            "attention" => {
+    for &key in &x.segments {
+        let forms: Vec<(String, usize)> = match key {
+            StatusSegment::Attention => {
                 let others: Vec<(String, String, Option<crate::core::pane::Pane>)> = match &x.fleet
                 {
                     Some(f) => f
@@ -147,7 +148,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 v.push(form(&p, &[(&format!("▲{n}"), "1;33")]));
                 v
             }
-            "agents" => {
+            StatusSegment::Agents => {
                 let Some(sc) = x
                     .fleet
                     .as_ref()
@@ -184,7 +185,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                     form(&p, &[(&format!("◐{}", sc.agents), "36")]),
                 ]
             }
-            "week" => {
+            StatusSegment::Week => {
                 // Exact from stdin; else the dashboard's estimate (≈).
                 let (pct, resets, exact) = match input
                     .rate_limits
@@ -256,7 +257,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                     ]
                 }
             }
-            "five_hour" => {
+            StatusSegment::FiveHour => {
                 let Some((pct, _)) = input
                     .rate_limits
                     .as_ref()
@@ -267,7 +268,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 };
                 vec![form(&p, &[(&format!("5h {pct:.0}%"), level(pct))])]
             }
-            "context" => {
+            StatusSegment::Context => {
                 let Some(c) = input
                     .context_window
                     .as_ref()
@@ -284,13 +285,13 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 };
                 vec![form(&p, &[(&format!("ctx {c:.0}%"), code)])]
             }
-            "cost" => {
+            StatusSegment::Cost => {
                 let Some(c) = input.cost.as_ref().and_then(|c| c.total_cost_usd) else {
                     continue;
                 };
                 vec![form(&p, &[(&format!("${c:.2}"), "")])]
             }
-            "burn" => {
+            StatusSegment::Burn => {
                 let Some(b) = x
                     .fleet
                     .as_ref()
@@ -302,10 +303,9 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 };
                 vec![form(&p, &[(&format!("${b:.1}/h"), "2")])]
             }
-            _ => continue,
         };
         segs.push(Segment {
-            key: static_key(key),
+            key,
             forms,
             form: 0,
             dropped: false,
@@ -318,33 +318,37 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
         let live: Vec<&Segment> = segs.iter().filter(|s| !s.dropped).collect();
         live.iter().map(|s| s.forms[s.form].1).sum::<usize>() + sep * live.len().saturating_sub(1)
     };
-    let pct_of = |k: &str| -> f64 {
+    let pct_of = |k: StatusSegment| -> f64 {
         match k {
-            "five_hour" => input
+            StatusSegment::FiveHour => input
                 .rate_limits
                 .as_ref()
                 .and_then(|r| r.five_hour.as_ref())
                 .map(|w| w.used_percentage)
                 .unwrap_or(0.0),
-            "context" => input
+            StatusSegment::Context => input
                 .context_window
                 .as_ref()
                 .and_then(|c| c.used_percentage)
                 .unwrap_or(0.0),
-            _ => 0.0,
+            StatusSegment::Attention
+            | StatusSegment::Agents
+            | StatusSegment::Week
+            | StatusSegment::Cost
+            | StatusSegment::Burn => 0.0,
         }
     };
-    let steps: [(&str, bool); 10] = [
-        ("burn", true),
-        ("cost", true),
-        ("five_hour", true),
-        ("week", false),
-        ("agents", false),
-        ("attention", false),
-        ("context", true),
-        ("week", false),
-        ("attention", false),
-        ("agents", true),
+    let steps: [(StatusSegment, bool); 10] = [
+        (StatusSegment::Burn, true),
+        (StatusSegment::Cost, true),
+        (StatusSegment::FiveHour, true),
+        (StatusSegment::Week, false),
+        (StatusSegment::Agents, false),
+        (StatusSegment::Attention, false),
+        (StatusSegment::Context, true),
+        (StatusSegment::Week, false),
+        (StatusSegment::Attention, false),
+        (StatusSegment::Agents, true),
     ];
     for (key, drop) in steps {
         if width(&segs) <= x.width {
@@ -353,8 +357,9 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
         if let Some(sg) = segs.iter_mut().find(|s| s.key == key && !s.dropped) {
             if drop {
                 // A 5-hour limit from amber on and a context past 70% stay.
-                let keep = (key == "five_hour" && Level::of(pct_of(key)) >= Level::Warn)
-                    || (key == "context" && pct_of(key) >= CONTEXT_WARN);
+                let keep = (key == StatusSegment::FiveHour
+                    && Level::of(pct_of(key)) >= Level::Warn)
+                    || (key == StatusSegment::Context && pct_of(key) >= CONTEXT_WARN);
                 if !keep {
                     sg.dropped = true;
                 }
@@ -458,21 +463,6 @@ pub fn truncate_to_width(s: &str, width: usize) -> String {
         w += cw;
     }
     out
-}
-
-fn static_key(k: &str) -> &'static str {
-    [
-        "attention",
-        "agents",
-        "week",
-        "five_hour",
-        "context",
-        "cost",
-        "burn",
-    ]
-    .into_iter()
-    .find(|s| *s == k)
-    .unwrap_or("?")
 }
 
 #[cfg(test)]

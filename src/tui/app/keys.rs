@@ -352,10 +352,10 @@ impl App {
             );
             return;
         };
-        match crate::claude::pane::jump(&pane) {
-            crate::claude::pane::Jump::Done => self.toast(format!("jumped to {pane}"), Tone::Good),
-            crate::claude::pane::Jump::Unreachable(why) => self.toast(why, Tone::Warn),
-            crate::claude::pane::Jump::Failed(why) => self.toast(why, Tone::Bad),
+        match crate::terminal::jump(&pane) {
+            crate::terminal::Jump::Done => self.toast(format!("jumped to {pane}"), Tone::Good),
+            crate::terminal::Jump::Unreachable(why) => self.toast(why, Tone::Warn),
+            crate::terminal::Jump::Failed(why) => self.toast(why, Tone::Bad),
         }
     }
 
@@ -386,7 +386,10 @@ impl App {
             ["capture", seat] | ["capture", seat, _] => {
                 let label = parts.get(2).copied();
                 let res = self.with_vault(|v, seats| {
-                    let s = seats.iter().find(|s| s.label == *seat).ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
+                    let s = seats.iter().find(|s| s.label == *seat).ok_or_else(|| crate::errors::LookupError::NoSeat {
+                        name: seat.to_string(),
+                        known: Vec::new(),
+                    })?;
                     v.capture(s, label)?.ok_or_else(|| anyhow::anyhow!("seat '{seat}' has no login"))
                 });
                 match res {

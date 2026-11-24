@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 
-use crate::claude::procs::proc_start_ticks;
 use crate::claude::seats::Seat;
+use crate::procs::proc_start_ticks;
 
 mod agy;
 mod codex;

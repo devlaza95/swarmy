@@ -121,7 +121,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             .agents
             .iter()
             .filter(|a| {
-                a.project == p.name
+                a.project_key.as_ref() == Some(&p.key)
                     && (a.state.is_active() || matches!(a.state, State::NeedsYou(_)))
             })
             .count();
@@ -137,7 +137,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             .flat_map(|w| {
                 w.shares
                     .iter()
-                    .filter(|s| s.key == p.name)
+                    .filter(|s| s.project == p.key)
                     .map(|s| s.limit_points.get())
             })
             .sum();

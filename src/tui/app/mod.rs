@@ -472,7 +472,12 @@ impl App {
         let Some(a) = account else {
             return (None, None, None);
         };
-        let Some(rep) = self.analytics.limits.iter().find(|r| r.account_uuid == a) else {
+        let Some(rep) = self
+            .analytics
+            .limits
+            .iter()
+            .find(|r| r.account.as_str() == a)
+        else {
             return (None, None, None);
         };
         let five = rep
@@ -495,7 +500,7 @@ impl App {
         self.analytics
             .limits
             .iter()
-            .find(|r| r.account_uuid == uuid)
+            .find(|r| r.account.as_str() == uuid)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short_account(uuid)))
     }
@@ -519,7 +524,11 @@ impl App {
                 .filter(|l| l.harness == h)
                 .collect();
             logins.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
-            rows.extend(logins.into_iter().map(|l| LimitsRow::Login(l.id.clone())));
+            rows.extend(
+                logins
+                    .into_iter()
+                    .map(|l| LimitsRow::Login(l.id.to_string())),
+            );
         }
         rows
     }
@@ -536,7 +545,7 @@ impl App {
                 .vault
                 .logins
                 .iter()
-                .find(|l| &l.id == id)
+                .find(|l| l.id.as_str() == id)
                 .map_or(Harness::Claude, |l| l.harness),
         }
     }

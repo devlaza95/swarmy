@@ -395,7 +395,7 @@ impl Index {
     ) -> anyhow::Result<Vec<(i64, String, f64)>> {
         // The kept rows start an hour before the horizon, so they cover `start` until the
         // horizon moves.
-        let from = settled::horizon(Utc::now()) - chrono::Duration::hours(1);
+        let from = settled::horizon(self.now()) - chrono::Duration::hours(1);
         let span = Span {
             start: from.min(start),
             end: DateTime::<Utc>::MAX_UTC,

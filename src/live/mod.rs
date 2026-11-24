@@ -2,6 +2,15 @@
 //! waiting for its children, stalled or done. Built from the index (freshly refreshed), the
 //! session registry and the process table.
 
+// A new variant of a domain enum (a harness, a window kind, a dim) must be handled where it
+// is matched, not fall into a catch-all (reviews A-H7, B-M24, B-L3).
+#![deny(clippy::wildcard_enum_match_arm)]
+// No result ignored, no string cut by bytes, and (where there are none) no silent numeric
+// casts: the strict lints switched on, in production code, where they hold already (reviews
+// A-H7, B-M24).
+#![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
+#![cfg_attr(not(test), deny(clippy::string_slice))]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
@@ -34,6 +43,10 @@ pub struct Agent {
     pub name: String,
     pub agent_type: Option<String>,
     pub project: String,
+    /// The project's identity (`projects.key`), what panels join on; `None` for a dir the index
+    /// has not resolved yet.
+    #[serde(skip)]
+    pub project_key: Option<crate::core::ids::ProjectKey>,
     /// The git checkout it works in (worktree, branch, live sessions sharing it).
     pub checkout: Option<Checkout>,
     pub model: Option<String>,
@@ -170,7 +183,7 @@ impl Snapshot {
 pub fn build(
     idx: &Index,
     live: &[LiveSession],
-    procs: &crate::claude::procs::ProcTable,
+    procs: &crate::procs::ProcTable,
     opts: &Options,
     now: DateTime<Utc>,
     // Session totals and the recently-done list change slowly: when `prev` is given they are
@@ -315,6 +328,11 @@ pub fn build(
         } else {
             r.description.clone().unwrap_or_else(|| r.agent_id.clone())
         };
+        let project_key = r
+            .cwd
+            .as_ref()
+            .and_then(|c| projects.get(c))
+            .map(|p| crate::core::ids::ProjectKey::from_stored(p.key.clone()));
         let project = r
             .cwd
             .as_ref()
@@ -349,6 +367,7 @@ pub fn build(
                 .clone()
                 .or_else(|| (r.kind == "workflow").then(|| "workflow".to_string())),
             project,
+            project_key,
             checkout,
             model: last_req.model.or_else(|| r.requested_model.clone()),
             effort: last_req.effort.or_else(|| r.effort.clone()),
@@ -399,21 +418,20 @@ pub fn build(
         }
     }
 
-    // Main threads waiting on their background agents.
-    for i in 0..agents.len() {
-        if agents[i].is_main() && agents[i].state == State::Idle {
-            let n = agents
-                .iter()
-                .filter(|a| {
-                    !a.is_main()
-                        && a.seat == agents[i].seat
-                        && a.session_id == agents[i].session_id
-                        && a.state.is_active()
-                })
-                .count();
-            if n > 0 {
-                agents[i].state = State::WaitingAgents(n);
-            }
+    // Main threads waiting on their background agents (`state::waiting_on_agents`).
+    let waiting = state::waiting_on_agents(
+        &agents
+            .iter()
+            .map(|a| state::Member {
+                main: a.is_main(),
+                session: (a.seat.as_str(), a.session_id.as_str()),
+                state: &a.state,
+            })
+            .collect::<Vec<_>>(),
+    );
+    for (a, n) in agents.iter_mut().zip(waiting) {
+        if n > 0 {
+            a.state = State::WaitingAgents(n);
         }
     }
 
@@ -500,15 +518,8 @@ pub fn build(
         }
     }
     snap.burn_per_hour = total;
-    let midnight = now
-        .with_timezone(&chrono::Local)
-        .date_naive()
-        .and_time(chrono::NaiveTime::MIN);
-    let midnight = midnight
-        .and_local_timezone(chrono::Local)
-        .earliest()
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or(now);
+    let midnight =
+        crate::core::period::local_midnight(now.with_timezone(&chrono::Local).date_naive());
     snap.today_cost = idx.spend_since(midnight)?;
     // Recently finished agents (the history under the live tree).
     if let Some(p) = prev {
@@ -694,33 +705,15 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
     out
 }
 
-/// The last text the agent wrote (read from the tail of its transcript).
+/// The last text the agent wrote (read from the tail of its transcript by its harness's reader).
 pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
     let path = idx.transcript_path(key_of(a)).ok().flatten()?;
+    let path = std::path::Path::new(&path);
     match a.harness {
-        Harness::Agy => {
-            return crate::agy::transcript::last_message(std::path::Path::new(&path));
-        }
-        Harness::Codex => return crate::codex::rollout::last_message(std::path::Path::new(&path)),
-        Harness::Claude => {}
+        Harness::Agy => crate::agy::transcript::last_message(path),
+        Harness::Codex => crate::codex::rollout::last_message(path),
+        Harness::Claude => crate::claude::transcript::last_message(path),
     }
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(256 * 1024);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = String::new();
-    f.read_to_string(&mut buf).ok()?;
-    let mut events = Vec::new();
-    let mut stats = crate::claude::transcript::ParseStats::default();
-    // Skip the first, probably partial, line.
-    for line in buf.lines().skip(if start > 0 { 1 } else { 0 }) {
-        crate::claude::transcript::parse_line(line, &mut events, &mut stats);
-    }
-    events.iter().rev().find_map(|e| match e {
-        crate::claude::transcript::Event::Request(r) => r.text.clone(),
-        _ => None,
-    })
 }
 
 /// The latest tool calls of one agent, newest first.
@@ -848,6 +841,7 @@ mod tests {
             name: id.into(),
             agent_type: None,
             project: "p".into(),
+            project_key: None,
             checkout: None,
             model: None,
             effort: None,
@@ -887,7 +881,7 @@ mod tests {
         w.append("work", "s1", &[owner("acc-a"), line("m1", 90)]);
         let mut idx = w.index("i.sqlite");
         w.refresh(&mut idx, &[], &book);
-        let procs = crate::claude::procs::ProcTable::empty();
+        let procs = crate::procs::ProcTable::empty();
         let opts = Options::default();
         let mut reads = Reads::default();
         let heavy = build(&idx, &[], &procs, &opts, now, None, &mut reads).unwrap();

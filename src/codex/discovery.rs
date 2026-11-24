@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::claude::seats::Seat;
 use crate::core::harness::Harness;
 use crate::core::ids::SeatId;
+use crate::model::seat::Seat;
 
 /// Recognises a Codex home by the files Codex creates in it.
 pub fn looks_like_codex_dir(p: &Path) -> bool {

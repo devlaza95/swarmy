@@ -65,12 +65,18 @@ impl Pane {
         let mut wezterm_socket: Option<String> = None;
         let mut iterm_session: Option<String> = None;
         let mut warp_session: Option<String> = None;
+        let mut in_tmux = false;
+        let mut tmux_pane: Option<String> = None;
 
         for (k, v) in vars {
             if v.is_empty() {
                 continue;
             }
-            if k == "ZELLIJ_SESSION_NAME" {
+            if k == "TMUX" {
+                in_tmux = true;
+            } else if k == "TMUX_PANE" {
+                tmux_pane = Some(v.to_string());
+            } else if k == "ZELLIJ_SESSION_NAME" {
                 zellij_session = Some(v.to_string());
             } else if k == "ZELLIJ_PANE_ID" {
                 zellij_pane = Some(v.to_string());
@@ -97,6 +103,11 @@ impl Pane {
             }
         }
 
+        // tmux runs inside the terminal: its pane is the nearer one (review B-L9: a Codex inside
+        // tmux inside kitty jumped to the kitty window).
+        if let Some(pane) = tmux_pane.filter(|_| in_tmux) {
+            return Some(Pane::Tmux { pane });
+        }
         if let (Some(session), Some(pane_id)) = (zellij_session, zellij_pane) {
             return Some(Pane::Zellij { session, pane_id });
         }
@@ -166,6 +177,25 @@ impl fmt::Display for Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmux_inside_a_terminal_is_the_pane() {
+        let env = [
+            ("KITTY_WINDOW_ID", "3"),
+            ("TMUX", "/tmp/tmux-1/default,1,0"),
+            ("TMUX_PANE", "%12"),
+        ];
+        assert_eq!(
+            Pane::from_environ_pairs(env),
+            Some(Pane::Tmux { pane: "%12".into() })
+        );
+        // A TMUX_PANE left over without TMUX (a shell started from tmux, then detached) is not.
+        let env = [("KITTY_WINDOW_ID", "3"), ("TMUX_PANE", "%12")];
+        assert!(matches!(
+            Pane::from_environ_pairs(env),
+            Some(Pane::Kitty { .. })
+        ));
+    }
 
     #[test]
     fn reads_kitty_window_socket_and_pid_from_proc_environ() {

@@ -14,8 +14,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::claude::config_json::Account;
 use crate::core::ids::AccountId;
+use crate::model::account::Account;
 
 /// The login file inside a Codex home.
 pub const AUTH_FILE: &str = "auth.json";

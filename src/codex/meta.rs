@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::claude::files::{FileKind, TranscriptFile};
 use crate::core::harness::Harness;
 use crate::core::ids::SeatId;
+use crate::model::files::{FileKind, TranscriptFile};
 
 /// The thread id of a rollout file: the uuid at the end of its name.
 pub fn thread_of(path: &Path) -> Option<String> {
@@ -117,6 +117,26 @@ type Found = Mutex<HashMap<(PathBuf, String), PathBuf>>;
 
 static FOUND: OnceLock<Found> = OnceLock::new();
 
+/// Threads whose rollout was not found, per home, with the stamp of the newest day dir then.
+type Missed = Mutex<HashMap<(PathBuf, String), Option<DayStamp>>>;
+
+/// The newest day dir, when it last changed, and how many files it holds (a change within one
+/// tick of a coarse clock still shows in the count).
+type DayStamp = (PathBuf, std::time::SystemTime, usize);
+
+static MISSED: OnceLock<Missed> = OnceLock::new();
+
+/// The newest day dir of `sessions/` and when it last changed: a new rollout of a running thread
+/// lands there. Three small listings, not a walk of every day.
+fn newest_day(home: &Path) -> Option<DayStamp> {
+    let y = sorted_dirs(&home.join("sessions")).into_iter().next()?;
+    let m = sorted_dirs(&y).into_iter().next()?;
+    let d = sorted_dirs(&m).into_iter().next()?;
+    let t = std::fs::metadata(&d).and_then(|m| m.modified()).ok()?;
+    let n = std::fs::read_dir(&d).map_or(0, |rd| rd.count());
+    Some((d, t, n))
+}
+
 fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -142,6 +162,15 @@ pub fn find_rollout(home: &Path, tid: &str) -> Option<PathBuf> {
     {
         return Some(p.clone());
     }
+    // A miss is not looked for again until a day dir changes: an open thread whose rollout is
+    // not written yet walked every day dir each second (review B-L15).
+    let stamp = newest_day(home);
+    let missed = MISSED.get_or_init(Default::default);
+    if let Ok(m) = missed.lock()
+        && m.get(&key) == Some(&stamp)
+    {
+        return None;
+    }
     let suffix = format!("-{tid}.jsonl");
     let matches = |p: &Path| {
         p.file_name()
@@ -161,7 +190,18 @@ pub fn find_rollout(home: &Path, tid: &str) -> Option<PathBuf> {
             }
         }
     }
-    let hit = hit?;
+    let Some(hit) = hit else {
+        if let Ok(mut m) = missed.lock() {
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(key, stamp);
+        }
+        return None;
+    };
+    if let Ok(mut m) = missed.lock() {
+        m.remove(&key);
+    }
     if let Ok(mut f) = found.lock() {
         if f.len() > 4096 {
             f.clear();
@@ -174,6 +214,22 @@ pub fn find_rollout(home: &Path, tid: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review B-L15: a miss is remembered until the newest day dir changes; a rollout written
+    /// then is found.
+    #[test]
+    fn a_missing_rollout_is_found_once_written() {
+        let t = tempfile::tempdir().unwrap();
+        let day = t.path().join("sessions/2026/11/24");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-2026-11-24T10-00-00-other.jsonl"), "").unwrap();
+        let tid = "0c0d0e0f-0000-4000-8000-0000000000aa";
+        assert_eq!(find_rollout(t.path(), tid), None);
+        assert_eq!(find_rollout(t.path(), tid), None, "remembered");
+        let p = day.join(format!("rollout-2026-11-24T10-05-00-{tid}.jsonl"));
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(find_rollout(t.path(), tid), Some(p));
+    }
 
     const TID: &str = "0a1b2c3d-0000-4000-8000-00000000000a";
 

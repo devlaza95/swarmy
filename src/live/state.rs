@@ -128,9 +128,58 @@ pub fn agent_state(
     (!hidden).then_some((state, since))
 }
 
+/// One agent as the waiting rule sees it: whether it is a session's main thread, its session
+/// (seat and session id), and its state.
+pub struct Member<'a> {
+    pub main: bool,
+    pub session: (&'a str, &'a str),
+    pub state: &'a State,
+}
+
+/// For each agent, the number of its session's background agents at work when it is an idle
+/// main thread (it then shows `WaitingAgents(n)`), else 0. Here, with the other state rules
+/// (review B-M23: it lived inside `live::build`).
+pub fn waiting_on_agents(agents: &[Member]) -> Vec<usize> {
+    agents
+        .iter()
+        .map(|m| {
+            if !m.main || *m.state != State::Idle {
+                return 0;
+            }
+            agents
+                .iter()
+                .filter(|a| !a.main && a.session == m.session && a.state.is_active())
+                .count()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_main_thread_waits_on_its_sessions_agents_at_work() {
+        fn m<'a>(main: bool, s: &'a str, state: &'a State) -> Member<'a> {
+            Member {
+                main,
+                session: ("seat", s),
+                state,
+            }
+        }
+        let (busy, idle) = (&State::Thinking, &State::Idle);
+        let agents = [
+            m(true, "s1", idle),
+            m(false, "s1", busy),
+            m(false, "s1", busy),
+            m(false, "s1", idle),
+            m(true, "s2", idle),
+            m(false, "s3", busy),
+            m(true, "s3", busy),
+        ];
+        // s1's main waits on two agents; s2 has none at work; s3's main is busy itself.
+        assert_eq!(waiting_on_agents(&agents), [2, 0, 0, 0, 0, 0, 0]);
+    }
 
     fn t(min: i64) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z")

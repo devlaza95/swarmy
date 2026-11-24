@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::claude::config_json::Account;
+use crate::model::account::Account;
 
 #[derive(Deserialize, Default)]
 #[serde(default)]

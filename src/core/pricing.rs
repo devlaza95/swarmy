@@ -16,6 +16,10 @@ use super::usage::Usage;
 mod builtin;
 use builtin::{BUILTIN, LONG_CONTEXT, writes_at_input};
 
+/// The most a web search can cost, in USD per request: no provider charges near it. A
+/// `[[price]]` above it was written per 1000 searches (`config::Config::validate`).
+pub const MAX_WEB_SEARCH_USD: f64 = 1.0;
+
 /// USD per million tokens; `web_search` is USD per request.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rates {

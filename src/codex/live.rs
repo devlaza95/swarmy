@@ -14,10 +14,10 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 
 use super::rollout::{self, TailState};
-use crate::claude::procs::{CodexProc, ProcTable};
-use crate::claude::registry::{LiveSession, SessionStatus};
 use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
+use crate::model::live::{LiveSession, SessionStatus};
+use crate::procs::{CodexProc, ProcTable};
 
 /// The lock directory of a Codex home.
 pub const LOCK_DIR: &str = "thread-writer-locks";
@@ -114,7 +114,7 @@ impl CodexLiveCache {
     /// live process yet, so a process that cannot be found costs one look-up, not one a second.
     pub fn resolve_procs(&mut self, home: &Path, open: &[String]) {
         self.by_thread
-            .retain(|tid, info| open.contains(tid) && pid_is_alive(info.pid));
+            .retain(|tid, info| open.contains(tid) && crate::procs::pid_alive_once(info.pid));
         let missing = open.iter().any(|t| !self.by_thread.contains_key(t));
         let mut key = open.to_vec();
         key.sort();
@@ -155,14 +155,10 @@ impl CodexLiveCache {
                 CodexProcInfo {
                     pid,
                     start_time,
-                    pane: crate::claude::pane::of(None, pid, None),
+                    pane: crate::terminal::of(None, pid, None),
                 },
             );
         }
-    }
-
-    pub fn proc_of(&self, tid: &str) -> Option<&CodexProcInfo> {
-        self.by_thread.get(tid)
     }
 
     /// The open threads of a Codex seat as live sessions.
@@ -212,20 +208,6 @@ impl CodexLiveCache {
 /// One look without a cache (CLI commands).
 pub fn open_threads_once(home: &Path) -> Vec<String> {
     crate::fsutil::locks::held_once(&home.join(LOCK_DIR))
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
 }
 
 #[cfg(test)]

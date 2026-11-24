@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use rusqlite::Connection;
 
-use super::agy_summaries;
+use crate::agy::summaries as agy_summaries;
 use crate::claude::files::{self, FileKind, TranscriptFile};
 use crate::claude::seats::{Seat, SeatId};
 use crate::claude::transcript;
@@ -73,11 +73,13 @@ pub(super) fn recent_files(
         })?;
         for r in rows {
             let (path, seat_id, session_id, agent_id, kind) = r?;
-            let harness = seats
-                .iter()
-                .find(|s| s.id == seat_id)
-                .map_or(Harness::Claude, |s| s.harness);
-            match harness {
+            // A file of a seat this process does not know (a harness turned off, a seat found
+            // only through another process's environment) is not read: which parser fits it is
+            // unknown, and a wrong one would move the offset past its spend.
+            let Some(seat) = seats.iter().find(|s| s.id == seat_id) else {
+                continue;
+            };
+            match seat.harness {
                 Harness::Agy => {
                     let cid = if agent_id.is_empty() {
                         session_id
@@ -88,10 +90,8 @@ pub(super) fn recent_files(
                     continue;
                 }
                 Harness::Codex => {
-                    if let Some(seat) = seats.iter().find(|s| s.id == seat_id) {
-                        let titles = crate::codex::meta::titles(&seat.dir);
-                        out.extend(crate::codex::meta::transcript_file(&seat.id, path, &titles));
-                    }
+                    let titles = crate::codex::meta::titles(&seat.dir);
+                    out.extend(crate::codex::meta::transcript_file(&seat.id, path, &titles));
                     continue;
                 }
                 Harness::Claude => {}

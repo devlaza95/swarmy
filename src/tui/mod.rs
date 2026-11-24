@@ -86,7 +86,7 @@ pub struct Analytics {
 
 #[derive(Debug, Clone, Default)]
 pub struct ProjectRow {
-    pub key: String,
+    pub key: crate::core::ids::ProjectKey,
     pub name: String,
     pub hour: f64,
     pub today: f64,
@@ -110,8 +110,6 @@ pub struct SeatRow {
     /// The confirmed account (None while a new login is unconfirmed).
     pub account: Option<String>,
     pub login: Option<String>,
-    /// Auth/plan hint for seats outside the Claude vault (e.g. `consumer`).
-    pub plan: Option<String>,
     /// The account's email, naming an account no limit report or login names (Codex);
     /// `--mask` hides it when drawn.
     pub email: Option<String>,

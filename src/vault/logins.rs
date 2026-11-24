@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::{Login, store};
 use crate::claude::seats::{Seat, SeatId};
 use crate::core::harness::Harness;
+use crate::core::ids::LoginId;
 use crate::errors::VaultError;
 
 /// The format of `logins.json`: 4 gives each login its `harness` and a list of seats in
@@ -147,6 +148,65 @@ impl Index {
     /// The login `key` names: its label, its id or its email. A key that names two logins
     /// (one's label is another's email, two logins of one email, one label in two harnesses)
     /// is an error that lists them, never a guess (review L3).
+    /// An id for a new login: `l` and the first 10 hex digits of its grant's fingerprint, with
+    /// `-2`, `-3`… when taken. A login keeps the id of its first grant when its refresh token
+    /// rotates, so that grant coming back (an old file imported) would otherwise get the same
+    /// id, overwrite the live secret, and be forgotten together with it (review A-H1).
+    pub(super) fn new_login_id(&self, fingerprint: &str) -> LoginId {
+        let base = format!("l{}", fingerprint.chars().take(10).collect::<String>());
+        let taken = |id: &str| self.logins.iter().any(|l| l.id.as_str() == id);
+        let mut id = base.clone();
+        let mut n = 2u32;
+        while taken(&id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        LoginId::from_stored(id)
+    }
+
+    /// What every saved vault holds (reviews A-H1, B-H1, B-M1, B-M5): login ids are unique, a
+    /// grant (harness and fingerprint) is saved once, every login has its secret, a seat holds
+    /// one login of its harness, and a Codex login (single-use refresh tokens) is in one seat at
+    /// most. The violations, worded for the journal; empty when it all holds.
+    pub(super) fn violations(&self, has_secret: impl Fn(&LoginId) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut grants = std::collections::BTreeSet::new();
+        let mut seats = std::collections::BTreeMap::new();
+        for l in &self.logins {
+            if !ids.insert(&l.id) {
+                out.push(format!("two logins have id '{}'", l.id));
+            }
+            if !grants.insert((l.harness, l.meta.fingerprint.as_str())) {
+                out.push(format!(
+                    "the grant of '{}' ({}) is saved twice",
+                    l.label, l.meta.fingerprint
+                ));
+            }
+            if !has_secret(&l.id) {
+                out.push(format!("login '{}' has no secret", l.label));
+            }
+            if !l.harness.shares_logins() && l.mounted.len() > 1 {
+                out.push(format!(
+                    "{} login '{}' is in {} seats",
+                    l.harness,
+                    l.label,
+                    l.mounted.len()
+                ));
+            }
+            for seat in &l.mounted {
+                if let Some(other) = seats.insert((l.harness, seat), l.label.as_str()) {
+                    out.push(format!(
+                        "seat {} holds both '{other}' and '{}'",
+                        self.seat_name(seat),
+                        l.label
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     pub(super) fn find(&self, key: &str) -> Result<&Login, VaultError> {
         self.find_in(key, None)
     }
@@ -162,7 +222,7 @@ impl Index {
             .logins
             .iter()
             .filter(|l| harness.is_none_or(|h| l.harness == h))
-            .filter(|l| l.label == key || l.id == key || l.email.as_deref() == Some(key))
+            .filter(|l| l.label == key || l.id.as_str() == key || l.email.as_deref() == Some(key))
             .collect();
         match hits.as_slice() {
             [one] => Ok(one),
@@ -177,14 +237,14 @@ impl Index {
         }
     }
 
-    pub(super) fn find_mut(&mut self, id: &str) -> Option<&mut Login> {
-        self.logins.iter_mut().find(|l| l.id == id)
+    pub(super) fn find_mut(&mut self, id: &LoginId) -> Option<&mut Login> {
+        self.logins.iter_mut().find(|l| l.id == *id)
     }
 
-    pub(super) fn label_of(&self, id: &str) -> Option<String> {
+    pub(super) fn label_of(&self, id: &LoginId) -> Option<String> {
         self.logins
             .iter()
-            .find(|l| l.id == id)
+            .find(|l| l.id == *id)
             .map(|l| l.label.clone())
     }
 
@@ -194,17 +254,21 @@ impl Index {
     pub(super) fn check_label(
         &self,
         label: &str,
-        id: Option<&str>,
+        id: Option<&LoginId>,
         harness: Harness,
     ) -> anyhow::Result<()> {
         if label.trim().is_empty() {
             return Err(VaultError::LabelEmpty.into());
         }
-        if self
-            .logins
-            .iter()
-            .any(|l| l.harness == harness && l.label == label && Some(l.id.as_str()) != id)
-        {
+        // A label may not be another login's label in the harness, nor any other login's id or
+        // email: lookups take all three, and an id that names two logins broke the vault's own
+        // lookups by id (review B-M5).
+        if self.logins.iter().any(|l| {
+            Some(&l.id) != id
+                && ((l.harness == harness && l.label == label)
+                    || l.id.as_str() == label
+                    || l.email.as_deref() == Some(label))
+        }) {
             return Err(VaultError::LabelTaken {
                 label: label.to_string(),
                 harness: harness.display_name().to_string(),

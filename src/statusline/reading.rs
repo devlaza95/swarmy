@@ -141,12 +141,7 @@ pub fn merge(
         (WindowKind::SevenDay, live.seven_day),
     ] {
         if let Some((utilization, resets_at)) = v {
-            readings.push(Reading {
-                kind,
-                utilization,
-                resets_at,
-                fetched_at: live.at,
-            });
+            readings.extend(Reading::parse(kind, utilization, resets_at, live.at));
         }
     }
     // Windows the status line does not carry (per-model weekly limits) keep the cached values.

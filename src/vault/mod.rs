@@ -18,13 +18,28 @@
 //! old or a whole new file. Every change goes through [`Vault::edit`], which holds the vault's
 //! OS lock, re-reads the files under it, and saves them through a [`VaultTx`].
 
+// A new variant of a domain enum (a harness, a window kind, a dim) must be handled where it
+// is matched, not fall into a catch-all (reviews A-H7, B-M24, B-L3).
+#![deny(clippy::wildcard_enum_match_arm)]
+// No result ignored, no string cut by bytes, and (where there are none) no silent numeric
+// casts: the strict lints switched on, in production code, where they hold already (reviews
+// A-H7, B-M24).
+#![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
+#![cfg_attr(not(test), deny(clippy::string_slice))]
+#![cfg_attr(not(test), deny(clippy::cast_possible_truncation))]
+#![cfg_attr(not(test), deny(clippy::cast_possible_wrap))]
+#![cfg_attr(not(test), deny(clippy::cast_sign_loss))]
+
 mod logins;
 mod seats;
 mod store;
 mod switch;
 
+mod new_login;
 use logins::{Index, read_index};
-pub use switch::SwitchReport;
+pub use new_login::{
+    NewLogin, new_login, new_login_recipe, new_login_scratch, parse_import, save_new_login,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -37,12 +52,13 @@ use crate::claude::config_json;
 use crate::claude::credentials::{self, LoginMeta, Secret};
 use crate::claude::seats::{Seat, SeatId};
 use crate::core::harness::Harness;
+use crate::core::ids::LoginId;
 pub use crate::errors::VaultError;
 use store::{Secrets, atomic_write};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Login {
-    pub id: String,
+    pub id: crate::core::ids::LoginId,
     pub label: String,
     /// The harness whose seats this login fits (logins saved before harnesses: Claude Code).
     #[serde(default)]
@@ -103,6 +119,8 @@ pub struct SeatState {
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Copies kept of each of the vault's own files, and of each seat file per seat.
 const VAULT_BACKUPS: usize = 30;
+/// How long a grant taken out of the vault is kept in `retired.json`.
+const RETIRED_DAYS: i64 = 90;
 const SEAT_BACKUPS: usize = 20;
 /// A read-only view of the vault, as of the last `open` or `edit`.
 pub struct Vault {
@@ -237,50 +255,6 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
     }
 }
 
-/// What to run for a new login of `h`, and what to do in it.
-pub fn new_login_recipe(h: Harness) -> (&'static str, &'static str) {
-    match h {
-        Harness::Claude => ("claude", "Run /login, choose the account, then /exit."),
-        Harness::Agy => ("agy", "Sign in with Google when agy asks, then quit agy."),
-        Harness::Codex => (
-            "codex",
-            "Sign in in the browser Codex opens; it returns by itself.",
-        ),
-    }
-}
-
-/// The process that makes a new login of `h` in the scratch dir `scratch`, and the seat the
-/// login lands in. Claude Code takes its config dir from `CLAUDE_CONFIG_DIR`; the agy CLI keys its
-/// dir on `HOME` (`$HOME/.gemini/antigravity-cli`; verified: it ignores
-/// `ANTIGRAVITY_APP_DATA_DIR` for its token and conversations), so it runs with `HOME=scratch`.
-pub fn new_login(h: Harness, label: &str, scratch: &Path) -> (std::process::Command, Seat) {
-    let (program, _) = new_login_recipe(h);
-    let mut cmd = std::process::Command::new(program);
-    let seat = match h {
-        Harness::Claude => {
-            cmd.env("CLAUDE_CONFIG_DIR", scratch);
-            Seat::new(
-                format!("scratch-{label}"),
-                scratch.to_path_buf(),
-                scratch.join(".claude.json"),
-                false,
-            )
-        }
-        Harness::Agy => {
-            cmd.env("HOME", scratch);
-            Seat::agy(
-                format!("scratch-{label}"),
-                scratch.join(".gemini").join("antigravity-cli"),
-            )
-        }
-        Harness::Codex => {
-            cmd.env("CODEX_HOME", scratch).arg("login");
-            Seat::codex(format!("scratch-{label}"), scratch.to_path_buf())
-        }
-    };
-    (cmd, seat)
-}
-
 /// The index as a reader sees it: labels an older version duplicated are told apart the way the
 /// next change will save them (`VaultTx::begin`), so a label never names two logins.
 fn read_view(dir: &Path) -> anyhow::Result<Index> {
@@ -336,6 +310,12 @@ impl Vault {
 
     pub fn logins(&self) -> &[Login] {
         &self.index.logins
+    }
+
+    /// Whether `label` can name a new login of `harness`: checked before its harness is started,
+    /// so a sign-in is not made for nothing (the save checks again under the lock).
+    pub fn check_new_label(&self, label: &str, harness: Harness) -> anyhow::Result<()> {
+        self.index.check_label(label, None, harness)
     }
 
     /// The login a label, an id or an email names (an error when it names none or several).
@@ -424,6 +404,8 @@ pub struct VaultTx<'a> {
     disk_secrets_text: Option<String>,
     /// `None` only for a read view (`VaultTx::detached`), which cannot save.
     lock: Option<&'a store::Lock>,
+    /// The one instant of this change: what it records is dated by it (review A-M6).
+    now: DateTime<Utc>,
 }
 
 impl<'a> VaultTx<'a> {
@@ -447,6 +429,7 @@ impl<'a> VaultTx<'a> {
             disk_secrets,
             disk_secrets_text,
             lock: Some(lock),
+            now: Utc::now(),
         })
     }
 
@@ -463,6 +446,7 @@ impl<'a> VaultTx<'a> {
             disk_secrets: Secrets::new(),
             disk_secrets_text: None,
             lock: None,
+            now: Utc::now(),
         })
     }
 
@@ -478,6 +462,17 @@ impl<'a> VaultTx<'a> {
         let secrets_changed = self.secrets != self.disk_secrets;
         if !logins_changed && !secrets_changed {
             return Ok(());
+        }
+        // Tests (debug builds) refuse a vault that breaks an invariant; a release build says so
+        // in the journal and saves anyway, so an old damaged vault never locks its owner out.
+        let broken = self.index.violations(|id| self.secrets.contains_key(id));
+        if !broken.is_empty() {
+            let msg = format!("vault invariants broken: {}", broken.join("; "));
+            journal(&self.dir, &msg);
+            crate::diag::log("vault", &msg);
+            if cfg!(debug_assertions) {
+                anyhow::bail!(msg);
+            }
         }
         store::backup(
             &self.dir.join("backups").join("vault"),
@@ -496,6 +491,9 @@ impl<'a> VaultTx<'a> {
             VAULT_BACKUPS,
         )?;
         let secrets_path = self.dir.join("secrets.json");
+        if secrets_changed {
+            self.retire_replaced_grants(self.now)?;
+        }
         if secrets_changed {
             let mut grown = self.disk_secrets.clone();
             grown.extend(self.secrets.clone());
@@ -523,12 +521,12 @@ impl<'a> VaultTx<'a> {
         self.index.find(key)
     }
 
-    fn secret(&self, id: &str) -> Option<Secret> {
+    fn secret(&self, id: &LoginId) -> Option<Secret> {
         let harness = self
             .index
             .logins
             .iter()
-            .find(|l| l.id == id)
+            .find(|l| l.id == *id)
             .map_or(Harness::Claude, |l| l.harness);
         self.secrets
             .get(id)
@@ -536,8 +534,67 @@ impl<'a> VaultTx<'a> {
             .map(|v| Secret::of(harness, v))
     }
 
-    fn set_secret(&mut self, id: &str, secret: &Secret) {
-        self.secrets.insert(id.to_string(), secret.expose().clone());
+    /// Keeps every grant this save takes out of `secrets.json` (a login forgotten, or its copy
+    /// replaced by another grant) in `retired.json` for [`RETIRED_DAYS`]: the backup ring turns
+    /// over in about a day of access-token refreshes, so a grant overwritten by mistake could be
+    /// recovered for only that long (review B-M28). A refreshed access token of the same grant
+    /// is not kept.
+    fn retire_replaced_grants(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
+        let fp = |id: &LoginId, v: &Value| {
+            let harness = self
+                .index
+                .logins
+                .iter()
+                .find(|l| l.id == *id)
+                .map_or(Harness::Claude, |l| l.harness);
+            Secret::of(harness, v.clone()).meta().fingerprint
+        };
+        let gone: Vec<(&LoginId, &Value)> = self
+            .disk_secrets
+            .iter()
+            .filter(|(id, old)| match self.secrets.get(*id) {
+                None => true,
+                Some(new) => fp(id, old) != fp(id, new),
+            })
+            .collect();
+        let path = self.dir.join("retired.json");
+        let mut kept: serde_json::Map<String, Value> = match store::read_optional(&path)? {
+            None => serde_json::Map::new(),
+            Some(t) => match serde_json::from_str(&t) {
+                Ok(m) => m,
+                // Never written over: what it holds may be the only copy of a grant.
+                Err(e) => {
+                    crate::diag::log(
+                        "vault",
+                        &format!("retired.json is damaged, left as is: {e}"),
+                    );
+                    return Ok(());
+                }
+            },
+        };
+        let before = kept.len();
+        let cutoff = (now - chrono::Duration::days(RETIRED_DAYS)).timestamp_millis();
+        kept.retain(|_, v| {
+            v.get("at")
+                .and_then(Value::as_i64)
+                .is_some_and(|t| t >= cutoff)
+        });
+        let pruned = kept.len() != before;
+        for (id, value) in &gone {
+            let label = self.index.label_of(id);
+            kept.insert(
+                format!("{id}@{}", now.timestamp_millis()),
+                serde_json::json!({"at": now.timestamp_millis(), "login": label, "secret": value}),
+            );
+        }
+        if gone.is_empty() && !pruned {
+            return Ok(());
+        }
+        atomic_write(&path, serde_json::to_string(&kept)?.as_bytes())
+    }
+
+    fn set_secret(&mut self, id: &LoginId, secret: &Secret) {
+        self.secrets.insert(id.clone(), secret.expose().clone());
     }
 
     fn journal(&self, line: &str) {
@@ -570,7 +627,7 @@ impl<'a> VaultTx<'a> {
         account: Option<&config_json::Account>,
         label: Option<&str>,
         mounted_in: Option<&SeatId>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<LoginId> {
         let choice = match label {
             Some(l) => Label::Given(l),
             None => Label::Default(
@@ -593,9 +650,9 @@ impl<'a> VaultTx<'a> {
         account: Option<&config_json::Account>,
         label: Label<'_>,
         mounted_in: Option<&SeatId>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<LoginId> {
         let meta = secret.meta();
-        let now = Utc::now();
+        let now = self.now;
         let account_with_meta: Option<config_json::Account> = account.map(|a| {
             let mut a = a.clone();
             a.apply_credentials(&meta);
@@ -604,25 +661,29 @@ impl<'a> VaultTx<'a> {
         let account = account_with_meta.as_ref();
         let account_id = account.map(|a| a.id().to_string());
         let logins = &self.index.logins;
-        let existing = mounted_in
-            .and_then(|seat| {
-                logins
-                    .iter()
-                    .find(|l| l.is_in(seat) && l.harness == secret.harness())
-            })
-            .filter(|l| {
-                account_id.is_none() || l.account_uuid.is_none() || l.account_uuid == account_id
-            })
+        // The grant decides first: a grant the vault holds is that login, whichever is mounted
+        // in the seat (review B-L6); else the seat's login takes it (a refresh followed).
+        let existing = logins
+            .iter()
+            .find(|l| l.harness == secret.harness() && l.meta.fingerprint == meta.fingerprint)
             .or_else(|| {
-                logins.iter().find(|l| {
-                    l.harness == secret.harness() && l.meta.fingerprint == meta.fingerprint
-                })
+                mounted_in
+                    .and_then(|seat| {
+                        logins
+                            .iter()
+                            .find(|l| l.is_in(seat) && l.harness == secret.harness())
+                    })
+                    .filter(|l| {
+                        account_id.is_none()
+                            || l.account_uuid.is_none()
+                            || l.account_uuid == account_id
+                    })
             })
             .map(|l| l.id.clone());
         // An existing login keeps its label unless one is given; a new one gets a free one.
         let new_label = match (&label, &existing) {
             (Label::Given(l), id) => {
-                self.index.check_label(l, id.as_deref(), secret.harness())?;
+                self.index.check_label(l, id.as_ref(), secret.harness())?;
                 Some(l.to_string())
             }
             (Label::Default(_), Some(_)) => None,
@@ -650,7 +711,7 @@ impl<'a> VaultTx<'a> {
                 id
             }
             None => {
-                let id = format!("l{}", meta.fingerprint.chars().take(10).collect::<String>());
+                let id = self.index.new_login_id(&meta.fingerprint);
                 self.index.logins.push(Login {
                     id: id.clone(),
                     label: new_label.context("a new login without a label")?,
@@ -676,7 +737,7 @@ impl<'a> VaultTx<'a> {
     }
 
     /// Takes the seat's current login into the vault.
-    pub fn capture(&mut self, seat: &Seat, label: Option<&str>) -> anyhow::Result<Option<String>> {
+    pub fn capture(&mut self, seat: &Seat, label: Option<&str>) -> anyhow::Result<Option<LoginId>> {
         self.sync(std::slice::from_ref(seat))?;
         let s = read_seat(seat)?;
         let Some(secret) = s.secret.clone() else {
@@ -700,7 +761,7 @@ impl<'a> VaultTx<'a> {
         s: &SeatLogin,
         secret: &Secret,
         label: Option<&str>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<LoginId> {
         let state = self.observe(seat, s);
         let choice = match label {
             Some(l) => Label::Given(l),

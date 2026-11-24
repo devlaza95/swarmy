@@ -318,7 +318,8 @@ impl Index {
         if dim.is_time() {
             return self.spend_by_time(dim, span, f);
         }
-        let read = |c: &Connection, s: Span| spend_by_on(c, dim, s, f);
+        let now = self.now();
+        let read = |c: &Connection, s: Span| spend_by_on(c, dim, s, f, now);
         if !dim.settles() {
             return read(&self.conn, span);
         }
@@ -329,8 +330,12 @@ impl Index {
     /// Sums per UTC quarter hour; local-time grouping happens in Rust (`time_key`), which is far
     /// cheaper than SQLite's `localtime` on every row and exact in every zone.
     pub(super) fn buckets(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
-        let parts =
-            self.settled_read(&format!("buckets|{f:?}"), span, |c, s| buckets_on(c, s, f))?;
+        let parts = {
+            let now = self.now();
+            self.settled_read(&format!("buckets|{f:?}"), span, |c, s| {
+                buckets_on(c, s, f, now)
+            })?
+        };
         Ok(settled::merge_buckets(parts))
     }
 
@@ -360,6 +365,7 @@ impl Index {
     }
 
     /// Spend grouped by two dimensions (e.g. project × model).
+    /// Spend per (label of `a`, key of `b`).
     pub fn matrix(
         &self,
         a: Dim,
@@ -367,16 +373,44 @@ impl Index {
         span: Span,
         f: &Filter,
     ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        Ok(self
+            .matrix_cells(a, b, span, f)?
+            .into_iter()
+            .map(|(_, la, kb, c)| (la, kb, c))
+            .collect())
+    }
+
+    /// Spend per (key of `a`, key of `b`): for joining with other rows of `a` by key, as two
+    /// projects of the same name are two rows (review B-H3).
+    pub fn matrix_by_key(
+        &self,
+        a: Dim,
+        b: Dim,
+        span: Span,
+        f: &Filter,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        Ok(self
+            .matrix_cells(a, b, span, f)?
+            .into_iter()
+            .map(|(ka, _, kb, c)| (ka, kb, c))
+            .collect())
+    }
+
+    fn matrix_cells(&self, a: Dim, b: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Cell>> {
         if a.is_time() && b.is_time() {
             let mut acc: BTreeMap<(String, String), f64> = BTreeMap::new();
             for (h, _, _, c, _, _) in self.buckets(span, f)? {
                 *acc.entry((Self::time_key(a, h), Self::time_key(b, h)))
                     .or_default() += c;
             }
-            return Ok(acc.into_iter().map(|((x, y), c)| (x, y, c)).collect());
+            return Ok(acc
+                .into_iter()
+                .map(|((x, y), c)| (x.clone(), x, y, c))
+                .collect());
         }
-        let read = |c: &Connection, s: Span| matrix_on(c, a, b, s, f);
-        let cells = if a.settles() && b.settles() {
+        let now = self.now();
+        let read = |c: &Connection, s: Span| matrix_on(c, a, b, s, f, now);
+        Ok(if a.settles() && b.settles() {
             settled::merge_cells(self.settled_read(
                 &format!("matrix|{a:?}|{b:?}|{f:?}"),
                 span,
@@ -384,16 +418,13 @@ impl Index {
             )?)
         } else {
             read(&self.conn, span)?
-        };
-        Ok(cells
-            .into_iter()
-            .map(|(_, la, kb, c)| (la, kb, c))
-            .collect())
+        })
     }
 
     pub fn total(&self, span: Span, f: &Filter) -> anyhow::Result<Row> {
+        let now = self.now();
         let parts = self.settled_read(&format!("total|{f:?}"), span, |c, s| {
-            archive::read(c, s, false, |c, p| total_on(c, p, f))
+            archive::read(c, s, false, now, |c, p| total_on(c, p, f))
         })?;
         Ok(match parts {
             (Some(mut a), b) => {
@@ -409,7 +440,7 @@ impl Index {
     pub fn total_priced(&self, span: Span, f: &Filter) -> anyhow::Result<(Row, Option<String>)> {
         let tx = self.conn.unchecked_transaction()?;
         let fp = super::schema::meta(&tx, "price_fp")?;
-        let row = total_on(&tx, archive::plan(&tx, span, false)?, f)?;
+        let row = total_on(&tx, archive::plan(&tx, span, false, self.now())?, f)?;
         tx.commit()?;
         Ok((row, fp))
     }
@@ -434,7 +465,9 @@ impl Index {
             ..Default::default()
         };
         if ms(span.end) >= ms(now) - super::SETTLED_AFTER_MS {
-            return Ok(archive::read(&self.conn, span, true, |c, p| total_on(c, p, &filter))?.cost);
+            return Ok(
+                archive::read(&self.conn, span, true, now, |c, p| total_on(c, p, &filter))?.cost,
+            );
         }
         let tx = self.conn.unchecked_transaction()?;
         let generation = super::schema::meta(&tx, "settled_gen")?;
@@ -453,7 +486,7 @@ impl Index {
         {
             return Ok(*v);
         }
-        let row = total_on(&tx, archive::plan(&tx, span, true)?, &filter)?;
+        let row = total_on(&tx, archive::plan(&tx, span, true, now)?, &filter)?;
         tx.commit()?;
         if row.pending == 0
             && let Some(fp) = fp
@@ -473,8 +506,9 @@ impl Index {
         span: Span,
         f: &Filter,
     ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        let now = self.now();
         let parts = self.settled_read(&format!("subs|{f:?}"), span, |c, s| {
-            substitutions_on(c, s, f)
+            substitutions_on(c, s, f, now)
         })?;
         Ok(settled::merge_counts(parts))
     }
@@ -496,6 +530,11 @@ impl Index {
                WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
              UNION SELECT account_uuid FROM (
                SELECT account_uuid FROM requests
+               WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
+               LIMIT 1
+             )
+             UNION SELECT account_uuid FROM (
+               SELECT account_uuid FROM usage_rollup
                WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
                LIMIT 1
              )",
@@ -552,90 +591,6 @@ impl Index {
         Ok(out.into_iter().collect())
     }
 
-    /// Claude Code's own totals vs. the transcript sums, over sessions that have both:
-    /// (sessions, claude code USD, transcript USD).
-    /// A session's transcript sum covers its rolled-up part too: sessions resumed after weeks
-    /// compare in full.
-    pub fn cost_crosscheck(&self, span: Span) -> anyhow::Result<(u64, f64, f64)> {
-        let source = if archive::rolled_until(&self.conn)? > 0 {
-            "(SELECT seat, session_id, cost, ts FROM requests
-              UNION ALL SELECT seat, session_id, cost, last_ts FROM usage_rollup)"
-        } else {
-            "requests"
-        };
-        let sql = format!(
-            "SELECT COUNT(*), SUM(cs.total_usd), SUM(t.cost) FROM cost_states cs
-             JOIN (SELECT seat, session_id, TOTAL(cost) AS cost, MAX(ts) AS last FROM {source} GROUP BY 1, 2) t
-               ON t.seat = cs.seat AND t.session_id = cs.session_id
-             WHERE t.last >= ?1 AND t.last < ?2"
-        );
-        Ok(self.conn.query_row(
-            &sql,
-            rusqlite::params![
-                ms(span.start.max(DateTime::<Utc>::UNIX_EPOCH)),
-                ms(span.end)
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                    r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                ))
-            },
-        )?)
-    }
-
-    /// The rows of one table (a table walk: for `doctor` and tests, never a per-second path).
-    pub fn count(&self, t: Counted) -> anyhow::Result<u64> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT COUNT(*) FROM {}", t.table()), [], |r| {
-                r.get::<_, i64>(0)
-            })? as u64)
-    }
-
-    /// Transcripts the last refresh that tried could not read, whose file is still there: (path,
-    /// error, since when in epoch ms), oldest first.
-    pub fn unreadable_files(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
-        let mut st = self.conn.prepare_cached(
-            "SELECT path, error, since FROM unreadable_files ORDER BY since, path",
-        )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        let all: Vec<(String, String, i64)> = rows.collect::<Result<_, _>>()?;
-        Ok(all
-            .into_iter()
-            .filter(|(p, ..)| std::path::Path::new(p).exists())
-            .collect())
-    }
-
-    pub fn record_types(&self) -> anyhow::Result<Vec<(String, u64)>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT type, SUM(count) FROM record_types GROUP BY 1 ORDER BY 2 DESC")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    pub fn api_errors(&self, span: Span) -> anyhow::Result<Vec<(String, u64)>> {
-        archive::read(&self.conn, span, false, |c, p| {
-            let (b0, b1) = p.buckets();
-            let sql = if p.archive {
-                format!(
-                    "SELECT kind, SUM(n) FROM (SELECT kind, 1 AS n FROM api_errors WHERE ts >= ?1 AND ts < ?2
-                       UNION ALL SELECT kind, n FROM api_error_rollup WHERE bucket >= {b0} AND bucket < {b1})
-                     GROUP BY 1 ORDER BY 2 DESC, 1"
-                )
-            } else {
-                "SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 AND ts < ?2 GROUP BY 1 ORDER BY 2 DESC, 1".into()
-            };
-            let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(rusqlite::params![p.start, p.end], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
     /// Spend per bucket of `bucket_minutes` over a span, for sparklines and burn rate.
     pub fn spend_series(
         &self,
@@ -648,8 +603,9 @@ impl Index {
         let n = (((ms(span.end) - origin) as f64) / bucket as f64)
             .ceil()
             .max(1.0) as usize;
+        let now = self.now();
         let parts = self.settled_read(&format!("series|{bucket}|{f:?}"), span, |c, s| {
-            series_on(c, s, origin, bucket, n, f)
+            series_on(c, s, origin, bucket, n, f, now)
         })?;
         // The kept part was summed for the span end of the call that read it: its length can
         // differ from this call's (its buckets past the horizon are empty anyway). The length is
@@ -676,7 +632,19 @@ where
     match dim {
         Dim::Day => t.format("%Y-%m-%d").to_string(),
         Dim::Hour => t.format("%H").to_string(),
-        _ => t.format("%w").to_string(),
+        // Only time dims are bucketed; the weekday is the coarsest.
+        Dim::Weekday
+        | Dim::Project
+        | Dim::Worktree
+        | Dim::Branch
+        | Dim::Account
+        | Dim::Seat
+        | Dim::Harness
+        | Dim::Model
+        | Dim::Effort
+        | Dim::AgentType
+        | Dim::Session
+        | Dim::Agent => t.format("%w").to_string(),
     }
 }
 
@@ -685,9 +653,10 @@ pub(super) fn spend_by_on(
     dim: Dim,
     span: Span,
     f: &Filter,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Row>> {
     let (key, label) = dim.exprs();
-    archive::read(c, span, false, |c, p| {
+    archive::read(c, span, false, now, |c, p| {
         let mut args = Vec::new();
         let wh = where_clause(p, f, &mut args);
         let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
@@ -711,8 +680,13 @@ pub(super) fn spend_by_on(
     })
 }
 
-pub(super) fn buckets_on(c: &Connection, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
-    archive::read(c, span, false, |c, p| {
+pub(super) fn buckets_on(
+    c: &Connection,
+    span: Span,
+    f: &Filter,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Vec<BucketRow>> {
+    archive::read(c, span, false, now, |c, p| {
         let mut args = Vec::new();
         let wh = where_clause(p, f, &mut args);
         let from = from_for(p, &[&wh]);
@@ -734,6 +708,7 @@ pub(super) fn matrix_on(
     b: Dim,
     span: Span,
     f: &Filter,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<Cell>> {
     let (ka, la) = a.exprs();
     let (kb, _) = b.exprs();
@@ -742,7 +717,7 @@ pub(super) fn matrix_on(
     } else {
         format!("MAX({la})")
     };
-    archive::read(c, span, false, |c, p| {
+    archive::read(c, span, false, now, |c, p| {
         let mut args = Vec::new();
         let wh = where_clause(p, f, &mut args);
         let from = from_for(p, &[&la, kb, ka, &wh]);
@@ -766,8 +741,9 @@ pub(super) fn substitutions_on(
     c: &Connection,
     span: Span,
     f: &Filter,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<(String, String, u64)>> {
-    archive::read(c, span, false, |c, p| {
+    archive::read(c, span, false, now, |c, p| {
         let mut args = Vec::new();
         let wh = where_clause(p, f, &mut args);
         let sql = format!(
@@ -792,8 +768,9 @@ pub(super) fn series_on(
     bucket: i64,
     n: usize,
     f: &Filter,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<f64>> {
-    archive::read(c, span, false, |c, p| {
+    archive::read(c, span, false, now, |c, p| {
         let mut args = Vec::new();
         let wh = where_clause(p, f, &mut args);
         let sql = format!(

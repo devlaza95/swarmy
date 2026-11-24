@@ -1,13 +1,12 @@
 //! Everything a command needs: dirs, config, seats, prices, a fresh index.
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 use crate::agy::discovery::{self as agy_discovery, AgyCandidates};
 use crate::claude::config_json;
-use crate::claude::procs::ProcTable;
 use crate::claude::project::Resolver;
 use crate::claude::seats::{self, Candidates, Seat, SeatId};
 use crate::codex::discovery::{self as codex_discovery, CodexCandidates};
@@ -19,6 +18,7 @@ use crate::core::period::Span;
 use crate::core::pricing::PriceBook;
 use crate::errors::LookupError;
 use crate::index::{Index, Progress, RefreshStats, SeatInfo};
+use crate::procs::ProcTable;
 use crate::ui::fmt;
 use crate::ui::style::Painter;
 
@@ -33,11 +33,18 @@ pub struct Ctx {
     pub mask: bool,
     pub now: DateTime<Utc>,
     /// Saved logins by account: names and plan tiers for accounts not in any seat right now.
-    pub login_labels: std::collections::BTreeMap<String, String>,
+    pub login_labels: std::collections::BTreeMap<String, LoginName>,
     pub login_tiers: std::collections::BTreeMap<String, String>,
     /// What could not be read and so may make numbers wrong (a damaged `.claude.json`, an
     /// unreadable vault): `doctor` lists them, the dashboard shows them in ATTENTION.
     pub problems: Vec<String>,
+}
+
+/// A saved login's name for its account, with the email it was made from (for `--mask`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginName {
+    pub label: String,
+    pub email: Option<String>,
 }
 
 impl Ctx {
@@ -51,22 +58,9 @@ impl Ctx {
         // config dirs of running `claude`, `agy` or `codex` processes, which belong to the real
         // user.
         let isolated = std::env::var_os("SWARMY_ISOLATED").is_some();
-        let mut claude_cfg = Vec::new();
-        let mut agy_cfg = Vec::new();
-        let mut codex_cfg = Vec::new();
-        for (path, label, explicit) in config.seat_entries(&dirs.home) {
-            let h = match explicit {
-                Some(h) => h,
-                None if agy_discovery::looks_like_agy_dir(&path) => Harness::Agy,
-                None if codex_discovery::looks_like_codex_dir(&path) => Harness::Codex,
-                None => Harness::Claude,
-            };
-            match h {
-                Harness::Claude => claude_cfg.push((path, label)),
-                Harness::Agy => agy_cfg.push((path, label)),
-                Harness::Codex => codex_cfg.push((path, label)),
-            }
-        }
+        let claude_cfg = config.seats_of(&dirs.home, Harness::Claude);
+        let agy_cfg = config.seats_of(&dirs.home, Harness::Agy);
+        let codex_cfg = config.seats_of(&dirs.home, Harness::Codex);
         let mut seats = Vec::new();
         if config.harness_enabled(Harness::Claude) {
             let mut env_dirs: Vec<PathBuf> = procs
@@ -75,7 +69,7 @@ impl Ctx {
                 .filter(|_| !isolated)
                 .filter_map(|p| p.config_dir.clone())
                 .collect();
-            if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+            if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|_| !isolated) {
                 env_dirs.push(PathBuf::from(d));
             }
             seats.extend(seats::discover(&Candidates {
@@ -141,13 +135,7 @@ impl Ctx {
             }
             seat_info.push(info);
         }
-        // A seat whose transcript retention cannot be read is said so (the raw window is
-        // checked against Claude Code's default for it).
-        for s in &seats {
-            if let Err(e) = s.cleanup_period_days() {
-                problems.push(format!("seat {}: {e}", s.label));
-            }
-        }
+        seat_problems(&config, &dirs.home, &seats, &mut problems);
         let prices = price_book(&caches, &config, Utc::now())?;
         let mut ctx = Ctx {
             dirs,
@@ -201,12 +189,16 @@ impl Ctx {
             &retention,
         )
         .map_err(|e| {
-            let from = if explicit.is_some() {
-                "--keep-days"
+            if explicit.is_some() {
+                anyhow::anyhow!("--keep-days: {e}")
             } else {
-                "[storage] in config.toml"
-            };
-            anyhow::anyhow!("{from}: {e}")
+                // A config error keeps its code (`config-invalid`; review B-L10).
+                crate::errors::ConfigError::Invalid {
+                    path: self.dirs.config_file(),
+                    message: format!("[storage] {e}"),
+                }
+                .into()
+            }
         })
     }
 
@@ -229,9 +221,11 @@ impl Ctx {
                 info
             })
             .collect();
+        let config = Config::load(&self.dirs)?;
+        seat_problems(&config, &self.dirs.home, &self.seats, &mut problems);
         self.problems = problems;
         self.check_unconfirmed();
-        self.config.price = Config::load(&self.dirs)?.price;
+        self.config.price = config.price;
         let prices = price_book(&caches, &self.config, self.now)?;
         if prices.fingerprint() == self.prices.fingerprint() {
             return Ok(false);
@@ -261,10 +255,14 @@ impl Ctx {
         self.login_tiers.clear();
         for l in v.logins() {
             if let Some(a) = &l.account_uuid {
-                // `--mask` hides a label made from the login's email (`ui::mask`).
-                self.login_labels.entry(a.clone()).or_insert_with(|| {
-                    crate::ui::mask::login_label(&l.label, l.email.as_deref(), self.mask)
-                });
+                // Unmasked: `--mask` is applied where a name is shown (`shown_account_name`), so
+                // what joins (`[subscription]` keys, `fleet.json`) never depends on it.
+                self.login_labels
+                    .entry(a.clone())
+                    .or_insert_with(|| LoginName {
+                        label: l.label.clone(),
+                        email: l.email.clone(),
+                    });
                 if let Some(t) = l.plan.clone().or_else(|| l.meta.rate_limit_tier.clone()) {
                     self.login_tiers.insert(a.clone(), t);
                 }
@@ -386,6 +384,7 @@ impl Ctx {
     /// progress on stderr.
     pub fn index(&self) -> anyhow::Result<(Index, RefreshStats)> {
         let mut idx = Index::open(&self.dirs.index_file())?;
+        idx.set_now(self.now);
         idx.set_known_accounts(self.saved_accounts());
         let mut resolver = Resolver::new(self.config.project.clone());
         let tty = std::io::stderr().is_terminal();
@@ -431,9 +430,20 @@ impl Ctx {
         Ok((idx, stats))
     }
 
-    /// Display name of an account: the config label, else a saved login's label, else the seats it
-    /// is logged into, else the email / org name (masked on request), else a short id.
+    /// Name of an account: the config label, else a saved login's label, else the seats it is
+    /// logged into, else the email / org name, else a short id. Unmasked: what front ends print
+    /// goes through [`Ctx::shown_account_name`].
     pub fn account_name(&self, uuid: &str) -> String {
+        self.account_name_as(uuid, false)
+    }
+
+    /// [`Ctx::account_name`] as printed: `--mask` hides a login label made from its email and
+    /// an email or org name.
+    pub fn shown_account_name(&self, uuid: &str) -> String {
+        self.account_name_as(uuid, self.mask)
+    }
+
+    fn account_name_as(&self, uuid: &str, mask: bool) -> String {
         let user = AccountId::new(uuid);
         if let Some(l) = self.config.accounts.get(uuid) {
             return l.clone();
@@ -455,7 +465,7 @@ impl Ctx {
         }
         // A saved login's label names its account best: seat names would mix the two ideas.
         if let Some(l) = self.login_labels.get(uuid) {
-            return l.clone();
+            return crate::ui::mask::login_label(&l.label, l.email.as_deref(), mask);
         }
         let seats: Vec<&str> = self
             .seat_info
@@ -466,7 +476,7 @@ impl Ctx {
         if !seats.is_empty() {
             return format!("account in {}", seats.join("+"));
         }
-        if !self.mask
+        if !mask
             && let Some(a) = self
                 .seat_info
                 .iter()
@@ -528,6 +538,32 @@ impl Ctx {
     /// seat now: a login parked in the vault keeps its last known limit and reset time. Every
     /// surface (`swarmy limits`, `swarmy accounts`, `doctor`, the dashboard, the status line
     /// through `fleet`) starts from these readings, so they agree on an account.
+    /// What the limit analysis takes (`limits::all_reports`): the latest readings of every
+    /// account, with each one's plan tier (its seat's, else its saved login's) and name.
+    pub fn limits_inputs(&self, idx: &Index) -> anyhow::Result<crate::limits::LimitsInputs> {
+        let readings = self.latest_readings(idx)?;
+        let mut tiers = std::collections::HashMap::new();
+        let mut names = std::collections::HashMap::new();
+        for (acct, _) in &readings {
+            let seat_tier = self
+                .seat_info
+                .iter()
+                .filter_map(|s| s.account.as_ref())
+                .find(|a| a.id().as_str() == acct)
+                .and_then(|a| a.effective_tier());
+            if let Some(t) = seat_tier.or_else(|| self.login_tiers.get(acct).cloned()) {
+                tiers.insert(acct.clone(), t);
+            }
+            names.insert(acct.clone(), self.account_name(acct));
+        }
+        Ok(crate::limits::LimitsInputs {
+            now: self.now,
+            readings,
+            tiers,
+            names,
+        })
+    }
+
     pub fn latest_readings(&self, idx: &Index) -> anyhow::Result<Vec<(String, Vec<Reading>)>> {
         let mut merged: std::collections::BTreeMap<String, Vec<Reading>> =
             idx.latest_readings()?.into_iter().collect();
@@ -653,7 +689,7 @@ impl Ctx {
                 &format!("cannot read the vault, login labels are not matched: {e:#}"),
             ),
         }
-        let name = |a: &AccountId| format!("{} ({a})", self.account_name(a.as_str()));
+        let name = |a: &AccountId| format!("{} ({a})", self.shown_account_name(a.as_str()));
         let mut it = found.iter();
         match (it.next(), it.next()) {
             (Some(one), None) => Ok(one.clone()),
@@ -669,10 +705,18 @@ impl Ctx {
     /// The seat a user named: by its label, else by its id. An unknown name is an error that
     /// lists the seats.
     pub fn resolve_seat(&self, name: &str) -> anyhow::Result<&Seat> {
+        // A label, else an id, else the dir (as written or canonical): one rule for every
+        // command (review A-M3: `accounts` had its own, without ids and without an error code).
+        let canonical = crate::fsutil::canonical(Path::new(name));
         self.seats
             .iter()
             .find(|s| s.label == name)
             .or_else(|| self.seats.iter().find(|s| s.id.as_str() == name))
+            .or_else(|| {
+                self.seats.iter().find(|s| {
+                    s.dir.to_string_lossy() == name || canonical.as_ref().is_ok_and(|c| *c == s.dir)
+                })
+            })
             .ok_or_else(|| {
                 LookupError::NoSeat {
                     name: name.to_string(),
@@ -721,6 +765,30 @@ pub fn price_book(
     }
     config.apply_prices(&mut prices, now.with_timezone(&chrono::Local).date_naive())?;
     Ok(prices)
+}
+
+/// What is wrong with the seats themselves, the same at startup and on every reload: a
+/// `[[seat]]` whose files fit several harnesses, and a seat whose transcript retention cannot be
+/// read (the raw window is then checked against Claude Code's default).
+fn seat_problems(config: &Config, home: &Path, seats: &[Seat], problems: &mut Vec<String>) {
+    for (path, label, explicit) in config.seat_entries(home) {
+        if explicit.is_some() {
+            continue;
+        }
+        if let Err(found) = crate::config::detect_harness(&path) {
+            let names: Vec<&str> = found.iter().map(|h| h.key()).collect();
+            problems.push(format!(
+                "[[seat]] {}: its files fit {}; set `harness = \"…\"` (read as claude until then)",
+                label.unwrap_or_else(|| path.display().to_string()),
+                names.join(" and "),
+            ));
+        }
+    }
+    for s in seats {
+        if let Err(e) = s.cleanup_period_days() {
+            problems.push(format!("seat {}: {e}", s.label));
+        }
+    }
 }
 
 /// What a seat says about itself: its account from `.claude.json`, and its limit readings — the
@@ -795,6 +863,37 @@ pub fn seat_info_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review B-H4: a used Claude Code dir has `sessions/` and `history.jsonl`, which Codex
+    /// writes too; the README's `[[seat]]` (no `harness`) must stay a Claude Code seat.
+    #[test]
+    fn a_configured_seat_without_harness_is_judged_by_its_own_files() {
+        let t = tempfile::tempdir().unwrap();
+        let cc = t.path().join("agents/cc-work");
+        for d in ["sessions", "projects"] {
+            std::fs::create_dir_all(cc.join(d)).unwrap();
+        }
+        std::fs::write(cc.join("history.jsonl"), "").unwrap();
+        assert_eq!(crate::config::detect_harness(&cc), Ok(Harness::Claude));
+        let both = t.path().join("both");
+        std::fs::create_dir_all(both.join("projects")).unwrap();
+        std::fs::write(both.join("auth.json"), "{}").unwrap();
+        let config: Config = toml::from_str(&format!(
+            "[[seat]]\npath = {:?}\nlabel = \"work\"\n\n[[seat]]\npath = {:?}\nlabel = \"odd\"\n\n\
+             [[seat]]\npath = {:?}\nharness = \"codex\"\n",
+            cc.display().to_string(),
+            both.display().to_string(),
+            both.display().to_string(),
+        ))
+        .unwrap();
+        let mut problems = Vec::new();
+        seat_problems(&config, t.path(), &[], &mut problems);
+        // Only the ambiguous dir without `harness` is a problem; saying it settles it.
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("[[seat]] odd:") && problems[0].contains("claude and codex")
+        );
+    }
 
     /// First review H5: a damaged `.claude.json` is a problem that is reported, never a seat
     /// without an account; a seat that has none yet is no problem.

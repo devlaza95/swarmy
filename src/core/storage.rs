@@ -110,7 +110,7 @@ pub fn outlook(
     let kept = file_bytes.saturating_sub(free_bytes).saturating_sub(raw);
     let days = raw_days.max(1.0);
     // The raw window once it holds `keep_raw_days` days at today's pace.
-    let raw_full = (raw as f64 / days * keep_raw_days as f64) as u64;
+    let raw_full = bytes(raw as f64 / days * keep_raw_days as f64);
     let recent = &samples[samples.len().saturating_sub(SLOPE_SAMPLES)..];
     let slope = (recent.len() >= MIN_SAMPLES).then(|| {
         let n = recent.len() as f64;
@@ -130,8 +130,23 @@ pub fn outlook(
         kept_bytes: kept,
         per_day,
         from_samples: slope.is_some(),
-        in_12_months: raw_full + kept + (per_day * 365.0) as u64,
+        in_12_months: raw_full + kept + bytes(per_day * 365.0),
     }
+}
+
+/// A projected byte count: an estimate, so a negative or non-finite one is 0 and one past
+/// `u64` is `u64::MAX`.
+fn bytes(x: f64) -> u64 {
+    if !(x.is_finite() && x > 0.0) {
+        return 0;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite and above zero, checked above; `as` saturates past u64::MAX"
+    )]
+    let b = x as u64;
+    b
 }
 
 #[cfg(test)]

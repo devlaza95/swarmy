@@ -32,9 +32,9 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
-use crate::claude::transcript::{Chunk, Event, ParseStats, Request, ToolUse};
 use crate::core::tools::ToolClass;
 use crate::core::usage::Usage;
+use crate::model::event::{Chunk, Event, ParseStats, Request, ToolUse};
 
 /// The model of a record that carries tool calls but no usage (see [`Ctx::flush_tools`]).
 const NO_REQUEST_MODEL: &str = "<synthetic>";
@@ -669,6 +669,7 @@ fn event_msg(p: &Value, ts: Option<DateTime<Utc>>, sid: &str, ctx: &mut Ctx, out
             text: str_of(p, "message")
                 .map(|m| truncate(m, 200))
                 .unwrap_or_default(),
+            id: None,
         }),
     }
 }
@@ -690,11 +691,19 @@ fn prompt(text: &str, ts: Option<DateTime<Utc>>, ctx: &mut Ctx, out: &mut Vec<Ev
     out.push(Event::Prompt {
         ts,
         text: truncate(text, 200),
+        id: None,
     });
 }
 
-/// The state at the end of each file's last read, by path.
-type States = Mutex<HashMap<PathBuf, (u64, Ctx)>>;
+/// The state at the end of each file's last read, by path: (offset, file identity, state). A
+/// file replaced at the same path and grown to the same offset is another file (review A-H6).
+type States = Mutex<HashMap<PathBuf, (u64, u64, Ctx)>>;
+
+fn file_id_of(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| crate::fsutil::file_id(path, &m))
+}
 
 static STATES: OnceLock<States> = OnceLock::new();
 
@@ -706,8 +715,9 @@ fn state_at(path: &Path, offset: u64, sid: &str) -> std::io::Result<Ctx> {
         return Ok(Ctx::default());
     }
     if let Ok(m) = STATES.get_or_init(Default::default).lock()
-        && let Some((end, ctx)) = m.get(path)
+        && let Some((end, id, ctx)) = m.get(path)
         && *end == offset
+        && file_id_of(path) == Some(*id)
     {
         return Ok(ctx.clone());
     }
@@ -735,7 +745,9 @@ fn keep_state(path: &Path, end: u64, ctx: Ctx) {
         if m.len() >= MAX_STATES {
             m.clear();
         }
-        m.insert(path.to_path_buf(), (end, ctx));
+        if let Some(id) = file_id_of(path) {
+            m.insert(path.to_path_buf(), (end, id, ctx));
+        }
     }
 }
 

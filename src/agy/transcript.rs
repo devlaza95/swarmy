@@ -12,17 +12,17 @@
 //! - `SYSTEM_MESSAGE`: system notification (skipped)
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::claude::transcript::{Chunk, Event, ParseStats, Request, ToolUse};
 use crate::core::models::split_effort_suffix;
 use crate::core::tools::ToolClass;
 use crate::core::usage::Usage;
+use crate::model::event::{Chunk, Event, ParseStats, Request, ToolUse};
 
 /// The model of a step whose usage Antigravity did not record (see `parse_line`).
 const UNRECORDED_MODEL: &str = "<synthetic>";
@@ -338,6 +338,7 @@ pub fn parse_line(
                     out.push(Event::Prompt {
                         ts,
                         text: truncate(&text, 200),
+                        id: None,
                     });
                 }
             }
@@ -357,6 +358,7 @@ pub fn parse_line(
                 ts,
                 kind: "agy_error".into(),
                 text,
+                id: None,
             });
         }
         StepKind::SystemMessage => {}
@@ -401,15 +403,10 @@ pub fn read_from(
 
 /// Reads the last text response from the tail of an Antigravity transcript (for `AGENT` panel).
 pub fn last_message(path: &Path) -> Option<String> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(256 * 1024);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = String::new();
-    f.read_to_string(&mut buf).ok()?;
+    let buf = crate::fsutil::tail_lines(path, 256 * 1024).ok()?;
     let mut events = Vec::new();
     let mut stats = ParseStats::default();
-    for line in buf.lines().skip(usize::from(start > 0)) {
+    for line in buf.lines() {
         parse_line(line, "", None, &mut events, &mut stats);
     }
     events.iter().rev().find_map(|e| match e {

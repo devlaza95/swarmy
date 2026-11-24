@@ -41,7 +41,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             Harness::Agy => {
                 let locked = agy_cache.locked_conversations(&s.dir);
                 agy_cache.resolve_procs(&s.dir, &locked);
-                let metas = crate::index::agy_summaries::read_all(&s.dir);
+                let metas = crate::agy::summaries::read_all(&s.dir);
                 crate::agy::live::build_live_sessions(
                     &s.id, &locked, &metas, &agy_cache, &ctx.procs, ctx.now,
                 )
@@ -69,7 +69,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         let acct = si
             .account
             .as_ref()
-            .map(|a| ctx.account_name(a.id().as_str()))
+            .map(|a| ctx.shown_account_name(a.id().as_str()))
             .unwrap_or_else(|| "(not logged in)".into());
         let plan = si
             .account
@@ -153,7 +153,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 info(&format!(
                     "seats {} are logged into the same account ({}): they share one limit",
                     seats.join(" + "),
-                    ctx.account_name(acct)
+                    ctx.shown_account_name(acct)
                 ))
             );
         }
@@ -275,6 +275,15 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
+    if let Some(n) = idx.meta("rebuild_refused")?.filter(|n| n != "0") {
+        println!(
+            "{}",
+            warn(&format!(
+                "a cache rebuild left out {n} kept rows (of transcripts that are gone) the new schema refused; \
+                 their spend is missing"
+            ))
+        );
+    }
     for (path, error, since) in idx.unreadable_files()? {
         println!(
             "{}",
@@ -287,13 +296,20 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
-    let unknown: Vec<(&str, u64)> = ps
-        .unknown_types()
-        .into_iter()
-        .filter(|(t, _)| {
-            !crate::agy::transcript::KNOWN_TYPES.contains(t)
-                && !crate::codex::rollout::KNOWN_TYPES.contains(t)
+    let malformed = crate::claude::transcript::MALFORMED;
+    let by_harness = idx.record_types_by_harness()?;
+    let unknown: Vec<(&str, u64)> = by_harness
+        .iter()
+        .filter(|(h, t, _)| match h {
+            Harness::Claude => !crate::claude::transcript::is_known_type(t),
+            Harness::Agy => {
+                !crate::agy::transcript::KNOWN_TYPES.contains(&t.as_str()) && t != malformed
+            }
+            Harness::Codex => {
+                !crate::codex::rollout::KNOWN_TYPES.contains(&t.as_str()) && t != malformed
+            }
         })
+        .map(|(_, t, n)| (t.as_str(), *n))
         .collect();
     if unknown.is_empty() {
         println!("{}", ok("every transcript record type is recognised"));
@@ -370,7 +386,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 "{}",
                 ok(&format!(
                     "{} {} {} · resets {} · reading {} old",
-                    ctx.account_name(&acct),
+                    ctx.shown_account_name(&acct),
                     r.kind.label(),
                     fmt::pct(r.utilization),
                     r.resets_at
@@ -541,12 +557,12 @@ fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::procs::ProcTable;
     use crate::config::{Config, Dirs};
     use crate::core::pricing::PriceBook;
     use crate::index::archive_scenarios::{NOW, populate, refresh};
     use crate::index::compact::CompactOpts;
     use crate::index::scenarios::{World, at};
+    use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
 
     #[test]

@@ -199,7 +199,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 (acct, false)
             }
             LimitsRow::Login(id) => {
-                let l = app.vault.logins.iter().find(|x| &x.id == id);
+                let l = app.vault.logins.iter().find(|x| x.id.as_str() == id);
                 let label = l.map(|x| x.label.clone()).unwrap_or_default();
                 // The seats that hold it, or free.
                 let seats: Vec<String> = l
@@ -295,7 +295,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                     .vault
                     .logins
                     .iter()
-                    .find(|x| &x.id == id)
+                    .find(|x| x.id.as_str() == id)
                     .and_then(|x| x.plan.clone().or_else(|| x.meta.subscription_type.clone()))
                     .unwrap_or_default(),
             };
@@ -305,9 +305,12 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             ));
         }
         // Status: what to do or expect.
-        let report = account
-            .as_deref()
-            .and_then(|a| app.analytics.limits.iter().find(|x| x.account_uuid == a));
+        let report = account.as_deref().and_then(|a| {
+            app.analytics
+                .limits
+                .iter()
+                .find(|x| x.account.as_str() == a)
+        });
         let weekly = report.and_then(|r| {
             r.windows
                 .iter()
@@ -361,7 +364,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 (parts.join(" · "), colour)
             }
             LimitsRow::Login(id) => {
-                let l = app.vault.logins.iter().find(|x| &x.id == id);
+                let l = app.vault.logins.iter().find(|x| x.id.as_str() == id);
                 let read = weekly
                     .map(|w| {
                         format!(
@@ -478,7 +481,12 @@ fn section_head(app: &App, h: Harness, rows: &[LimitsRow]) -> Line<'static> {
 /// email an agy account is keyed by, else the email a seat's login names (Codex), else a short
 /// id.
 fn account_name(app: &App, id: &str) -> String {
-    if app.analytics.limits.iter().any(|r| r.account_uuid == id) {
+    if app
+        .analytics
+        .limits
+        .iter()
+        .any(|r| r.account.as_str() == id)
+    {
         return app.account_label(id);
     }
     if let Some(email) = id.strip_prefix("agy:") {
@@ -548,7 +556,7 @@ fn limit_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Li
                 break;
             }
             let mut sp = vec![Span::styled(
-                format!("  {} ", fit(&s.key, name_w)),
+                format!("  {} ", fit(&s.name, name_w)),
                 Style::new().fg(th.fg),
             )];
             sp.extend(gauge(

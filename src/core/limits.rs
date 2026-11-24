@@ -7,8 +7,9 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use super::ids::ProjectKey;
 use super::period::Span;
-use super::units::{Pct, Usd, UsdPerPct};
+use super::units::{Pct, PctPerHour, Usd, UsdPerPct};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum WindowKind {
@@ -58,7 +59,9 @@ impl WindowKind {
     pub fn length(self) -> Duration {
         match self {
             WindowKind::FiveHour => Duration::hours(5),
-            _ => Duration::days(7),
+            WindowKind::SevenDay | WindowKind::SevenDayOpus | WindowKind::SevenDaySonnet => {
+                Duration::days(7)
+            }
         }
     }
 }
@@ -74,6 +77,27 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// A reading as a source reports it, kept only when it can be one: a finite percent not
+    /// below 0, and a reset no further than one window (and an hour) after the fetch, which
+    /// catches seconds read as milliseconds (review B-M12: nothing checked it, and a bad number
+    /// became an estimate).
+    pub fn parse(
+        kind: WindowKind,
+        utilization: f64,
+        resets_at: DateTime<Utc>,
+        fetched_at: DateTime<Utc>,
+    ) -> Option<Reading> {
+        let sane = utilization.is_finite()
+            && utilization >= 0.0
+            && resets_at <= fetched_at + kind.length() + Duration::hours(1);
+        sane.then_some(Reading {
+            kind,
+            utilization,
+            resets_at,
+            fetched_at,
+        })
+    }
+
     pub fn window(&self) -> Span {
         let end = self.window_end();
         Span {
@@ -219,9 +243,20 @@ pub fn effective_start(
     (start, reset)
 }
 
+/// What one project spent in a window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectSpend {
+    /// What joins (the panels, other windows).
+    pub project: ProjectKey,
+    /// What is shown.
+    pub name: String,
+    pub cost: Usd,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Share {
-    pub key: String,
+    pub project: ProjectKey,
+    pub name: String,
     pub cost: Usd,
     /// Share of the window's spend, 0..=1.
     pub share: f64,
@@ -229,19 +264,21 @@ pub struct Share {
     pub limit_points: Pct,
 }
 
-/// Splits `utilization` points between keys in proportion to their cost.
-pub fn attribute(utilization: Pct, costs: &[(String, Usd)]) -> Vec<Share> {
-    let total: Usd = costs.iter().map(|(_, c)| c.max(Usd::ZERO)).sum();
+/// Splits `utilization` points between projects in proportion to their cost.
+pub fn attribute(utilization: Pct, costs: &[ProjectSpend]) -> Vec<Share> {
+    let total: Usd = costs.iter().map(|p| p.cost.max(Usd::ZERO)).sum();
     let mut out: Vec<Share> = costs
         .iter()
-        .map(|(k, c)| {
+        .map(|p| {
+            let c = &p.cost;
             let share = if total > Usd::ZERO {
                 c.max(Usd::ZERO) / total
             } else {
                 0.0
             };
             Share {
-                key: k.clone(),
+                project: p.project.clone(),
+                name: p.name.clone(),
                 cost: *c,
                 share,
                 limit_points: utilization * share,
@@ -275,47 +312,61 @@ pub fn calibrate(samples: &[UsdPerPct]) -> Option<UsdPerPct> {
 }
 
 /// Utilization now: the last reading plus what was spent since, converted at `usd_per_point`.
+/// The spend never takes it past 100%: beyond, the next reading tells (a rate measured too low
+/// would otherwise show thousands of percent, review B-H2).
 pub fn estimate_now(reading: Pct, spent_since: Usd, usd_per_point: Option<UsdPerPct>) -> Pct {
     match usd_per_point {
-        Some(r) if r.is_usable() => reading + spent_since / r,
-        _ => reading,
+        Some(r) if r.is_usable() => {
+            let room = (Pct::new(Level::REACHED_AT) - reading).max(Pct::ZERO);
+            reading + (spent_since / r).max(Pct::ZERO).min(room)
+        }
+        Some(_) | None => reading,
     }
 }
 
-/// Time until the limit reaches 100% at the given burn rate (points per hour).
-pub fn eta(current: f64, points_per_hour: f64) -> Option<Duration> {
-    if Level::of(current) == Level::Reached {
+/// Time until the limit reaches 100% at the given pace. Checked arithmetic: a pace of almost
+/// nothing gives no time rather than a duration past chrono's range (review B-L1).
+pub fn eta(current: Pct, pace: PctPerHour) -> Option<Duration> {
+    if Level::of(current.get()) == Level::Reached {
         return Some(Duration::zero());
     }
-    (points_per_hour > 1e-9).then(|| {
-        Duration::seconds(((Level::REACHED_AT - current) / points_per_hour * 3600.0) as i64)
-    })
+    let hours = pace.hours_for(Pct::new(Level::REACHED_AT) - current)?;
+    let secs = (hours * 3600.0).round();
+    // An f64 past i64's range would saturate silently; beyond about 30 000 years is no time.
+    if !(0.0..1e12).contains(&secs) {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a whole number of seconds in 0..1e12, checked above"
+    )]
+    let secs = secs as i64;
+    Duration::try_seconds(secs)
 }
 
 /// When the window runs out at the current pace: the [`eta`], kept only when it comes before the
 /// window resets (after the reset the pace no longer matters).
 pub fn runs_out(
-    current: f64,
-    points_per_hour: Option<f64>,
+    current: Pct,
+    pace: Option<PctPerHour>,
     now: DateTime<Utc>,
     window_end: DateTime<Utc>,
 ) -> Option<Duration> {
-    points_per_hour
-        .and_then(|pph| eta(current, pph))
-        .filter(|d| now + *d < window_end)
+    pace.and_then(|p| eta(current, p))
+        .filter(|d| now.checked_add_signed(*d).is_some_and(|t| t < window_end))
 }
 
 /// Where the window ends up at the current pace: utilization at its reset, uncapped (over 100
 /// means it runs out first). `None` without a positive pace.
 pub fn projection_at_reset(
-    current: f64,
-    points_per_hour: Option<f64>,
+    current: Pct,
+    pace: Option<PctPerHour>,
     now: DateTime<Utc>,
     window_end: DateTime<Utc>,
-) -> Option<f64> {
-    points_per_hour.filter(|p| *p > 0.0).map(|pph| {
+) -> Option<Pct> {
+    pace.filter(|p| p.get() > 0.0).map(|p| {
         let left = (window_end - now).num_seconds().max(0) as f64 / 3600.0;
-        current + pph * left
+        current + p.over(left)
     })
 }
 
@@ -424,6 +475,64 @@ pub fn own_ratio(points: &[(Pct, Usd)]) -> Option<UsdPerPct> {
     calibrate(&samples)
 }
 
+/// A plan tier within its harness: the key cross-account references are compared under. A
+/// Codex `team` plan is not Claude Team (review B-M12: tiers were bare names of any harness).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PlanTier {
+    pub harness: crate::core::harness::Harness,
+    pub tier: String,
+}
+
+impl PlanTier {
+    /// The tier of an account, its harness read from the account id (`agy:…`, `cdx:…`, else
+    /// Claude Code's).
+    pub fn of(account: &str, tier: impl Into<String>) -> PlanTier {
+        use crate::core::harness::Harness;
+        let harness = if account.starts_with("agy:") {
+            Harness::Agy
+        } else if account.starts_with("cdx:") {
+            Harness::Codex
+        } else {
+            Harness::Claude
+        };
+        PlanTier {
+            harness,
+            tier: tier.into(),
+        }
+    }
+}
+
+/// One account's own USD per point for a window kind, measured at its reading (`at`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration {
+    pub account: String,
+    pub tier: PlanTier,
+    pub kind: WindowKind,
+    pub usd_per_point: UsdPerPct,
+    pub at: DateTime<Utc>,
+}
+
+/// The reference of a (tier, window kind): the account with the highest own USD per point,
+/// so the least hidden usage. A calibration older than one window no longer speaks for its
+/// tier: a login parked weeks ago, calibrated in an unusual week, would set the rate for every
+/// active account of the tier (review B-M13; the rule lived in the query layer, without it).
+pub fn pick_references(
+    c: &[Calibration],
+    now: DateTime<Utc>,
+) -> std::collections::HashMap<(PlanTier, WindowKind), Calibration> {
+    let mut refs: std::collections::HashMap<(PlanTier, WindowKind), Calibration> =
+        std::collections::HashMap::new();
+    for x in c.iter().filter(|x| now - x.at <= x.kind.length()) {
+        let e = refs
+            .entry((x.tier.clone(), x.kind))
+            .or_insert_with(|| x.clone());
+        if x.usd_per_point > e.usd_per_point {
+            *e = x.clone();
+        }
+    }
+    refs
+}
+
 /// Whether a tier reference ratio replaces the account's own (see [`REFERENCE_MARGIN`]).
 pub fn reference_wins(own: Option<UsdPerPct>, reference: UsdPerPct) -> bool {
     own.is_none_or(|o| reference > o * REFERENCE_MARGIN)
@@ -448,7 +557,7 @@ pub struct WindowInputs {
     /// Spend over the last [`BURN_MINUTES`].
     pub cost_burn: Usd,
     /// Spend in the window per project.
-    pub by_project: Vec<(String, Usd)>,
+    pub by_project: Vec<ProjectSpend>,
     /// Spend per [`curve_step`] from the window start (empty when the window rolled over).
     pub series: Vec<Usd>,
     pub series_step: Duration,
@@ -467,7 +576,7 @@ pub struct WindowEstimate {
     /// Dollars per hour.
     pub burn_usd_per_hour: Usd,
     /// Points per hour.
-    pub points_per_hour: Option<Pct>,
+    pub points_per_hour: Option<PctPerHour>,
     /// When it runs out at this pace, if before the reset ([`runs_out`]).
     pub eta: Option<Duration>,
     /// The same as an instant, fixed when estimated: `now + eta` added again on every later tick
@@ -494,13 +603,8 @@ pub fn window_estimate(
     let visible_points = usd_per_point.map(|u| (i.cost_in_window / u).min(estimate_now));
     let outside_points = visible_points.map(|v| (estimate_now - v).max(Pct::ZERO));
     let burn_usd_per_hour = i.cost_burn * 60.0 / BURN_MINUTES as f64;
-    let points_per_hour = usd_per_point.map(|u| burn_usd_per_hour / u);
-    let eta = runs_out(
-        estimate_now.get(),
-        points_per_hour.map(Pct::get),
-        now,
-        i.place.window.end,
-    );
+    let points_per_hour = usd_per_point.map(|u| PctPerHour::of_burn(burn_usd_per_hour, u));
+    let eta = runs_out(estimate_now, points_per_hour, now, i.place.window.end);
     let shares = attribute(visible_points.unwrap_or(estimate_now), &i.by_project);
     let total: Usd = i.series.iter().sum();
     // Points per dollar of the curve: it ends at the estimate.
@@ -537,6 +641,22 @@ pub fn window_estimate(
 mod tests {
     use super::*;
 
+    /// Review B-M12: a reading that cannot be one is refused where it comes in.
+    #[test]
+    fn a_reading_is_checked_where_it_comes_in() {
+        let at = ts("2026-11-20T12:00:00Z");
+        let reset = ts("2026-11-24T00:00:00Z");
+        assert!(Reading::parse(WindowKind::SevenDay, 42.0, reset, at).is_some());
+        assert!(Reading::parse(WindowKind::SevenDay, f64::NAN, reset, at).is_none());
+        assert!(Reading::parse(WindowKind::SevenDay, -1.0, reset, at).is_none());
+        // Seconds read as milliseconds: a reset thousands of years away.
+        let far = DateTime::from_timestamp(reset.timestamp() * 1000, 0)
+            .unwrap_or(reset + Duration::days(9999));
+        assert!(Reading::parse(WindowKind::SevenDay, 42.0, far, at).is_none());
+        // Extra usage reads past 100%.
+        assert!(Reading::parse(WindowKind::FiveHour, 104.0, at + Duration::hours(3), at).is_some());
+    }
+
     #[test]
     fn attribution_by_hand() {
         // 77% used; shop $810, blog $120, other $70 (total $1000).
@@ -544,12 +664,12 @@ mod tests {
         let s = attribute(
             Pct::new(77.0),
             &[
-                ("other".into(), Usd::new(70.0)),
-                ("shop".into(), Usd::new(810.0)),
-                ("blog".into(), Usd::new(120.0)),
+                spend("other", 70.0),
+                spend("shop", 810.0),
+                spend("blog", 120.0),
             ],
         );
-        assert_eq!(s[0].key, "shop");
+        assert_eq!(s[0].name, "shop");
         assert!((s[0].share - 0.81).abs() < 1e-12);
         assert!((s[0].limit_points.get() - 62.37).abs() < 1e-9);
         assert!((s[1].limit_points.get() - 9.24).abs() < 1e-9);
@@ -560,7 +680,7 @@ mod tests {
 
     #[test]
     fn zero_spend_attributes_nothing() {
-        let s = attribute(Pct::new(10.0), &[("a".into(), Usd::ZERO)]);
+        let s = attribute(Pct::new(10.0), &[spend("a", 0.0)]);
         assert_eq!(s[0].limit_points, Pct::ZERO);
     }
 
@@ -582,6 +702,35 @@ mod tests {
         assert_eq!(calibrate(&[]), None);
         // Below 1% the ratio is too noisy to trust.
         assert_eq!(usd_per_point(Pct::new(0.5), Usd::new(10.0)), None);
+    }
+
+    /// Review B-H2: an account used mostly on claude.ai reads 40% with $0.004 spent here. That
+    /// gives no rate, and $2 more leaves the estimate at the reading; a rate that is too low
+    /// still never takes it past 100%.
+    #[test]
+    fn little_visible_spend_never_makes_the_estimate_explode() {
+        let own = own_ratio(&[(Pct::new(40.0), Usd::new(0.004))]);
+        assert_eq!(own, None);
+        assert_eq!(
+            estimate_now(Pct::new(40.0), Usd::new(2.0), own),
+            Pct::new(40.0)
+        );
+        let tiny = Some(UsdPerPct::new(0.0001));
+        assert_eq!(
+            estimate_now(Pct::new(40.0), Usd::new(2.0), tiny),
+            Pct::new(100.0)
+        );
+        // A reading past 100% (extra usage) stays what it is.
+        assert_eq!(
+            estimate_now(Pct::new(104.0), Usd::new(2.0), tiny),
+            Pct::new(104.0)
+        );
+        for spent in [0.0, 0.5, 3.0, 1e9] {
+            for r in [1e-12, 0.01, 5.0, 1e12] {
+                let e = estimate_now(Pct::new(30.0), Usd::new(spent), Some(UsdPerPct::new(r)));
+                assert!(e.get().is_finite() && e >= Pct::new(30.0) && e <= Pct::new(100.0));
+            }
+        }
     }
 
     #[test]
@@ -621,9 +770,15 @@ mod tests {
     #[test]
     fn eta_by_hand() {
         // 70% now, 3 points per hour → 10 hours.
-        assert_eq!(eta(70.0, 3.0), Some(Duration::hours(10)));
-        assert_eq!(eta(100.0, 0.0), Some(Duration::zero()));
-        assert_eq!(eta(50.0, 0.0), None);
+        assert_eq!(eta(pct(70.0), pace(3.0)), Some(Duration::hours(10)));
+        assert_eq!(eta(pct(100.0), pace(0.0)), Some(Duration::zero()));
+        assert_eq!(eta(pct(50.0), pace(0.0)), None);
+        // Review B-L1: paces this small used to build a duration past chrono's range.
+        for p in [f64::MIN_POSITIVE, 1e-8, 2e-8, 1e-6] {
+            assert!(eta(pct(50.0), pace(p)).is_none_or(|d| d > Duration::days(365)));
+            let (now, end) = (ts("2026-11-20T12:00:00Z"), ts("2026-11-21T00:00:00Z"));
+            assert_eq!(runs_out(pct(50.0), Some(pace(p)), now, end), None);
+        }
     }
 
     #[test]
@@ -712,19 +867,31 @@ mod tests {
         let end = ts("2026-11-21T00:00:00Z"); // 12 h left
         // 70% at 2 points/h: runs out in 15 h, after the reset → no runs-out; at the reset
         // 70 + 2 × 12 = 94%.
-        assert_eq!(runs_out(70.0, Some(2.0), now, end), None);
-        assert_eq!(projection_at_reset(70.0, Some(2.0), now, end), Some(94.0));
+        assert_eq!(runs_out(pct(70.0), Some(pace(2.0)), now, end), None);
+        assert_eq!(
+            projection_at_reset(pct(70.0), Some(pace(2.0)), now, end),
+            Some(pct(94.0))
+        );
         // 70% at 5 points/h: (100 − 70) / 5 = 6 h → before the reset; projection 70 + 60 = 130.
         assert_eq!(
-            runs_out(70.0, Some(5.0), now, end),
+            runs_out(pct(70.0), Some(pace(5.0)), now, end),
             Some(Duration::hours(6))
         );
-        assert_eq!(projection_at_reset(70.0, Some(5.0), now, end), Some(130.0));
+        assert_eq!(
+            projection_at_reset(pct(70.0), Some(pace(5.0)), now, end),
+            Some(pct(130.0))
+        );
         // No pace: no projection, and runs out only when already reached.
-        assert_eq!(projection_at_reset(70.0, Some(0.0), now, end), None);
-        assert_eq!(projection_at_reset(70.0, None, now, end), None);
-        assert_eq!(runs_out(70.0, None, now, end), None);
-        assert_eq!(runs_out(100.0, Some(0.0), now, end), Some(Duration::zero()));
+        assert_eq!(
+            projection_at_reset(pct(70.0), Some(pace(0.0)), now, end),
+            None
+        );
+        assert_eq!(projection_at_reset(pct(70.0), None, now, end), None);
+        assert_eq!(runs_out(pct(70.0), None, now, end), None);
+        assert_eq!(
+            runs_out(pct(100.0), Some(pace(0.0)), now, end),
+            Some(Duration::zero())
+        );
     }
 
     // ── estimating one window ──
@@ -833,6 +1000,14 @@ mod tests {
         assert_eq!(curve_step(span(5)), Duration::minutes(1));
     }
 
+    fn spend(dir: &str, usd: f64) -> ProjectSpend {
+        ProjectSpend {
+            project: ProjectKey::from_stored(format!("/w/{dir}")),
+            name: dir.into(),
+            cost: Usd::new(usd),
+        }
+    }
+
     /// 30% read at hour 10; the window ends at hour 100 and now is hour 76 (24 h left).
     fn inputs() -> WindowInputs {
         let r = wk(10, 30.0);
@@ -843,10 +1018,64 @@ mod tests {
             spent_since: Usd::new(5.0),
             cost_in_window: Usd::new(15.0),
             cost_burn: Usd::new(2.0),
-            by_project: vec![("b".into(), Usd::new(5.0)), ("a".into(), Usd::new(10.0))],
+            by_project: vec![spend("b", 5.0), spend("a", 10.0)],
             series: [5.0, 0.0, 10.0].map(Usd::new).to_vec(),
             series_step: Duration::hours(1),
         }
+    }
+
+    /// Review B-M13: a login parked weeks ago, calibrated at $40 a point, no longer sets the
+    /// tier's rate for an active account at $20; within one window it still does.
+    #[test]
+    fn a_stale_calibration_is_no_reference() {
+        let now = ts("2026-11-20T12:00:00Z");
+        let cal = |account: &str, usd: f64, at: &str| Calibration {
+            account: account.into(),
+            tier: PlanTier::of(account, "max"),
+            kind: WindowKind::SevenDay,
+            usd_per_point: UsdPerPct::new(usd),
+            at: ts(at),
+        };
+        let parked = cal("parked", 40.0, "2026-10-25T00:00:00Z");
+        let active = cal("active", 20.0, "2026-11-20T10:00:00Z");
+        let refs = pick_references(&[parked.clone(), active.clone()], now);
+        assert_eq!(
+            refs[&(PlanTier::of("", "max"), WindowKind::SevenDay)].account,
+            "active"
+        );
+        let recent = cal("recent", 30.0, "2026-11-15T00:00:00Z");
+        let refs = pick_references(&[parked, active, recent], now);
+        assert_eq!(
+            refs[&(PlanTier::of("", "max"), WindowKind::SevenDay)].account,
+            "recent"
+        );
+    }
+
+    /// Review B-M12: a Codex `team` plan and Claude Team are two tiers.
+    #[test]
+    fn tiers_of_two_harnesses_never_share_a_reference() {
+        let now = ts("2026-11-20T12:00:00Z");
+        let cal = |account: &str, usd: f64| Calibration {
+            account: account.into(),
+            tier: PlanTier::of(account, "team"),
+            kind: WindowKind::SevenDay,
+            usd_per_point: UsdPerPct::new(usd),
+            at: now,
+        };
+        let refs = pick_references(&[cal("acc-1/org", 20.0), cal("cdx:u/ws", 90.0)], now);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[&(PlanTier::of("acc-1/org", "team"), WindowKind::SevenDay)].account,
+            "acc-1/org"
+        );
+    }
+
+    fn pct(v: f64) -> Pct {
+        Pct::new(v)
+    }
+
+    fn pace(v: f64) -> PctPerHour {
+        PctPerHour::new(v)
     }
 
     fn near(a: impl Into<f64>, b: f64) -> bool {
@@ -868,7 +1097,8 @@ mod tests {
         assert_eq!(e.eta, Some(Duration::hours(15)));
         assert_eq!(e.runs_out_at, Some(hour(76) + Duration::hours(15)));
         // The visible 30 points split $10 : $5 → a 20, b 10 (largest first).
-        assert_eq!(e.shares[0].key, "a");
+        assert_eq!(e.shares[0].name, "a");
+        assert_eq!(e.shares[0].project, ProjectKey::from_stored("/w/a"));
         assert!(near(e.shares[0].limit_points, 20.0));
         assert!(near(e.shares[1].limit_points, 10.0));
         // A full window ≈ 100 × $0.50 = $50.

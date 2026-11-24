@@ -14,15 +14,3 @@ pub fn log(area: &str, message: &str) {
         eprintln!("swarmy[{area}]: {message}");
     }
 }
-
-/// Logs an error with its context and gives back `None`: for an `Option`-returning reader whose
-/// caller treats "unreadable" like "absent" on purpose.
-pub fn ok_or_log<T, E: std::fmt::Display>(area: &str, what: &str, r: Result<T, E>) -> Option<T> {
-    match r {
-        Ok(v) => Some(v),
-        Err(e) => {
-            log(area, &format!("{what}: {e}"));
-            None
-        }
-    }
-}
