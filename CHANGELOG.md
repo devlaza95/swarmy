@@ -3,6 +3,18 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## v0.2.3
+
+BURN down to the model.
+
+- **BURN tells models apart**, not only families: `gem-4-neon` and `gem-4-hydrogen`, `opus-5.5`
+  and `opus-5`, each with its rate over the last hour and its part of the chart, in its family's
+  colour (other models of the family in shades of it). A small panel lists them in as many lines
+  as its height allows instead of the one or two that fitted on one line.
+- Fixed: the lowest cell of every BURN bar was grey (the baseline was drawn over the bars);
+  Codex's bars had the colour of unknown models; the chart's legend left Mythos and unknown
+  models out.
+
 ## v0.2.2
 
 Jump to Warp, and the burn rate on every screen size.
