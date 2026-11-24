@@ -25,7 +25,9 @@ pub fn parse_login(text: &str) -> anyhow::Result<Option<Secret>> {
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
         .is_some_and(|k| !k.is_empty());
-    Ok((tokens || key).then(|| Secret::of(Harness::Codex, v)))
+    Ok((tokens || key)
+        .then(|| Secret::of(Harness::Codex, v))
+        .filter(Secret::has_token))
 }
 
 /// The text of `auth.json` for `login`: the file is the login, so it is replaced whole.

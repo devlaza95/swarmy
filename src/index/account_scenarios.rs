@@ -9,7 +9,6 @@ mod tests {
 
     use crate::app::context::Ctx;
     use crate::claude::config_json::Account;
-    use crate::claude::procs::ProcTable;
     use crate::claude::project::Resolver;
     use crate::config::{Config, Dirs};
     use crate::core::ids::AccountId;
@@ -19,6 +18,7 @@ mod tests {
     use crate::index::query::{Dim, Filter};
     use crate::index::scenarios::{World, assistant, at, dump, owner, weekly};
     use crate::limits::all_reports;
+    use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
 
     const M: &str = "claude-sonnet-5-5";
@@ -146,16 +146,16 @@ mod tests {
         w.refresh(&mut idx, &infos, &PriceBook::builtin());
 
         let ctx = ctx_of(&w, infos, "2026-11-20T02:00:00Z");
-        let reports = all_reports(&ctx, &idx).unwrap();
+        let reports = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
         assert_eq!(reports.len(), 2, "two distinct accounts: {reports:?}");
 
         let r_max = reports
             .iter()
-            .find(|r| r.account_uuid == "acc-same/org-max")
+            .find(|r| r.account.as_str() == "acc-same/org-max")
             .unwrap();
         let r_team = reports
             .iter()
-            .find(|r| r.account_uuid == "acc-same/org-team")
+            .find(|r| r.account.as_str() == "acc-same/org-team")
             .unwrap();
 
         assert_eq!(r_team.tier.as_deref(), Some("default_raven"));
@@ -234,9 +234,9 @@ mod tests {
         let mut idx = w.index("i.sqlite");
         w.refresh(&mut idx, &infos, &PriceBook::builtin());
         let ctx = ctx_of(&w, infos, "2026-11-20T02:00:00Z");
-        let reports = all_reports(&ctx, &idx).unwrap();
+        let reports = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
         assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].account_uuid, "acc-same/org-shared");
+        assert_eq!(reports[0].account.as_str(), "acc-same/org-shared");
         assert_eq!(reports[0].windows[0].reading.utilization, 35.0);
     }
 
@@ -475,12 +475,12 @@ mod tests {
         );
 
         let ctx = ctx_of(&w, infos, "2026-11-20T01:00:00Z");
-        let reports = all_reports(&ctx, &idx).unwrap();
+        let reports = all_reports(&ctx.limits_inputs(&idx).unwrap(), &idx).unwrap();
         assert_eq!(reports.len(), 2, "no ghost 3rd account: {reports:?}");
         assert_eq!(
             reports
                 .iter()
-                .find(|r| r.account_uuid == "acc-1/org-team")
+                .find(|r| r.account.as_str() == "acc-1/org-team")
                 .unwrap()
                 .windows[0]
                 .cost_in_window
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(
             reports
                 .iter()
-                .find(|r| r.account_uuid == "acc-1/org-max")
+                .find(|r| r.account.as_str() == "acc-1/org-max")
                 .unwrap()
                 .windows[0]
                 .cost_in_window
@@ -562,14 +562,33 @@ mod tests {
                 .as_deref(),
             Some("1")
         );
+        // Review B-H5: the transcripts are marked for a re-read (`offset > size`), so a pass that
+        // re-reads none of them (a hot refresh) keeps the flag. SQLite evaluates every `SET`
+        // with the old row: `size = size + 1, offset = size + 1` left them equal.
+        let scheduled = dump(&idx, "SELECT COUNT(*) FROM files WHERE offset > size");
+        assert_eq!(scheduled, ["2"]);
+        super::super::accounts::finish_reattribution(&idx.conn).unwrap();
+        assert_eq!(
+            idx.meta(super::super::accounts::OWNERS_PENDING)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
         drop(idx);
+        // The transcript grows before it is read again (a live session): it is still read from
+        // the start, not resumed at the mark.
+        w.append("work", "s-old", &[req("m2", "2026-11-10T11:00:00Z", 5)]);
         // A later run (fresh process, nothing in memory) still re-attributes, then clears it.
         let mut idx = w.index("i.sqlite");
         idx.set_known_accounts([AccountId::of("acc-1", Some("org-max"))]);
         w.refresh(&mut idx, &infos, &book);
         assert_eq!(
             dump(&idx, "SELECT msg_id, account_uuid FROM requests ORDER BY 1"),
-            ["m1|acc-1/org-max", "t1|acc-1/org-team"]
+            ["m1|acc-1/org-max", "m2|acc-1/org-max", "t1|acc-1/org-team"]
+        );
+        assert_eq!(
+            dump(&idx, "SELECT COUNT(*) FROM files WHERE offset > size"),
+            ["0"]
         );
         assert_eq!(
             idx.meta(super::super::accounts::OWNERS_PENDING).unwrap(),

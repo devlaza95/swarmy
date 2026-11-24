@@ -5,12 +5,20 @@
 //! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
 //! start. The first run reads everything in parallel.
 
+// A new variant of a domain enum (a harness, a window kind, a dim) must be handled where it
+// is matched, not fall into a catch-all (reviews A-H7, B-M24, B-L3).
+#![deny(clippy::wildcard_enum_match_arm)]
+// No result ignored, no string cut by bytes, and (where there are none) no silent numeric
+// casts: the strict lints switched on, in production code, where they hold already (reviews
+// A-H7, B-M24).
+#![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
+#![cfg_attr(not(test), deny(clippy::string_slice))]
+
 #[cfg(test)]
 mod account_scenarios;
 mod accounts;
 #[cfg(test)]
 mod agy_scenarios;
-pub mod agy_summaries;
 pub mod archive;
 #[cfg(test)]
 pub(crate) mod archive_scenarios;
@@ -26,8 +34,8 @@ pub mod live;
 mod marks;
 mod prices;
 mod projects;
-pub use prices::BandDrift;
 pub mod query;
+mod records;
 #[cfg(test)]
 pub(crate) mod scenarios;
 pub mod schema;
@@ -91,6 +99,10 @@ pub struct Index {
     changes: Changes,
     /// Settled parts of recurring sums (`settled`).
     parts: settled::Parts,
+    /// The instant of the current pass, given by the caller (`Index::set_now`): which rows
+    /// are settled, inside the raw window or recent is decided by it, not by the wall clock
+    /// read deep inside (reviews A-M6, B-M17). Without it, the wall clock.
+    clock: Option<DateTime<Utc>>,
 }
 
 /// An agent by (seat, session id, agent id), as its transcript file names it.
@@ -309,29 +321,17 @@ fn file_key(ino: u64) -> u64 {
     ino & i64::MAX.unsigned_abs()
 }
 
-#[cfg(unix)]
-fn inode(_path: &Path, m: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    m.ino()
-}
-
-/// Windows has no inode in `Metadata`: the file index of an open handle (mixed with the
-/// volume serial) tells a replaced file from one appended to, as the inode does on Unix.
-#[cfg(windows)]
-fn inode(path: &Path, _m: &std::fs::Metadata) -> u64 {
-    winapi_util::Handle::from_path_any(path)
-        .and_then(|h| winapi_util::file::information(&h))
-        .map_or(0, |i| {
-            i.file_index() ^ i.volume_serial_number().rotate_left(48)
-        })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn inode(_path: &Path, _m: &std::fs::Metadata) -> u64 {
-    0
-}
-
 impl Index {
+    /// Sets the instant of the passes that follow (the dashboard's tick, a command's `now`).
+    pub fn set_now(&mut self, now: DateTime<Utc>) {
+        self.clock = Some(now);
+    }
+
+    /// The instant of this pass ([`Index::set_now`]), else the wall clock.
+    pub fn now(&self) -> DateTime<Utc> {
+        self.clock.unwrap_or_else(Utc::now)
+    }
+
     pub fn open(path: &Path) -> anyhow::Result<Index> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -364,6 +364,7 @@ impl Index {
             known_accounts: Vec::new(),
             changes: Changes::default(),
             parts: settled::Parts::default(),
+            clock: None,
         })
     }
 
@@ -371,7 +372,7 @@ impl Index {
         Ok(schema::meta(&self.conn, key)?)
     }
 
-    pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    pub fn set_meta(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
         Ok(schema::set_meta(&self.conn, key, value)?)
     }
 
@@ -439,7 +440,7 @@ impl Index {
         resolver: &mut Resolver,
         prices: &PriceBook,
     ) -> anyhow::Result<RefreshStats> {
-        let since = Utc::now().timestamp() - 1800;
+        let since = self.now().timestamp() - 1800;
         let mut out = source::recent_files(&self.conn, seats, since)?;
         for (seat_id, sid) in live {
             let Some(seat) = seats.iter().find(|s| &s.id == seat_id) else {
@@ -545,7 +546,7 @@ impl Index {
             let Ok(m) = std::fs::metadata(&f.path) else {
                 continue;
             };
-            let (ino, size) = (file_key(inode(&f.path, &m)), m.len());
+            let (ino, size) = (file_key(crate::fsutil::file_id(&f.path, &m)), m.len());
             let mtime = m
                 .modified()
                 .ok()
@@ -555,6 +556,9 @@ impl Index {
             let key = f.path.to_string_lossy().into_owned();
             let expected = known.get(&key).map(|(kino, _, koff, ..)| (*kino, *koff));
             let (start, account, last_ts, reset) = match known.get(&key) {
+                // Scheduled for a re-read from the start (`accounts`: `offset > size`), however
+                // the file changed since.
+                Some((_, ksize, koff, ..)) if *koff > *ksize => (0, None, 0, true),
                 Some((kino, ksize, ..)) if *kino == ino && *ksize == size => continue,
                 Some((kino, _, koff, kacc, kts)) if *kino == ino && size >= *koff => {
                     (*koff, kacc.clone(), *kts, false)
@@ -617,22 +621,21 @@ impl Index {
         // after the compactor deleted rows (`compact::requests_rowid_high`).
         let last_rowid = compact::requests_rowid_high(&self.conn)?;
         let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let settled_before = ms(Utc::now()) - SETTLED_AFTER_MS;
+        let settled_before = ms(self.now()) - SETTLED_AFTER_MS;
         for batch in work.chunks(48) {
             // A few small files parse faster on this thread than by waking the whole pool.
-            let mut parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
-                batch
-                    .iter()
-                    .map(|w| (w, source::read_transcript_chunk(&w.file, w.start)))
-                    .collect()
+            type Parsed<'w> = (&'w Work, std::io::Result<transcript::Chunk>, write::Side);
+            fn read(w: &Work) -> Parsed<'_> {
+                let chunk = source::read_transcript_chunk(&w.file, w.start);
+                (w, chunk, write::read_side(&w.file))
+            }
+            let mut parsed: Vec<Parsed> = if batch.len() < 8 {
+                batch.iter().map(read).collect()
             } else {
-                batch
-                    .par_iter()
-                    .map(|w| (w, source::read_transcript_chunk(&w.file, w.start)))
-                    .collect()
+                batch.par_iter().map(read).collect()
             };
             // Owner records without an organization take the one they must be in.
-            for (w, chunk) in &mut parsed {
+            for (w, chunk, _) in &mut parsed {
                 if let Ok(c) = chunk {
                     self.complete_owners(&w.file.seat, &mut c.events, seat_info);
                 }
@@ -646,7 +649,7 @@ impl Index {
             // Read in the write transaction: a compaction committed since the plan counts.
             let rolled_until = archive::rolled_until(&tx)?;
             let mut written: Vec<AgentOf> = Vec::new();
-            for (w, chunk) in parsed {
+            for (w, chunk, side) in parsed {
                 let path = w.file.path.to_string_lossy();
                 let chunk = match chunk {
                     Ok(c) => c,
@@ -675,7 +678,7 @@ impl Index {
                     settled_before,
                     rolled_until,
                 };
-                let wrote = write::write_file(&tx, w, chunk, &mut cwds, at, &mut rowid)?;
+                let wrote = write::write_file(&tx, w, chunk, side, &mut cwds, at, &mut rowid)?;
                 written.push((
                     w.file.seat.clone(),
                     w.file.session_id.clone(),
@@ -718,7 +721,7 @@ impl Index {
         // Only a refresh that read something commits: a commit makes every other process's
         // per-agent caches read again (`note_other_writers`).
         if done.files_done > 0 {
-            self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
+            self.set_meta("refreshed_at", &self.now().timestamp_millis().to_string())?;
         }
         Ok(stats)
     }
@@ -732,7 +735,7 @@ impl Index {
         new_after_rowid: Option<i64>,
         reattribute_owners: bool,
     ) -> anyhow::Result<()> {
-        let now = ms(Utc::now());
+        let now = ms(self.now());
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -969,7 +972,7 @@ mod tests {
             "a second reader"
         );
         // Another process commits: everything counts as changed.
-        let other = w.index("i.sqlite");
+        let mut other = w.index("i.sqlite");
         other.set_meta("refreshed_at", "1").unwrap();
         w.refresh(&mut idx, &[], &book);
         assert_ne!(seq(&idx, "a1"), sub2);

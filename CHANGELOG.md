@@ -3,6 +3,50 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+Fixes from two architecture reviews: wrong numbers, lost logins.
+
+- Fixed: a `[[seat]]` without `harness` that points at a used Claude Code dir was read as a
+  Codex home, and the seat's spend, limits and sessions vanished. A dir whose files fit two
+  harnesses is now named in ATTENTION.
+- Fixed: two repositories with the same dir name (`~/work/api`, `~/oss/api`) showed each
+  other's "% of week", live agents and harness mix in PROJECTS.
+- Fixed: after a multi-organisation split, the re-attribution of old spend could stop after the
+  first pass and leave it on the wrong organisation.
+- Fixed: a hot refresh read the rollouts of a seat it did not know with Claude Code's reader and
+  skipped their spend.
+- Fixed: `report --mask` printed full project paths in the CSV and JSON `key` column;
+  `SWARMY_ISOLATED` now ignores `CLAUDE_CONFIG_DIR` too; a seat warning no longer disappears
+  from ATTENTION after 20 seconds.
+- Vault: a switch interrupted between its two writes can no longer overwrite the previous
+  login's tokens with the new one's; a re-imported pre-rotation token gets its own id; a Codex
+  move never leaves one single-use token in two seats, saves a token Codex refreshed meanwhile,
+  is refused by the vault itself while Codex runs in either seat, and never empties a seat
+  signed into another account since (it asks to save that login first); a new login whose save
+  fails is kept in its scratch dir; `accounts import` reads Codex `auth.json` and takes the
+  account agy and Codex files name.
+- `swarmy limits` says `%` instead of "pts", and "pace unknown" instead of "lasts until reset"
+  when there is no usable rate yet. In `--format json`, a share names its project by `project`
+  (the git root, what tells two projects of one name apart) and `name`; `key` is gone.
+- Fixed: an account used mostly elsewhere (claude.ai) could show a limit estimate of thousands
+  of percent; a rate needs $1 of visible spend now, and spend never takes the estimate past
+  100%. A login parked for more than a window no longer sets its tier's rate, and a Codex plan
+  never shares a tier with a Claude Code one.
+- Fixed: "today" read about $0 all day where DST starts at midnight; the AGENT card lost the
+  last message when the tail cut a non-ASCII character; dead sessions showed as "needs you" on
+  macOS and Windows; the status line and `swarmy jump` missed `~/.claude_*` and configured
+  seats without a dashboard; a Codex inside tmux jumped to the terminal window, not the pane.
+- Fixed: prompts and API errors of a forked session or a moved config dir counted twice; a
+  `null` token count lost the record; a response without an id or a time is counted as unusable
+  (`doctor` lists it); an older swarmy refuses a newer index instead of rebuilding it; a cache
+  rebuild says how many kept rows it refused.
+- Vault: login labels can no longer be another login's id or email; a file without any token
+  is no login; `.claude.json` keeps its mode and its symlink; a grant taken out of the vault is
+  kept in `retired.json` for 90 days.
+- `config.toml`: an unknown status-line segment, a nonsense `[subscription]` price and a
+  `web_search` price per 1000 searches are refused.
+
 ## v0.2.3
 
 BURN down to the model.

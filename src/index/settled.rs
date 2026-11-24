@@ -90,7 +90,7 @@ impl Index {
         span: Span,
         read: impl Fn(&Connection, Span) -> anyhow::Result<T>,
     ) -> anyhow::Result<(Option<T>, T)> {
-        let Some((old, new)) = split(span, Utc::now()) else {
+        let Some((old, new)) = split(span, self.now()) else {
             return Ok((None, read(&self.conn, span)?));
         };
         let tx = if self.conn.is_autocommit() {
@@ -260,7 +260,7 @@ mod tests {
             assert!(split(span, Utc::now()).is_some());
             let c = &idx.conn;
             for dim in [Dim::Project, Dim::Model] {
-                let one = spend_by_on(c, dim, span, &f).unwrap();
+                let one = spend_by_on(c, dim, span, &f, Utc::now()).unwrap();
                 let two = idx.spend_by(dim, span, &f).unwrap();
                 assert_eq!(one.len(), two.len(), "{when} {dim:?}");
                 for (a, b) in one.iter().zip(&two) {
@@ -278,7 +278,7 @@ mod tests {
                     );
                 }
             }
-            let one = crate::index::archive::read(c, span, false, |c, p| {
+            let one = crate::index::archive::read(c, span, false, Utc::now(), |c, p| {
                 super::super::query::total_on(c, p, &f)
             })
             .unwrap();
@@ -294,14 +294,14 @@ mod tests {
                 one.cost,
                 two.cost
             );
-            let one = matrix_on(c, Dim::Project, Dim::Model, span, &f).unwrap();
+            let one = matrix_on(c, Dim::Project, Dim::Model, span, &f, Utc::now()).unwrap();
             let two = idx.matrix(Dim::Project, Dim::Model, span, &f).unwrap();
             assert_eq!(one.len(), two.len(), "{when}");
             for (a, b) in one.iter().zip(&two) {
                 assert_eq!((&a.1, &a.2), (&b.0, &b.1), "{when}");
                 assert!(close(a.3, b.2), "{when}");
             }
-            let one = buckets_on(c, span, &f).unwrap();
+            let one = buckets_on(c, span, &f, Utc::now()).unwrap();
             let two = idx.buckets(span, &f).unwrap();
             assert_eq!(one.len(), two.len(), "{when}");
             for (a, b) in one.iter().zip(&two) {
@@ -309,7 +309,7 @@ mod tests {
                 assert!(close(a.3, b.3), "{when}");
             }
             let n = 25;
-            let one = series_on(c, span, ms(span.start), 3_600_000, n, &f).unwrap();
+            let one = series_on(c, span, ms(span.start), 3_600_000, n, &f, Utc::now()).unwrap();
             let two = idx.spend_series(span, 60, &f).unwrap();
             assert_eq!(one.len(), two.len(), "{when}");
             assert!(one.iter().zip(&two).all(|(a, b)| close(*a, *b)), "{when}");
@@ -380,14 +380,14 @@ mod tests {
                 end: now + Duration::seconds(1) + Duration::minutes(later),
             };
             let n = ((ms(span.end) - ms(start)) as f64 / 60_000.0).ceil() as usize;
-            let fresh = series_on(&idx.conn, span, ms(start), 60_000, n, &f).unwrap();
+            let fresh = series_on(&idx.conn, span, ms(start), 60_000, n, &f, Utc::now()).unwrap();
             let kept = idx.spend_series(span, 1, &f).unwrap();
             assert_eq!(kept.len(), fresh.len(), "{later} min later");
             assert!(
                 kept.iter().zip(&fresh).all(|(a, b)| close(*a, *b)),
                 "{later} min later"
             );
-            let one = crate::index::archive::read(&idx.conn, span, false, |c, p| {
+            let one = crate::index::archive::read(&idx.conn, span, false, Utc::now(), |c, p| {
                 super::super::query::total_on(c, p, &f)
             })
             .unwrap();
@@ -428,7 +428,7 @@ mod tests {
         }];
         w.append("work", "s1", &[line("m2", now)]);
         w.refresh(&mut idx, &info, &book);
-        let fresh = crate::index::archive::read(&idx.conn, span, true, |c, p| {
+        let fresh = crate::index::archive::read(&idx.conn, span, true, Utc::now(), |c, p| {
             let f = Filter {
                 account: Some(crate::core::ids::AccountId::new("acc-a")),
                 ..Default::default()

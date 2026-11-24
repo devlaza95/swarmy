@@ -6,7 +6,7 @@
 
 use std::process::Command;
 
-use super::pane::{JUMP_TIMEOUT, RunOutcome, run_with_timeout};
+use super::{JUMP_TIMEOUT, RunOutcome, run_with_timeout};
 use crate::core::pane::KittyWindow;
 
 pub const REMOTE_CONTROL_HINT: &str = "turn on kitty's remote control: `allow_remote_control socket-only` \

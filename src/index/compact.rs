@@ -21,8 +21,6 @@ use crate::core::pricing::PriceBook;
 use crate::core::storage::{TOOL_ROLLUP_BYTES, USAGE_ROLLUP_BYTES, raw_bytes};
 use crate::core::tools::ToolClass;
 
-pub use crate::core::storage::DEFAULT_KEEP_RAW_DAYS;
-
 /// One chunk: six UTC hours, a whole number of quarter hours.
 pub const CHUNK_MS: i64 = 6 * 3600 * 1000;
 
@@ -210,7 +208,7 @@ impl Index {
         max_chunks: Option<usize>,
         progress: &mut dyn FnMut(&CompactReport),
     ) -> anyhow::Result<CompactReport> {
-        let book = self.dated_prices(prices, Utc::now())?;
+        let book = self.dated_prices(prices, self.now())?;
         let seat_dirs: Vec<(String, SeatId)> = seats
             .iter()
             .map(|s| (canonical(&s.dir), s.id.clone()))
@@ -253,6 +251,17 @@ impl Index {
             if FAIL_IN_CHUNK.get() == Some(report.chunks + 1) {
                 anyhow::bail!("test fault in chunk {}", report.chunks + 1);
             }
+            // The seats whose rows this chunk moves, whichever this process found: a seat seen
+            // only through another run's processes must be known as rolled up too, or a fork of
+            // one of its old sessions counts its copied messages again (review B-M6).
+            tx.execute(
+                "INSERT INTO rollup_seats(seat_dir, seat)
+                 SELECT st.dir, st.seat FROM seats st
+                 WHERE st.dir IS NOT NULL
+                   AND st.seat IN (SELECT DISTINCT seat FROM requests WHERE ts >= ?1 AND ts < ?2)
+                 ON CONFLICT(seat_dir) DO UPDATE SET seat = excluded.seat",
+                params![c0, c1],
+            )?;
             let m = Moved {
                 owners: delete_chunk(&tx, c0, c1)?,
                 ..m

@@ -4,6 +4,7 @@
 use chrono::Local;
 
 use crate::app::context::Ctx;
+use crate::core::ids::ProjectKey;
 use crate::core::limits::Share;
 use crate::core::units::{Pct, Usd};
 use crate::limits::{WindowReport, all_reports};
@@ -15,7 +16,21 @@ use super::Format;
 
 pub fn run(ctx: &Ctx, format: Format, top: usize) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
-    let reports = all_reports(ctx, &idx)?;
+    let mut reports = all_reports(&ctx.limits_inputs(&idx)?, &idx)?;
+    if ctx.mask {
+        // The analysis is unmasked; what is printed is masked here. Shares name projects by
+        // their dir: the last component only.
+        for r in &mut reports {
+            r.name = ctx.shown_account_name(r.account.as_str());
+            for w in &mut r.windows {
+                w.reference = w.reference_id.as_deref().map(|a| ctx.shown_account_name(a));
+                for s in &mut w.shares {
+                    s.project = ProjectKey::from_stored(ctx.show_path(s.project.as_str()));
+                    s.name = ctx.show_path(&s.name);
+                }
+            }
+        }
+    }
     if format == Format::Json {
         println!("{}", serde_json::to_string_pretty(&reports)?);
         return Ok(());
@@ -30,10 +45,13 @@ pub fn run(ctx: &Ctx, format: Format, top: usize) -> anyhow::Result<()> {
             println!();
         }
         let email = ctx
-            .email(&rep.account_uuid)
+            .email(rep.account.as_str())
             .map(|e| format!(" · {e}"))
             .unwrap_or_default();
-        let org = match ctx.org_name(&rep.account_uuid).filter(|o| o != &rep.name) {
+        let org = match ctx
+            .org_name(rep.account.as_str())
+            .filter(|o| o != &rep.name)
+        {
             Some(o) => format!(" · {o}"),
             None => String::new(),
         };
@@ -112,7 +130,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
     }
     let mut burn = format!("burn {}/h", fmt::money(w.burn_usd_per_hour));
     if let Some(pph) = w.points_per_hour {
-        burn.push_str(&format!(" ≈ {pph:.1} pts/h"));
+        burn.push_str(&format!(" ≈ {pph:.1}%/h"));
     }
     match w.eta {
         Some(d) if d.num_seconds() == 0 => burn.push_str(" · LIMIT REACHED"),
@@ -121,7 +139,12 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
             (ctx.now + d).with_timezone(&Local).format("%a %H:%M"),
             fmt::duration(d)
         )),
-        None if w.burn_usd_per_hour > Usd::ZERO => burn.push_str(" · lasts until reset"),
+        // No `eta` either because the window lasts, or because the pace is unknown (no usable
+        // USD per point yet).
+        None if w.points_per_hour.is_some() && w.burn_usd_per_hour > Usd::ZERO => {
+            burn.push_str(" · lasts until reset")
+        }
+        None if w.burn_usd_per_hour > Usd::ZERO => burn.push_str(" · pace unknown"),
         None => {}
     }
     println!(
@@ -157,7 +180,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
     {
         println!(
             "{pad}{}",
-            p.paint(&format!("on this machine ≈{v:.1} pts · elsewhere (claude.ai, desktop, other computers) ≈{o:.1} pts"), Tone::Warn)
+            p.paint(&format!("on this machine ≈{v:.1}% · elsewhere (claude.ai, desktop, other computers) ≈{o:.1}%"), Tone::Warn)
         );
     }
     if w.shares.is_empty() {
@@ -173,7 +196,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
     let max = w.shares.first().map(|s| s.share).unwrap_or(0.0);
     for s in w.shares.iter().take(top) {
         t.row(vec![
-            Cell::new(s.key.clone()),
+            Cell::new(s.name.clone()),
             Cell::new(fmt::money(s.cost)),
             Cell::tone(
                 format!(
@@ -183,7 +206,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
                 ),
                 Tone::Accent,
             ),
-            Cell::tone(format!("≈{:.1} pts", s.limit_points), Tone::Bold),
+            Cell::tone(format!("≈{:.1}%", s.limit_points), Tone::Bold),
         ]);
     }
     if w.shares.len() > top {
@@ -196,10 +219,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
             ),
             Cell::new(""),
             Cell::tone(
-                format!(
-                    "≈{:.1} pts",
-                    rest.iter().map(|s| s.limit_points).sum::<Pct>()
-                ),
+                format!("≈{:.1}%", rest.iter().map(|s| s.limit_points).sum::<Pct>()),
                 Tone::Dim,
             ),
         ]);
@@ -209,7 +229,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
             Cell::tone("(elsewhere)", Tone::Warn),
             Cell::tone("?", Tone::Dim),
             Cell::new(""),
-            Cell::tone(format!("≈{o:.1} pts"), Tone::Warn),
+            Cell::tone(format!("≈{o:.1}%"), Tone::Warn),
         ]);
     }
     for line in t.render(p).lines() {

@@ -6,7 +6,6 @@ use anyhow::{Context, bail};
 use chrono::Local;
 use clap::{Args, Subcommand};
 
-use crate::claude::credentials;
 use crate::claude::registry;
 use crate::claude::seats::Seat;
 use crate::core::harness::Harness;
@@ -16,7 +15,7 @@ use crate::ui::fmt;
 use crate::ui::mask;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
-use crate::vault::{self, Vault};
+use crate::vault::{self, Vault, VaultError};
 
 use crate::app::context::Ctx;
 
@@ -86,30 +85,12 @@ fn vault_seats(ctx: &Ctx) -> Vec<Seat> {
 }
 
 fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
-    let found = ctx
-        .seats
-        .iter()
-        .find(|s| s.label == key || s.dir.to_string_lossy() == key)
-        .with_context(|| {
-            format!(
-                "no seat '{key}'; seats: {}",
-                ctx.seats
-                    .iter()
-                    .filter(|s| s.harness.supports_vault())
-                    .map(|s| s.label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+    let found = ctx.resolve_seat(key)?;
     if let Some(e) = vault::unavailable(found.harness) {
         return Err(e.into());
     }
     if !found.harness.supports_vault() {
-        bail!(
-            "seat '{}' uses {}, whose logins the vault does not keep",
-            found.label,
-            found.harness.display_name()
-        );
+        return Err(VaultError::Unsupported(found.harness.display_name().into()).into());
     }
     Ok(found)
 }
@@ -150,7 +131,7 @@ fn weekly(
     let account = account?;
     let w = reports
         .iter()
-        .find(|r| r.account_uuid == account)?
+        .find(|r| r.account.as_str() == account)?
         .windows
         .iter()
         .find(|w| w.reading.kind == WindowKind::SevenDay)?;
@@ -168,7 +149,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             let s = seat(ctx, &key)?;
             match v.edit(|tx| tx.capture(s, label.as_deref()))? {
                 Some(id) => {
-                    let l = v.find(&id)?;
+                    let l = v.find(id.as_str())?;
                     println!(
                         "{} saved the login of seat '{}' as '{}' ({})",
                         p.paint("[ OK ]", Tone::Good),
@@ -188,25 +169,22 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
         AccountsCmd::Import { file, label } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            // A Claude Code credentials file (or `{"claudeAiOauth": …}`), else an agy token file.
-            let secret = match credentials::parse_login(&text)? {
-                Some(s) => s,
-                None => crate::agy::credentials::parse_login(&text)?
-                    .context("no Claude Code or Antigravity login in that file")?,
-            };
-            v.edit(|tx| tx.put(&secret, None, None, Some(&label), None))?;
+            let (secret, account) = vault::parse_import(&text)?;
+            v.edit(|tx| tx.put(&secret, None, account.as_ref(), Some(&label), None))?;
             println!(
                 "{} imported '{label}' ({})",
                 p.paint("[ OK ]", Tone::Good),
                 secret.meta().fingerprint
             );
-            println!(
-                "{}",
-                p.paint(
-                    "  The account behind it is learnt the first time it is switched into a seat.",
-                    Tone::Dim
-                )
-            );
+            if account.is_none() {
+                println!(
+                    "{}",
+                    p.paint(
+                        "  The account behind it is learnt the first time it is switched into a seat.",
+                        Tone::Dim
+                    )
+                );
+            }
             Ok(())
         }
         AccountsCmd::Switch {
@@ -325,10 +303,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             if let Some(e) = vault::unavailable(harness) {
                 return Err(e.into());
             }
-            let scratch = ctx
-                .dirs
-                .vault_dir()
-                .join(format!("new-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+            v.check_new_label(&label, harness)?;
+            let scratch = vault::new_login_scratch(&ctx.dirs.vault_dir(), ctx.now);
             std::fs::create_dir_all(&scratch)?;
             let (program, hint) = vault::new_login_recipe(harness);
             println!(
@@ -336,36 +312,27 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 harness.display_name()
             );
             let (mut cmd, tmp) = vault::new_login(harness, &label, &scratch);
-            let status = cmd.status();
-            let result = (|| -> anyhow::Result<()> {
-                let status =
-                    status.with_context(|| format!("cannot start `{program}` (is it on PATH?)"))?;
-                if !status.success() {
-                    eprintln!("{program} exited with {status}");
+            match cmd.status() {
+                Ok(status) if !status.success() => eprintln!("{program} exited with {status}"),
+                Ok(_) => {}
+                Err(e) => {
+                    if let Err(rm) = std::fs::remove_dir_all(&scratch) {
+                        eprintln!("cannot remove {}: {rm}", scratch.display());
+                    }
+                    return Err(e)
+                        .with_context(|| format!("cannot start `{program}` (is it on PATH?)"));
                 }
-                let s = vault::read_seat(&tmp)?;
-                let secret = s.secret.context("no login was made in the scratch seat")?;
-                v.edit(|tx| {
-                    tx.put(
-                        &secret,
-                        s.oauth_account,
-                        s.account.as_ref(),
-                        Some(&label),
-                        None,
-                    )
-                })?;
-                println!(
-                    "{} saved '{label}' ({})",
-                    p.paint("[ OK ]", Tone::Good),
-                    secret.meta().fingerprint
-                );
-                Ok(())
-            })();
-            // A scratch dir left behind holds a login: say where it is.
-            if let Err(e) = std::fs::remove_dir_all(&scratch) {
-                eprintln!("cannot remove {}: {e}", scratch.display());
             }
-            result
+            let saved = vault::save_new_login(&mut v, &label, &scratch, &tmp)?;
+            println!(
+                "{} saved '{label}' ({})",
+                p.paint("[ OK ]", Tone::Good),
+                saved.fingerprint
+            );
+            if let Some(msg) = saved.left_behind {
+                eprintln!("{msg}");
+            }
+            Ok(())
         }
         AccountsCmd::Rename {
             login,
@@ -373,7 +340,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             harness,
         } => {
             let id = v.find_in(&login, harness)?.id.clone();
-            v.edit(|tx| tx.rename(&id, &new_label))?;
+            v.edit(|tx| tx.rename(id.as_str(), &new_label))?;
             println!("{} renamed to '{new_label}'", p.paint("[ OK ]", Tone::Good));
             Ok(())
         }
@@ -383,7 +350,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             harness,
         } => {
             let id = v.find_in(&login, harness)?.id.clone();
-            let l = v.edit(|tx| tx.remove(&id, force))?;
+            let l = v.edit(|tx| tx.remove(id.as_str(), force))?;
             println!("{} forgot '{}'", p.paint("[ OK ]", Tone::Good), l.label);
             Ok(())
         }
@@ -394,7 +361,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     let vault_seats = vault_seats(ctx);
     let states = v.edit(|tx| tx.seat_states(&vault_seats))?;
     let (idx, _) = ctx.index()?;
-    let reports = all_reports(ctx, &idx)?;
+    let reports = all_reports(&ctx.limits_inputs(&idx)?, &idx)?;
     let p = &ctx.painter;
     let week_cell = |acct: Option<&str>| match weekly(&reports, acct) {
         Some((u, end, reset)) => (
@@ -506,7 +473,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                         ),
                         Tone::Warn,
                     ),
-                    (None, Some(a)) => Cell::new(ctx.account_name(a)),
+                    (None, Some(a)) => Cell::new(ctx.shown_account_name(a)),
                     (None, None) => Cell::tone("-", Tone::Dim),
                 },
             ];

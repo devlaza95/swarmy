@@ -61,6 +61,18 @@ pub enum VaultError {
         "the switch of seat '{seat}' stopped half way: {what}. The vault records what the seat holds now; run the switch again"
     )]
     SwitchIncomplete { seat: String, what: String },
+    #[error(
+        "seat '{seat}' holds another login now, one the vault has not saved; nothing moved. Save it first (`c` in the dashboard, `swarmy accounts capture {seat}`), then move again"
+    )]
+    SeatChanged { seat: String },
+    #[error(
+        "{harness} is running in seat '{seat}' ({what}). It keeps the login it loaded, and a refresh of it would undo the switch (its refresh tokens are single-use). Quit it there first"
+    )]
+    HarnessRunning {
+        seat: String,
+        harness: String,
+        what: String,
+    },
 }
 
 /// `config.toml`.
@@ -143,6 +155,8 @@ impl Coded for VaultError {
             VaultError::OneSeatOnly { .. } => "vault-one-seat-only",
             VaultError::SeatBusy(_) => "vault-seat-busy",
             VaultError::SwitchIncomplete { .. } => "vault-switch-incomplete",
+            VaultError::HarnessRunning { .. } => "vault-harness-running",
+            VaultError::SeatChanged { .. } => "vault-seat-changed",
         }
     }
 }
@@ -270,6 +284,17 @@ mod tests {
             VaultError::SwitchIncomplete {
                 seat: String::new(),
                 what: String::new(),
+            }
+            .code(),
+            VaultError::HarnessRunning {
+                seat: String::new(),
+                harness: String::new(),
+                what: String::new(),
+            }
+            .code(),
+            VaultError::Unsupported(String::new()).code(),
+            VaultError::SeatChanged {
+                seat: String::new(),
             }
             .code(),
             ConfigError::Invalid {

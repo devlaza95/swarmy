@@ -113,6 +113,46 @@ mod tests {
         );
     }
 
+    /// Review B-M6: the compacting process does not know every seat (one found only through
+    /// another run's processes). The seats whose rows it rolls up are recorded all the same, so
+    /// a later re-read of their old transcripts is judged by the archive.
+    #[test]
+    fn a_seat_this_process_did_not_find_is_recorded_as_rolled_up() {
+        let (w, path) = base();
+        let mut idx = copy(&w, &path, "partial.sqlite");
+        let lab = w.seats.iter().find(|s| s.label == "lab").unwrap().clone();
+        let others: Vec<_> = w.seats.iter().filter(|s| s.id != lab.id).cloned().collect();
+        let had_rows = count(
+            &idx,
+            &format!("SELECT COUNT(*) FROM requests WHERE seat = '{}'", lab.id),
+        );
+        assert!(had_rows > 0);
+        idx.compact(&CompactOpts {
+            keep_raw_days: 8,
+            now: at(NOW),
+            prices: &PriceBook::builtin(),
+            seats: &others,
+            max_chunks: None,
+        })
+        .unwrap();
+        let rolled_lab = count(
+            &idx,
+            &format!(
+                "SELECT COUNT(*) FROM rollup_seats WHERE seat = '{}'",
+                lab.id
+            ),
+        );
+        assert_eq!(rolled_lab, 1);
+        let lab_rollups = count(
+            &idx,
+            &format!(
+                "SELECT COUNT(*) FROM usage_rollup WHERE seat = '{}'",
+                lab.id
+            ),
+        );
+        assert!(lab_rollups > 0, "lab's old rows were rolled up");
+    }
+
     #[test]
     fn compaction_changes_no_number() {
         let (w, path) = base();
@@ -371,15 +411,17 @@ mod tests {
                 .collect();
             std::fs::write(&p, text(&l)).unwrap();
         }
-        // A fork of the third day's session: a new session id, the old responses and tool
-        // results (same message and tool ids, same times), then a new response. (Its prompts and
-        // API errors are left out: keyed by session, they count again even without compaction.)
+        // A fork of the third day's session: a new session id, the old records (same message,
+        // tool and record ids, same times), then a new response. Its API errors are the old ones
+        // again, counted once (review B-M8: keyed by session, they counted twice). Its prompts
+        // are left out here: with them the fork is the larger file, read first, and which
+        // session the copied responses land in depends on that order (prompts by record id:
+        // `index::scenarios::a_forked_prompt_counts_once`).
         let old: Vec<String> = lines(&work.join("s03.jsonl"))
             .into_iter()
             .filter(|l| {
                 let v: Value = serde_json::from_str(l).unwrap();
-                let prompt = v["type"] == "user" && v["message"]["content"].is_string();
-                !prompt && v["isApiErrorMessage"].is_null()
+                !(v["type"] == "user" && v["message"]["content"].is_string())
             })
             .collect();
         let mut fork = vec![owner("acc-a")];
@@ -396,8 +438,8 @@ mod tests {
 
     /// Marks the raw tables stale, as a new `CACHE_VERSION` does: the next open drops them.
     fn bump(path: &Path) {
-        let idx = Index::open(path).unwrap();
-        let other = (schema::CACHE_VERSION.parse::<u32>().unwrap() + 1).to_string();
+        let mut idx = Index::open(path).unwrap();
+        let other = (schema::CACHE_VERSION.parse::<u32>().unwrap() - 1).to_string();
         idx.set_meta("schema_version", &other).unwrap();
     }
 

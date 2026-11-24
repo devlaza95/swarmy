@@ -92,9 +92,13 @@ impl Index {
     }
 
     /// Remembers a compaction that rolled something up, for `doctor`.
-    pub(super) fn record_compaction(&self, r: &CompactReport, took_ms: u64) -> anyhow::Result<()> {
+    pub(super) fn record_compaction(
+        &mut self,
+        r: &CompactReport,
+        took_ms: u64,
+    ) -> anyhow::Result<()> {
         let last = LastCompaction {
-            at: ms(Utc::now()),
+            at: ms(self.now()),
             chunks: r.chunks,
             requests: r.requests,
             tool_calls: r.tool_calls,

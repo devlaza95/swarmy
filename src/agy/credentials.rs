@@ -21,7 +21,8 @@ pub fn parse_login(text: &str) -> anyhow::Result<Option<Secret>> {
     let v: Value = serde_json::from_str(text)?;
     Ok(v.get("token")
         .is_some_and(Value::is_object)
-        .then(|| Secret::of(Harness::Agy, v)))
+        .then(|| Secret::of(Harness::Agy, v))
+        .filter(Secret::has_token))
 }
 
 /// The text of the token file for `login`: the file is the login, so it is replaced whole.

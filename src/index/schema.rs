@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS prompts (
   session_id TEXT NOT NULL,
   ts INTEGER NOT NULL,
   chars INTEGER NOT NULL CHECK (chars >= 0),
+  -- The record's own id (Claude Code's `uuid`): a fork or a moved config dir repeats it.
+  record_id TEXT,
   PRIMARY KEY (seat, session_id, ts)
 );
 CREATE INDEX IF NOT EXISTS prompts_ts ON prompts(ts);
@@ -238,6 +240,7 @@ CREATE TABLE IF NOT EXISTS api_errors (
   ts INTEGER NOT NULL,
   kind TEXT NOT NULL,
   text TEXT,
+  record_id TEXT,
   PRIMARY KEY (seat, session_id, agent_id, ts, kind)
 );
 CREATE INDEX IF NOT EXISTS api_errors_ts ON api_errors(ts);
@@ -407,6 +410,8 @@ CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
 CREATE INDEX IF NOT EXISTS tool_calls_msg ON tool_calls(msg_id);
 CREATE INDEX IF NOT EXISTS agents_last_ts ON agents(last_ts);
 CREATE INDEX IF NOT EXISTS agents_session ON agents(session_id);
+CREATE UNIQUE INDEX IF NOT EXISTS prompts_record ON prompts(record_id) WHERE record_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS api_errors_record ON api_errors(record_id) WHERE record_id IS NOT NULL;
 "#;
 
 pub(super) fn meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
@@ -438,6 +443,17 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     migrate_facts(&tx)?;
     migrate_archive(&tx)?;
     let version = meta(&tx, "schema_version")?;
+    // A newer swarmy's cache is refused, like its facts and archive: rebuilding it would cost a
+    // full re-read, and the newer binary would rebuild it back (review B-M11).
+    if let Some(v) = version.as_deref().and_then(|v| v.parse::<u32>().ok())
+        && v > CACHE_VERSION.parse::<u32>()?
+    {
+        return Err(crate::errors::IndexError::NewerVersion {
+            what: "cache",
+            version: v,
+        }
+        .into());
+    }
     let rebuild = version.as_deref() != Some(CACHE_VERSION);
     let mut stashed = false;
     if rebuild {
@@ -478,6 +494,15 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     } else {
         meta(&tx, "cache_step")?.map_or(Ok(0), |v| v.parse())?
     };
+    if done > CACHE_STEPS.len() {
+        // Steps this binary does not know ran already: writing a lower count would make the
+        // newer one run its own again.
+        return Err(crate::errors::IndexError::NewerVersion {
+            what: "cache step",
+            version: u32::try_from(done)?,
+        }
+        .into());
+    }
     for step in CACHE_STEPS.iter().skip(done) {
         step(&tx)?;
         // Tables a step recreated get their indexes back.
@@ -573,10 +598,22 @@ fn restore_unrereadable(tx: &Connection) -> anyhow::Result<()> {
             .map(|c| c.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        tx.execute_batch(&format!(
-            "INSERT OR IGNORE INTO main.{t}({cols}) SELECT {cols} FROM temp.keep_{t};
-             DROP TABLE temp.keep_{t};"
-        ))?;
+        let stashed: i64 =
+            tx.query_row(&format!("SELECT COUNT(*) FROM temp.keep_{t}"), [], |r| {
+                r.get(0)
+            })?;
+        let put = tx.execute(
+            &format!("INSERT OR IGNORE INTO main.{t}({cols}) SELECT {cols} FROM temp.keep_{t}"),
+            [],
+        )?;
+        tx.execute_batch(&format!("DROP TABLE temp.keep_{t};"))?;
+        // The tables were empty: every row left out is one the new rules refused. Nothing read
+        // is dropped silently (review B-M7): it is counted, and `doctor` says so.
+        let refused = stashed - i64::try_from(put)?;
+        if refused > 0 {
+            let before: i64 = meta(tx, "rebuild_refused")?.map_or(Ok(0), |v| v.parse())?;
+            set_meta(tx, "rebuild_refused", &(before + refused).to_string())?;
+        }
     }
     Ok(())
 }
@@ -587,7 +624,7 @@ fn restore_unrereadable(tx: &Connection) -> anyhow::Result<()> {
 /// tables already have the latest shape. Steps only ever get appended. A step that reshapes a
 /// dimension table must also run after a rebuild (dimension tables are kept by it).
 type CacheStep = fn(&Connection) -> anyhow::Result<()>;
-const CACHE_STEPS: &[CacheStep] = &[add_cost_parts, add_natural_keys];
+const CACHE_STEPS: &[CacheStep] = &[add_cost_parts, add_natural_keys, add_record_ids];
 
 fn columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     conn.prepare("SELECT name FROM pragma_table_info(?1)")?
@@ -629,6 +666,18 @@ fn add_cost_parts(conn: &Connection) -> anyhow::Result<()> {
     }
     if !missing.is_empty() {
         conn.execute("DELETE FROM meta WHERE key = 'price_fp'", [])?;
+    }
+    Ok(())
+}
+
+/// Step 3: each prompt and API error keeps its record's own id, which a fork of the session or a
+/// moved config dir repeats (review B-M8: keyed by seat and session, they counted again). Rows
+/// read before have none, and keep their old key.
+fn add_record_ids(conn: &Connection) -> anyhow::Result<()> {
+    for t in ["prompts", "api_errors"] {
+        if !columns(conn, t)?.iter().any(|c| c == "record_id") {
+            conn.execute_batch(&format!("ALTER TABLE {t} ADD COLUMN record_id TEXT;"))?;
+        }
     }
     Ok(())
 }
@@ -1169,6 +1218,51 @@ mod tests {
         assert!(migrate(&c).is_err());
     }
 
+    /// Review B-M8: an index from before step 3 gets the record ids in place, its rows kept.
+    #[test]
+    fn record_ids_are_added_in_place() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "DROP INDEX prompts_record; DROP INDEX api_errors_record;
+             ALTER TABLE prompts DROP COLUMN record_id; ALTER TABLE api_errors DROP COLUMN record_id;
+             INSERT INTO prompts(seat, session_id, ts, chars) VALUES ('work', 's1', 1, 10);",
+        )
+        .unwrap();
+        set_meta(&c, "cache_step", "2").unwrap();
+        assert!(!migrate(&c).unwrap(), "no rebuild");
+        for t in ["prompts", "api_errors"] {
+            assert!(
+                columns(&c, t).unwrap().iter().any(|x| x == "record_id"),
+                "{t}"
+            );
+        }
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM prompts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Review B-M11: an older swarmy refuses a newer cache (it used to drop and re-read it, and
+    /// to rewind the step counter so the newer one ran its steps twice).
+    #[test]
+    fn a_newer_cache_is_refused_not_rebuilt() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let newer = (CACHE_VERSION.parse::<u32>().unwrap() + 1).to_string();
+        set_meta(&c, "schema_version", &newer).unwrap();
+        let e = migrate(&c).unwrap_err();
+        assert!(e.to_string().contains("newer swarmy"), "{e}");
+        set_meta(&c, "schema_version", CACHE_VERSION).unwrap();
+        set_meta(&c, "cache_step", &(CACHE_STEPS.len() + 1).to_string()).unwrap();
+        assert!(migrate(&c).is_err());
+        assert_eq!(
+            meta(&c, "cache_step").unwrap(),
+            Some((CACHE_STEPS.len() + 1).to_string()),
+            "nothing rewound"
+        );
+    }
+
     #[test]
     fn archive_version_1_counts_its_unpriced_requests() {
         // Rollups written with the `priced` flag only: the counts are added, filled from it.
@@ -1222,7 +1316,7 @@ mod tests {
                  INSERT OR IGNORE INTO branches VALUES ('work', 's1', 'a1', 1, 'main');
                  INSERT OR IGNORE INTO cost_states VALUES ('work', 's1', 1.5, '{{}}');
                  INSERT OR REPLACE INTO meta VALUES ('projects_rev', 'r'), ('price_fp', 'p'), ('schema_version', '{version}');
-                 INSERT OR IGNORE INTO prompts VALUES ('work', 's1', 1, 10);"
+                 INSERT OR IGNORE INTO prompts(seat, session_id, ts, chars) VALUES ('work', 's1', 1, 10);"
             ))
             .unwrap();
         };
@@ -1231,8 +1325,8 @@ mod tests {
                 .unwrap()
         };
         let dims = |c: &Connection| DIMENSION_TABLES.iter().map(|t| n(c, t)).collect::<Vec<_>>();
-        // Another cache version of today's dimension shape: raw rows go, dimensions stay.
-        let other = (CACHE_VERSION.parse::<u32>().unwrap() + 1).to_string();
+        // Another (older) cache version of today's dimension shape: raw rows go, dimensions stay.
+        let other = (CACHE_VERSION.parse::<u32>().unwrap() - 1).to_string();
         fill(&c, &other);
         assert!(migrate(&c).unwrap(), "the raw tables are rebuilt");
         assert_eq!(

@@ -1,10 +1,18 @@
-//! Finding where a Claude Code runs and taking the user there (`crate::core::pane::Pane`).
+//! Finding where an agent runs (its terminal pane) and taking the user there
+//! (`crate::core::pane::Pane`): tmux, Zellij, kitty, WezTerm, iTerm2, Warp. Not Claude Code's:
+//! every harness's agents run in terminals (reviews A-H5, B-M14).
 
 use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{iterm2, kitty, proc_env, tmux, warp, wezterm, zellij};
+pub mod iterm2;
+pub mod kitty;
+pub mod proc_env;
+pub mod tmux;
+pub mod warp;
+pub mod wezterm;
+pub mod zellij;
 use crate::core::pane::Pane;
 
 /// Bound how long an external terminal/multiplexer jump command may block the TUI or CLI.
@@ -153,6 +161,7 @@ mod tests {
             "ZELLIJ_SESSION_NAME",
             "ITERM_SESSION_ID",
             "WARP_TERMINAL_SESSION_UUID",
+            "TMUX",
         ]
         .iter()
         .any(|k| std::env::var_os(k).is_some());

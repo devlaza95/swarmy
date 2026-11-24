@@ -246,7 +246,7 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
         .collect();
     for rep in s.limits {
         // A login parked in the vault is not urgent: nothing runs on it.
-        let parked = !seated.is_empty() && !seated.contains(&rep.account_uuid.as_str());
+        let parked = !seated.is_empty() && !seated.contains(&rep.account.as_str());
         for w in &rep.windows {
             let label = format!("{} {}", rep.name, w.reading.kind.label());
             if w.level() == Level::Reached && !w.reset_passed {
@@ -444,7 +444,7 @@ pub fn limit_events(prev: &[AccountReport], next: &[AccountReport]) -> Events {
         for w in &rep.windows {
             let before = prev
                 .iter()
-                .find(|r| r.account_uuid == rep.account_uuid)
+                .find(|r| r.account == rep.account)
                 .and_then(|r| r.windows.iter().find(|x| x.reading.kind == w.reading.kind))
                 .map(|x| (x.estimate_now.get(), x.window));
             let Some((p, prev_window)) = before else {
@@ -462,7 +462,7 @@ pub fn limit_events(prev: &[AccountReport], next: &[AccountReport]) -> Events {
                             ),
                             Tone::Bad,
                         )
-                        .flash(format!("limit:{}", rep.account_uuid)),
+                        .flash(format!("limit:{}", rep.account)),
                     );
                     ev.ring |= th >= RING_AT;
                 }
@@ -476,7 +476,7 @@ pub fn limit_events(prev: &[AccountReport], next: &[AccountReport]) -> Events {
                         format!("LIMIT RESET · {} {}", rep.name, w.reading.kind.label()),
                         Tone::Good,
                     )
-                    .flash(format!("restored:{}", rep.account_uuid)),
+                    .flash(format!("restored:{}", rep.account)),
                 );
             }
         }
@@ -549,6 +549,7 @@ mod tests {
             name: if id.is_empty() { "main" } else { id }.into(),
             agent_type: None,
             project: "shop".into(),
+            project_key: None,
             checkout: None,
             model: Some("claude-opus-5-5".into()),
             effort: None,
@@ -583,7 +584,7 @@ mod tests {
             fetched_at: now() - Duration::minutes(5),
         };
         AccountReport {
-            account_uuid: account.into(),
+            account: account.into(),
             name: format!("{account}-login"),
             tier: None,
             windows: vec![WindowReport {
@@ -594,6 +595,7 @@ mod tests {
                 own_usd_per_point: None,
                 usd_per_point: None,
                 reference: None,
+                reference_id: None,
                 cost_in_window: Usd::ZERO,
                 estimate_now: Pct::new(used),
                 visible_points: None,
@@ -619,7 +621,6 @@ mod tests {
             harness: crate::core::harness::Harness::Claude,
             account: account.map(String::from),
             login: login.map(String::from),
-            plan: None,
             email: None,
             live: 0,
             today_cost: 0.0,

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+
+pub use crate::model::project::Alias;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Project {
@@ -22,14 +24,6 @@ pub struct Project {
     /// the project of the session it was used in (see `Index::post_pass`).
     #[serde(skip)]
     pub orphan: bool,
-}
-
-/// `[[project]]` entries of `config.toml`: every cwd starting with `match` belongs to `name`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct Alias {
-    #[serde(rename = "match")]
-    pub prefix: String,
-    pub name: String,
 }
 
 #[derive(Default)]

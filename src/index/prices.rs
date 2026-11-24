@@ -21,9 +21,20 @@ impl Index {
         book: &PriceBook,
         now: DateTime<Utc>,
     ) -> anyhow::Result<PriceBook> {
-        let key = book.fingerprint();
+        // The book and what `observed_prices` holds: another process may have dated a version
+        // this one has not seen (review B-L15: the memo kept the book alone, and two processes
+        // took turns repricing).
+        let key = |c: &Connection| -> rusqlite::Result<String> {
+            let (n, last): (i64, i64) = c.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(seen_at), 0) FROM observed_prices",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(format!("{}|{n}|{last}", book.fingerprint()))
+        };
+        let before = key(&self.conn)?;
         if let Some((k, dated)) = &self.dated
-            && *k == key
+            && *k == before
         {
             return Ok(dated.clone());
         }
@@ -98,14 +109,15 @@ impl Index {
         }
         tx.commit()?;
         let dated = book.with_observed(observed);
-        self.dated = Some((key, dated.clone()));
+        // Keyed by what the table holds now, this pass's own rows included.
+        self.dated = Some((key(&self.conn)?, dated.clone()));
         Ok(dated)
     }
 
     /// Prices new requests, and every request when any price changed. One transaction: other
     /// readers see either the old costs or the new ones, never a table half reset.
     pub fn price_all(&mut self, prices: &PriceBook) -> anyhow::Result<()> {
-        let book = self.dated_prices(prices, Utc::now())?;
+        let book = self.dated_prices(prices, self.now())?;
         let fp = book.fingerprint();
         // Nothing to do (the usual case, every second in the dashboard): no write at all.
         let pending = |c: &rusqlite::Connection| {
@@ -188,7 +200,7 @@ impl Index {
     /// their old band, the one inexact case of repricing. (model, first day, last day, rows),
     /// by model and first day.
     pub fn band_drift(&mut self, prices: &PriceBook) -> anyhow::Result<Vec<BandDrift>> {
-        let book = self.dated_prices(prices, Utc::now())?;
+        let book = self.dated_prices(prices, self.now())?;
         let mut st = self.conn.prepare(
             "SELECT model, bucket, lc_threshold, COUNT(*) FROM usage_rollup GROUP BY model, bucket, lc_threshold",
         )?;

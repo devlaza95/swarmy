@@ -3,13 +3,12 @@
 
 use std::time::Instant;
 
-use chrono::Utc;
-
 use super::jobs::{Job, Schedule};
 use super::{Analytics, ProjectRow, SeatRow, Wants, debug};
 use crate::app::context::Ctx;
 use crate::claude::registry::LiveSession;
 use crate::claude::seats::Seat;
+use crate::core::ids::ProjectKey;
 use crate::core::period::{Period, Span};
 use crate::index::Index;
 use crate::index::query::{Dim, Filter, Row};
@@ -122,13 +121,8 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         problems.push(format!("cannot read {}: {error}", ctx.show_path(&path)));
     }
     problems.dedup();
-    let midnight = chrono::Local::now()
-        .date_naive()
-        .and_time(chrono::NaiveTime::MIN)
-        .and_local_timezone(chrono::Local)
-        .earliest()
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or(ctx.now);
+    let midnight =
+        crate::core::period::local_midnight(ctx.now.with_timezone(&chrono::Local).date_naive());
     let end = ctx.now + chrono::Duration::seconds(1);
     let today_by_seat: std::collections::HashMap<String, (f64, u64)> = idx
         .spend_by(
@@ -179,7 +173,6 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
             } else {
                 None
             },
-            plan: si.account.as_ref().and_then(|a| a.plan_label()),
             email: si.account.as_ref().and_then(|a| a.email.clone()),
             live: live.iter().filter(|l| l.seat == s.id).count(),
             today_cost,
@@ -222,11 +215,11 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
     {
         let mut upsert = |rows: Vec<Row>, set: &dyn Fn(&mut ProjectRow, &Row)| {
             for r in rows {
-                match projects.iter_mut().find(|p| p.key == r.key) {
+                match projects.iter_mut().find(|p| p.key.as_str() == r.key) {
                     Some(p) => set(p, &r),
                     None => {
                         let mut p = ProjectRow {
-                            key: r.key.clone(),
+                            key: ProjectKey::from_stored(r.key.clone()),
                             name: r.label.clone(),
                             ..Default::default()
                         };
@@ -252,11 +245,11 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 ),
                 &|p, r| p.in_worktrees = r.cost,
             );
-            // Which harnesses worked on each project (applied below, by project name).
+            // Which harnesses worked on each project (applied below, by project key).
             if multi_harness {
                 harness_cells = Some(timed!(
                     "project_harness",
-                    idx.matrix(Dim::Project, Dim::Harness, span, &f)?
+                    idx.matrix_by_key(Dim::Project, Dim::Harness, span, &f)?
                 ));
             }
             match (prev_reuse, prev_span) {
@@ -266,7 +259,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                         .iter()
                         .filter(|p| p.prev > 0.0)
                         .map(|p| Row {
-                            key: p.key.clone(),
+                            key: p.key.as_str().to_string(),
                             label: p.name.clone(),
                             requests: 0,
                             usage: Default::default(),
@@ -311,7 +304,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         for p in projects.iter_mut() {
             let mut hs: Vec<(String, f64)> = cells
                 .iter()
-                .filter(|(name, _, c)| *name == p.name && *c > 0.0)
+                .filter(|(key, _, c)| key == p.key.as_str() && *c > 0.0)
                 .map(|(_, h, c)| (h.clone(), *c))
                 .collect();
             hs.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -408,7 +401,10 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         },
         limits: match prev_limits {
             Some(l) => l.to_vec(),
-            None => timed!("limits", limits::all_reports(ctx, idx)?),
+            None => timed!(
+                "limits",
+                limits::all_reports(&ctx.limits_inputs(idx)?, idx)?
+            ),
         },
         logins: vault_logins,
         seats,

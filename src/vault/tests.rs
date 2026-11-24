@@ -40,8 +40,8 @@ fn login<'a>(v: &'a Vault, key: &str) -> anyhow::Result<&'a Login> {
 }
 
 /// A saved secret, read from disk the way another process would see it.
-fn secret_of(v: &Vault, id: &str) -> anyhow::Result<Value> {
-    Ok(read_json(&v.dir.join("secrets.json"))?[id].clone())
+fn secret_of(v: &Vault, id: &LoginId) -> anyhow::Result<Value> {
+    Ok(read_json(&v.dir.join("secrets.json"))?[id.as_str()].clone())
 }
 
 fn secret(refresh: &str) -> Secret {
@@ -334,7 +334,7 @@ fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<(
         }
     }
     for l in v.logins() {
-        let sec = Secret::new(secrets[&l.id].clone());
+        let sec = Secret::new(secrets[l.id.as_str()].clone());
         assert_eq!(sec.meta().fingerprint, l.meta.fingerprint, "{}", l.label);
     }
     // The seats' first logins were saved before anything overwrote them.
@@ -544,7 +544,11 @@ fn remove_saves_the_index_before_deleting_the_secret() -> anyhow::Result<()> {
     let mut v = Vault::open(&vdir)?;
     v.edit(|tx| tx.put(&secret("r-a"), None, None, Some("a"), None))?;
     v.edit(|tx| tx.remove("a", false))?;
-    assert!(read_json(&vdir.join("secrets.json"))?.get(&id).is_none());
+    assert!(
+        read_json(&vdir.join("secrets.json"))?
+            .get(id.as_str())
+            .is_none()
+    );
     Ok(())
 }
 
@@ -738,14 +742,27 @@ fn a_key_naming_two_logins_is_ambiguous() -> anyhow::Result<()> {
             Some("first"),
             None,
         )?;
-        // A label equal to the other login's email.
-        tx.put(
+        // A label equal to the other login's email is refused now (review B-M5)…
+        let refused = tx.put(
             &secret("r-2"),
             None,
             Some(&acct("u2", "b@example.com")),
             Some("a@example.com"),
             None,
-        )
+        );
+        assert!(refused.is_err());
+        let id = tx.put(
+            &secret("r-2"),
+            None,
+            Some(&acct("u2", "b@example.com")),
+            Some("second"),
+            None,
+        )?;
+        // …but an older vault may hold one.
+        if let Some(l) = tx.index.find_mut(&id) {
+            l.label = "a@example.com".into();
+        }
+        Ok(())
     })?;
     let e = v.edit(|tx| tx.rename("a@example.com", "x")).unwrap_err();
     assert_eq!(crate::errors::code_of(&e), Some("vault-ambiguous-login"));
@@ -770,8 +787,23 @@ pub(super) mod hooks {
 
     type Hook = Box<dyn FnMut()>;
 
+    type Running = Box<dyn Fn(&crate::claude::seats::Seat) -> (usize, usize)>;
+
     thread_local! {
         static BEFORE_SEAT_WRITE: RefCell<Option<Hook>> = RefCell::new(None);
+        static CODEX_RUNNING: RefCell<Option<Running>> = RefCell::new(None);
+    }
+
+    /// What runs in a Codex seat (open threads, processes), when a test says so; else the real
+    /// look (none in a temp dir).
+    pub(in crate::vault) fn codex_running(
+        seat: &crate::claude::seats::Seat,
+    ) -> Option<(usize, usize)> {
+        CODEX_RUNNING.with(|h| h.borrow().as_ref().map(|f| f(seat)))
+    }
+
+    pub(super) fn set_codex_running(f: Option<Running>) {
+        CODEX_RUNNING.with(|h| *h.borrow_mut() = f);
     }
 
     /// Runs the hook set on this thread, right before a switch writes the seat's credentials.
@@ -881,6 +913,34 @@ fn a_seat_holding_a_free_saved_login_gets_it_mounted() -> anyhow::Result<()> {
     write_creds(&work, "acc-r-bob", "r-bob")?;
     let both = [work.clone(), spare.clone()];
     v.edit(|tx| tx.sync(&both))?;
+    assert_eq!(login(&v, "bob")?.mounted, vec![work.id.clone()]);
+    assert_eq!(login(&v, "alice")?.mounted, Vec::<SeatId>::new());
+    Ok(())
+}
+
+/// Review B-H1: the same crash, with credentials as Claude Code writes them (an access token
+/// fresh for hours). `.claude.json` still names alice's account, so bob's grant in her seat
+/// passed for a rotation of hers and overwrote her saved tokens. A grant the vault already
+/// holds is that login, never a rotation of another one.
+#[test]
+fn an_interrupted_switch_never_overwrites_the_previous_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    let alice_id = login(&v, "alice")?.id.clone();
+    let fresh = (chrono::Utc::now() + chrono::Duration::hours(8)).timestamp_millis();
+    let creds = json!({"mcpOAuth": {}, "claudeAiOauth": {"accessToken": "acc-r-bob",
+        "refreshToken": "r-bob", "expiresAt": fresh}});
+    std::fs::write(work.credentials_file(), creds.to_string())?;
+    v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
+    assert_eq!(
+        secret_of(&v, &alice_id)?["refreshToken"],
+        "r-alice",
+        "alice keeps her own grant"
+    );
     assert_eq!(login(&v, "bob")?.mounted, vec![work.id.clone()]);
     assert_eq!(login(&v, "alice")?.mounted, Vec::<SeatId>::new());
     Ok(())
@@ -1012,6 +1072,20 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
     assert_eq!(alice.mounted, vec![work.id.clone()]);
     assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
     assert_eq!(v.logins().len(), 1, "no second login for the same grant");
+
+    // Review A-H1: the pre-rotation token comes back (`accounts import` of an old file). The
+    // saved login is named after its first grant, so the new one must not take its id (which
+    // would have overwritten the live secret and made `forget` remove both).
+    v.edit(|tx| tx.put(&secret("r-alice"), None, None, Some("old"), None))?;
+    let old = login(&v, "old")?.clone();
+    assert_ne!(old.id, alice.id);
+    assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
+    assert_eq!(secret_of(&v, &old.id)?["refreshToken"], "r-alice");
+    v.edit(|tx| tx.remove("old", true))?;
+    assert!(
+        find(&v, "alice").is_some(),
+        "forgetting one keeps the other"
+    );
 
     // Away and back: the live, rotated grant goes back into the seat.
     v.edit(|tx| {
@@ -1537,5 +1611,286 @@ fn codex_logins_are_switched_followed_and_kept_to_one_seat() -> anyhow::Result<(
     assert!(!other.credentials_file().exists());
     assert_eq!(codex_refresh(&empty)?, "rt-sam-2");
     assert_eq!(login(&v, "sam")?.mounted, vec![empty.id.clone()]);
+    Ok(())
+}
+
+/// Reviews A-H2, B-M1: a Codex move writes three times (empty the seat the login leaves, put it
+/// into the seat asked for, give that seat's old login to the seat emptied). Between any two
+/// writes no refresh token is in two seats, and every save keeps the vault's invariants
+/// (`Index::violations`, checked by `save` in debug builds).
+#[test]
+fn a_codex_move_never_puts_one_token_in_two_seats() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    write_codex(&other, "rt-team-1", "user-team", "ws-2")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (a, b, log) = (main.clone(), other.clone(), seen.clone());
+    hooks::set_before_seat_write(Some(Box::new(move || {
+        let rt = |s: &Seat| {
+            codex_refresh(s)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+        };
+        log.borrow_mut().push((rt(&a), rt(&b)));
+    })));
+    let seats = [main.clone(), other.clone()];
+    let rep = v.edit(|tx| tx.switch_moving(&other, "sam", &seats));
+    hooks::set_before_seat_write(None);
+    let rep = rep?;
+    assert_eq!(
+        rep.moved,
+        vec![("codex".to_string(), Some("codex-work".to_string()))]
+    );
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    for (m, o) in seen.iter() {
+        assert!(m.is_none() || m != o, "one token in two seats: {seen:?}");
+    }
+    assert_eq!(codex_refresh(&other)?, "rt-sam-1");
+    assert_eq!(codex_refresh(&main)?, "rt-team-1");
+    Ok(())
+}
+
+/// Review B-M2: Codex refreshes the login in the seat it leaves while the move runs. The newest
+/// token is saved and is the one moved; the seat is not emptied over a copy the vault lacks.
+#[test]
+fn a_codex_refresh_during_a_move_is_saved_and_moved() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (m, f) = (main.clone(), fired.clone());
+    hooks::set_before_seat_write(Some(Box::new(move || {
+        if !f.replace(true) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = write_codex(&m, "rt-sam-2", "user-sam", "ws-1");
+        }
+    })));
+    let seats = [main.clone(), other.clone()];
+    let rep = v.edit(|tx| tx.switch_moving(&other, "sam", &seats));
+    hooks::set_before_seat_write(None);
+    let rep = rep?;
+    assert!(fired.get());
+    assert_eq!(rep.moved, vec![("codex".to_string(), None)]);
+    assert!(!main.credentials_file().exists());
+    assert_eq!(
+        codex_refresh(&other)?,
+        "rt-sam-2",
+        "the refreshed token moved"
+    );
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(
+        secret_of(&v, &sam.id)?["tokens"]["refresh_token"],
+        "rt-sam-2"
+    );
+    Ok(())
+}
+
+/// Reviews A-H3, B-M3: the vault itself refuses to switch a Codex seat while Codex runs in it
+/// or in the seat the login moves out of, looked at under its lock right before the writes.
+#[test]
+fn a_running_codex_stops_the_switch_inside_the_vault() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    write_codex(&other, "rt-team-1", "user-team", "ws-2")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    v.edit(|tx| tx.capture(&other, Some("team")))?;
+    // A third login in no seat: saved from a spare seat that was then emptied.
+    let spare = codex_seat(t.path(), "codex-spare")?;
+    write_codex(&spare, "rt-free-1", "user-free", "ws-3")?;
+    v.edit(|tx| tx.capture(&spare, Some("free")))?;
+    std::fs::remove_file(spare.credentials_file())?;
+    v.edit(|tx| tx.sync(std::slice::from_ref(&spare)))?;
+    assert!(login(&v, "free")?.mounted.is_empty());
+    hooks::set_codex_running(Some(Box::new(|s: &Seat| {
+        if s.label == "codex" { (0, 1) } else { (0, 0) }
+    })));
+    let seats = [main.clone(), other.clone()];
+    // Codex runs in the seat the login moves out of, then in the seat switched.
+    let moving = v.edit(|tx| tx.switch_moving(&other, "sam", &seats));
+    let plain = v.edit(|tx| tx.switch(&main, "free"));
+    hooks::set_codex_running(None);
+    for err in [moving.unwrap_err(), plain.unwrap_err()] {
+        let e = err.downcast_ref::<VaultError>();
+        assert!(
+            matches!(e, Some(VaultError::HarnessRunning { seat, .. }) if seat == "codex"),
+            "{err:#}"
+        );
+    }
+    assert_eq!(codex_refresh(&main)?, "rt-sam-1", "nothing was written");
+    assert_eq!(codex_refresh(&other)?, "rt-team-1");
+    Ok(())
+}
+
+/// Review B-M4: the sign-in in a scratch seat is the only copy of a new grant. When saving it
+/// fails (here the label was taken while the harness ran), the scratch dir stays and the error
+/// says where; when it is saved, the dir goes.
+#[test]
+fn a_new_login_that_cannot_be_saved_is_kept_in_its_scratch_dir() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let vault_dir = t.path().join("vault");
+    let mut v = Vault::open(&vault_dir)?;
+    v.edit(|tx| tx.put(&secret("r-alice"), None, None, Some("work"), None))?;
+    let a = super::new_login_scratch(&vault_dir, Utc::now());
+    let b = super::new_login_scratch(&vault_dir, Utc::now());
+    assert_ne!(a, b, "two adds in one second get two dirs");
+    std::fs::create_dir_all(&a)?;
+    let (_, scratch_seat) = super::new_login(Harness::Claude, "work", &a);
+    write_seat(&scratch_seat, "r-new", "bob")?;
+    assert!(v.check_new_label("work", Harness::Claude).is_err());
+    let err = super::save_new_login(&mut v, "work", &a, &scratch_seat).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&a.display().to_string()),
+        "{err:#}"
+    );
+    assert!(
+        scratch_seat.credentials_file().exists(),
+        "the grant is kept"
+    );
+    let saved = super::save_new_login(&mut v, "bob", &a, &scratch_seat)?;
+    assert!(saved.left_behind.is_none());
+    assert!(!a.exists());
+    assert!(find(&v, "bob").is_some());
+    Ok(())
+}
+
+/// Review A-M4: `accounts import` reads a credentials file of every harness the vault keeps,
+/// and an agy or Codex file brings the account it names.
+#[test]
+fn an_import_reads_every_harness_and_its_account() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let cc = seat(t.path(), "work")?;
+    write_seat(&cc, "r-cc", "acc-cc")?;
+    let agy = agy_seat(t.path(), "agy")?;
+    write_agy(&agy, "ya-sam", "sam@example.com")?;
+    let cdx = codex_seat(t.path(), "codex")?;
+    write_codex(&cdx, "rt-sam-1", "user-sam", "ws-1")?;
+    let read = |s: &Seat| std::fs::read_to_string(s.credentials_file());
+    let (sec, acct) = super::parse_import(&read(&cc)?)?;
+    assert_eq!((sec.harness(), acct.is_none()), (Harness::Claude, true));
+    let (sec, acct) = super::parse_import(&read(&agy)?)?;
+    assert_eq!(sec.harness(), Harness::Agy);
+    assert_eq!(
+        acct.map(|a| a.id().to_string()).as_deref(),
+        Some("agy:sam@example.com")
+    );
+    let (sec, acct) = super::parse_import(&read(&cdx)?)?;
+    assert_eq!(sec.harness(), Harness::Codex);
+    assert_eq!(
+        acct.map(|a| a.id().to_string()).as_deref(),
+        Some("cdx:user-sam/ws-1")
+    );
+    assert!(super::parse_import("{\"other\": 1}").is_err());
+    Ok(())
+}
+
+/// Review B-M5: a label that is another login's id or email would make lookups by id
+/// ambiguous (inside a Codex move too); it is refused like a taken label.
+#[test]
+fn a_label_never_shadows_another_logins_id_or_email() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    let alice = login(&v, "alice")?.clone();
+    let id = alice.id.clone();
+    let taken = v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some(id.as_str()), None));
+    assert!(taken.is_err(), "the id of another login");
+    if let Some(email) = alice.email.clone() {
+        let taken = v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some(&email), None));
+        assert!(taken.is_err(), "the email of another login");
+    }
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    assert_eq!(v.find(id.as_str())?.label, "alice");
+    Ok(())
+}
+
+/// Review B-L7: `.claude.json` is Claude Code's file. A switch keeps its mode, and a symlink
+/// to it stays a link (the file it points at is the one rewritten).
+#[cfg(unix)]
+#[test]
+fn a_seat_file_keeps_its_mode_and_its_link() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir()?;
+    let real = t.path().join("dotfiles-claude.json");
+    std::fs::write(&real, r#"{"oauthAccount": {"accountUuid": "a"}}"#)?;
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644))?;
+    let link = t.path().join(".claude.json");
+    std::os::unix::fs::symlink(&real, &link)?;
+    assert!(store::rewrite_merging(&link, |text| {
+        config_json::with_oauth_account(text, Some(&json!({"accountUuid": "b"})))
+    })?);
+    assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+    assert_eq!(read_json(&real)?["oauthAccount"]["accountUuid"], "b");
+    assert_eq!(
+        std::fs::metadata(&real)?.permissions().mode() & 0o777,
+        0o644
+    );
+    Ok(())
+}
+
+/// Review B-M28: a grant taken out of the vault (its login forgotten, or its copy replaced by
+/// another grant) is kept in `retired.json`, beyond the backup ring's reach; a refreshed access
+/// token of the same grant is not.
+#[test]
+fn grants_taken_out_of_the_vault_are_kept_apart() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let dir = t.path().join("vault");
+    let mut v = Vault::open(&dir)?;
+    v.edit(|tx| tx.put(&secret("r-alice"), None, None, Some("alice"), None))?;
+    let retired = || -> anyhow::Result<Value> {
+        Ok(read_json(&dir.join("retired.json")).unwrap_or(json!({})))
+    };
+    assert_eq!(retired()?.as_object().map(|m| m.len()), Some(0));
+    v.edit(|tx| tx.remove("alice", true))?;
+    let kept = retired()?;
+    let entries: Vec<&Value> = kept
+        .as_object()
+        .map(|m| m.values().collect())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["secret"]["refreshToken"], "r-alice");
+    Ok(())
+}
+
+/// A Codex move empties only a seat that still holds the grant that moves. Signed into another
+/// account there meanwhile (not saved yet), the seat is left alone and nothing moves: emptying
+/// it would delete a grant the vault does not have.
+#[test]
+fn a_codex_move_never_empties_a_seat_holding_another_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    // Another account signed in in `codex` since; the vault still records sam there.
+    write_codex(&main, "rt-new-1", "user-new", "ws-9")?;
+    let seats = [main.clone(), other.clone()];
+    let err = v
+        .edit(|tx| tx.switch_moving(&other, "sam", &seats))
+        .unwrap_err();
+    assert_eq!(
+        crate::errors::code_of(&err),
+        Some("vault-seat-changed"),
+        "{err:#}"
+    );
+    assert_eq!(
+        codex_refresh(&main)?,
+        "rt-new-1",
+        "the new login is still there"
+    );
+    assert!(!other.credentials_file().exists(), "nothing moved");
     Ok(())
 }

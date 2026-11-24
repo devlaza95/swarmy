@@ -10,4 +10,5 @@ pub mod credentials;
 pub mod discovery;
 pub mod live;
 pub mod meta;
+pub mod summaries;
 pub mod transcript;

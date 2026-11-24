@@ -361,6 +361,7 @@ pub fn rollup_insert_sql(filter: &str) -> String {
     )
 }
 
+#[cfg(test)]
 /// Rewrites the `agent_rollup` rows of the agents `filter` selects (over `usage_rollup u`) from
 /// `usage_rollup`.
 pub fn agent_rollup_sql(filter: &str) -> String {
@@ -477,10 +478,10 @@ pub fn rolled_until(conn: &Connection) -> anyhow::Result<i64> {
 /// quarter hour (a rollup cannot be split); `snap` floors it there instead (limit calibration of
 /// an account idle for longer than the raw window, design §3.5). A span end inside the archive
 /// counts the whole quarter hour it falls in.
-pub fn plan(conn: &Connection, span: Span, snap: bool) -> anyhow::Result<Plan> {
+pub fn plan(conn: &Connection, span: Span, snap: bool, now: DateTime<Utc>) -> anyhow::Result<Plan> {
     let mut start = ms(span.start.max(DateTime::<Utc>::UNIX_EPOCH));
     let end = ms(span.end);
-    if inside_raw_window(span, Utc::now()) {
+    if inside_raw_window(span, now) {
         return Ok(Plan {
             start,
             end,
@@ -508,14 +509,15 @@ pub fn read<T>(
     conn: &Connection,
     span: Span,
     snap: bool,
+    now: DateTime<Utc>,
     f: impl FnOnce(&Connection, Plan) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if inside_raw_window(span, Utc::now()) || !conn.is_autocommit() {
-        let p = plan(conn, span, snap)?;
+    if inside_raw_window(span, now) || !conn.is_autocommit() {
+        let p = plan(conn, span, snap, now)?;
         return f(conn, p);
     }
     let tx = conn.unchecked_transaction()?;
-    let p = plan(&tx, span, snap)?;
+    let p = plan(&tx, span, snap, now)?;
     let v = f(&tx, p)?;
     tx.commit()?;
     Ok(v)

@@ -84,9 +84,10 @@ fn record(input: &input::Input, data: &Path, home: &Path, dir: &Path, now: chron
 /// `swarmy statusline [--then CMD]`: record, then print (after the user's own status line).
 pub fn run(
     dirs: &crate::config::Dirs,
-    conf: &crate::config::StatuslineConf,
+    config: &crate::config::Config,
     then: Option<&str>,
 ) -> anyhow::Result<()> {
+    let conf = &config.statusline;
     let mut text = String::new();
     let _ = std::io::stdin().read_to_string(&mut text);
     let input = parse_input(&text);
@@ -95,33 +96,30 @@ pub fn run(
     record(&input, &dirs.data, &dirs.home, &dir, now);
     let fleet = crate::fleet::read_fresh(&crate::fleet::path(&dirs.data), conf.fresh_seconds, now);
     // No dashboard running: find the sessions that wait for the user ourselves.
-    let waiting = if fleet.is_some() || !conf.segments.iter().any(|s| s == "attention") {
+    let waiting = if fleet.is_some()
+        || !conf
+            .segments
+            .contains(&crate::config::StatusSegment::Attention)
+    {
         Vec::new()
     } else {
-        let mut dirs_: Vec<PathBuf> = vec![dirs.home.join(".claude"), dir.clone()];
-        if let Ok(rd) = std::fs::read_dir(&dirs.home) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with(".claude-")
-                    && e.path().join("sessions").is_dir()
-                {
-                    dirs_.push(e.path());
-                }
-            }
-        }
-        dirs_.sort();
-        dirs_.dedup();
-        dirs_
-            .iter()
-            .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
-            .map(|w| {
-                (
-                    w.session_id.to_string(),
-                    w.label(),
-                    w.what.clone(),
-                    w.pane.clone(),
-                )
-            })
-            .collect()
+        // The seats the dashboard would find, short of running processes.
+        crate::claude::seats::discover(&crate::claude::seats::Candidates {
+            home: &dirs.home,
+            env_dirs: vec![dir.clone()],
+            configured: config.seats_of(&dirs.home, crate::core::harness::Harness::Claude),
+        })
+        .iter()
+        .flat_map(|s| crate::claude::registry::waiting_sessions(&s.sessions_dir()))
+        .map(|w| {
+            (
+                w.session_id.to_string(),
+                w.label(),
+                w.what.clone(),
+                w.pane.clone(),
+            )
+        })
+        .collect()
     };
     let seat_key = crate::claude::seats::seat_id(&dir);
     let columns: usize = std::env::var("COLUMNS")

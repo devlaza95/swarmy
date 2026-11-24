@@ -7,12 +7,13 @@
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use super::procs::{ProcTable, proc_start_ticks};
 use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
 use crate::core::pane::Pane;
+pub use crate::model::live::{LiveSession, SessionStatus};
+use crate::procs::{ProcTable, proc_start_ticks};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -31,44 +32,6 @@ struct RawSession {
     waiting_for: Option<String>,
     updated_at: Option<i64>,
     status_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LiveSession {
-    pub seat: SeatId,
-    #[serde(default)]
-    pub harness: Harness,
-    pub pid: u32,
-    pub session_id: SessionId,
-    pub cwd: String,
-    pub name: Option<String>,
-    pub status: SessionStatus,
-    /// Its tmux pane or kitty window, for `J`.
-    pub pane: Option<Pane>,
-    pub version: Option<String>,
-    pub kind: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub status_since: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum SessionStatus {
-    Busy,
-    Idle,
-    /// Blocked on the user: a permission prompt, a question, a dialog…
-    Waiting(String),
-    Other(String),
-}
-
-impl SessionStatus {
-    fn parse(status: Option<&str>, waiting_for: Option<&str>) -> Self {
-        match status.unwrap_or("") {
-            "busy" => SessionStatus::Busy,
-            "idle" | "" => SessionStatus::Idle,
-            "waiting" => SessionStatus::Waiting(waiting_for.unwrap_or("input").to_string()),
-            s => SessionStatus::Other(s.to_string()),
-        }
-    }
 }
 
 fn ms(t: i64) -> Option<DateTime<Utc>> {
@@ -105,14 +68,8 @@ pub fn live_sessions(seat: &SeatId, sessions_dir: &Path, procs: &ProcTable) -> V
         let Ok(r) = serde_json::from_str::<RawSession>(&text) else {
             continue;
         };
-        // A record without a session id names nothing the index knows (review M10).
-        if r.pid == 0 || r.session_id.is_empty() || !procs.alive(r.pid) {
+        if !is_live(&r, |pid| procs.alive(pid)) {
             continue;
-        }
-        if let (Some(want), Some(have)) = (&r.proc_start, proc_start_ticks(r.pid))
-            && *want != have
-        {
-            continue; // the pid was reused by another process
         }
         out.push(LiveSession {
             seat: seat.clone(),
@@ -122,7 +79,7 @@ pub fn live_sessions(seat: &SeatId, sessions_dir: &Path, procs: &ProcTable) -> V
             cwd: r.cwd,
             name: r.name,
             status: SessionStatus::parse(r.status.as_deref(), r.waiting_for.as_deref()),
-            pane: super::pane::of(r.tmux, r.pid, r.proc_start.as_deref()),
+            pane: crate::terminal::of(r.tmux, r.pid, r.proc_start.as_deref()),
             version: r.version,
             kind: r.kind.or(r.entrypoint),
             started_at: ms(r.started_at).unwrap_or_else(Utc::now),
@@ -170,26 +127,31 @@ pub fn waiting_sessions(sessions_dir: &Path) -> Vec<Waiting> {
         else {
             continue;
         };
-        if r.status.as_deref() != Some("waiting") || r.pid == 0 || !pid_alive(r.pid) {
+        if r.status.as_deref() != Some("waiting") || !is_live(&r, crate::procs::pid_alive_once) {
             continue;
         }
         out.push(Waiting {
             session_id: SessionId::new(r.session_id),
             name: r.name,
             what: r.waiting_for.unwrap_or_else(|| "input".into()),
-            pane: super::pane::of(r.tmux, r.pid, r.proc_start.as_deref()),
+            pane: crate::terminal::of(r.tmux, r.pid, r.proc_start.as_deref()),
             cwd: r.cwd,
         });
     }
     out
 }
 
-fn pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        Path::new("/proc").join(pid.to_string()).exists()
-    } else {
-        true
-    }
+/// The one rule for a registry entry (review B-M18: the status line had a second, looser one):
+/// it names a session (a record without a session id names nothing the index knows, review
+/// M10), and its process runs and started when the entry says (a reused pid is another process).
+fn is_live(r: &RawSession, alive: impl Fn(u32) -> bool) -> bool {
+    r.pid != 0
+        && !r.session_id.is_empty()
+        && alive(r.pid)
+        && match (&r.proc_start, proc_start_ticks(r.pid)) {
+            (Some(want), Some(have)) => *want == have,
+            (None, _) | (_, None) => true,
+        }
 }
 
 #[cfg(test)]

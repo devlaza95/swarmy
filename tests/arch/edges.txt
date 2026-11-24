@@ -1,12 +1,11 @@
 # Allowed `crate::<module>::` references between top-level modules (production code).
 # New lines need a reason; lines only ever get removed.
-# Google Antigravity (`agy`) reader: shares normalized Seat, Event, LiveSession and ProcTable.
-agy -> claude
+# Google Antigravity (`agy`) reader.
 agy -> core
+# An agy database that cannot be opened is said on the debug channel (`agy::summaries`).
+agy -> diag
 agy -> fsutil
-# OpenAI Codex reader: shares normalized Seat, Event, LiveSession and ProcTable, and the lock
-# files of `fsutil::locks` with agy.
-codex -> claude
+# OpenAI Codex reader: shares the lock files of `fsutil::locks` with agy.
 codex -> core
 codex -> fsutil
 # The composition root (Ctx) reads seats, config, prices, the index and the vault's labels.
@@ -19,7 +18,12 @@ app -> core
 app -> diag
 # Failures users see come from the error catalogue (src/errors.rs, review L3).
 app -> errors
+# A seat named by its dir is matched canonically (`Ctx::resolve_seat`).
+app -> fsutil
 app -> index
+# The context builds the limit analysis's inputs (`Ctx::limits_inputs`); the analysis does
+# not read the context (reviews A-M1, B-M16).
+app -> limits
 # A seat's limit reading merges the status line's (statusline::reading, a published language).
 app -> statusline
 # Ctx::index draws the first-run progress bar with ui::fmt.
@@ -27,7 +31,6 @@ app -> ui
 app -> vault
 claude -> core
 # A seat's damaged settings.json is a coded failure from the error catalogue (src/errors.rs).
-claude -> errors
 # Commands start from the composition root.
 cli -> agy
 cli -> app
@@ -51,7 +54,6 @@ cli -> statusline
 cli -> tui
 cli -> ui
 cli -> vault
-config -> claude
 config -> core
 # Coded failures from the error catalogue (src/errors.rs).
 config -> errors
@@ -72,8 +74,6 @@ index -> codex
 index -> core
 # Coded failures from the error catalogue (src/errors.rs).
 index -> errors
-# The analysis reads its inputs (now, names, tiers, seat readings) from the context.
-limits -> app
 # Pure estimation rules.
 limits -> core
 # The queries feeding the estimation.
@@ -115,6 +115,8 @@ tui -> power
 tui -> statusline
 tui -> ui
 tui -> vault
+# Coded errors (`LookupError::NoSeat`) instead of ad-hoc text (review B-L10).
+tui -> errors
 ui -> core
 # Antigravity logins: the token file's format and the account it names (agy::credentials).
 vault -> agy
@@ -132,3 +134,32 @@ vault -> fsutil
 # Canonical paths without Windows' verbatim prefix, one helper for seats and the compactor.
 claude -> fsutil
 index -> fsutil
+# The OS process table (`procs`) and the terminal adapters (`terminal`) are no reader's: every
+# harness's agents are processes in terminal panes (reviews A-H5, B-M14: they lived in `claude`).
+agy -> procs
+agy -> terminal
+app -> procs
+claude -> procs
+claude -> terminal
+cli -> terminal
+codex -> procs
+codex -> terminal
+demo -> procs
+live -> procs
+terminal -> core
+terminal -> procs
+tui -> procs
+tui -> terminal
+vault -> procs
+# The normalized model (`model`: seats, transcript events and files, live sessions, accounts,
+# project aliases) every reader produces, owned by none of them (reviews A-H5, B-M14).
+agy -> model
+claude -> model
+codex -> model
+config -> model
+index -> model
+model -> core
+# `Seat::cleanup_period_days` reports a damaged `settings.json` with its code.
+model -> errors
+# A seat's id comes from its canonical dir.
+model -> fsutil

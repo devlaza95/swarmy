@@ -527,7 +527,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         .analytics
         .limits
         .iter()
-        .filter(|r| seated.is_empty() || seated.contains(&r.account_uuid.as_str()))
+        .filter(|r| seated.is_empty() || seated.contains(&r.account.as_str()))
         .filter_map(|r| {
             r.windows
                 .iter()
@@ -760,6 +760,7 @@ mod tests {
             name: format!("agent {id}"),
             agent_type: None,
             project: "shop".into(),
+            project_key: None,
             checkout: None,
             model: Some("claude-opus-5-5".into()),
             effort: None,

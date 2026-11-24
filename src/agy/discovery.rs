@@ -3,22 +3,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::claude::seats::Seat;
 use crate::core::harness::Harness;
 use crate::core::ids::SeatId;
+use crate::model::seat::Seat;
 
 /// Recognises an Antigravity CLI data directory (`~/.gemini/antigravity-cli`, etc.).
 pub fn looks_like_agy_dir(p: &Path) -> bool {
-    p.is_dir()
-        && [
-            "conversation_summaries.db",
-            "presence",
-            "antigravity-oauth-token",
-            "jetski_state.pbtxt",
-            "brain",
-        ]
-        .iter()
-        .any(|f| p.join(f).exists())
+    p.is_dir() && Harness::Agy.markers().iter().any(|f| p.join(f).exists())
 }
 
 pub fn label_for(dir: &Path, default_dir: &Path) -> String {

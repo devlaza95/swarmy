@@ -12,7 +12,7 @@ use crate::errors::VaultError;
 use crate::fsutil::{self, Mode};
 
 /// Secrets by login id: the verbatim `claudeAiOauth` objects.
-pub type Secrets = BTreeMap<String, Value>;
+pub type Secrets = BTreeMap<crate::core::ids::LoginId, Value>;
 
 /// Where secrets are kept: a JSON file readable only by the owner.
 /// How the secrets are kept, for `accounts` and `doctor`.
@@ -70,10 +70,18 @@ const RETRY_PAUSE: Duration = Duration::from_millis(15);
 /// After [`ATTEMPTS`] it fails ([`VaultError::SeatBusy`], or `change`'s own error when the file
 /// never parsed) instead of writing over a version it has not seen. Returns false (and writes
 /// nothing) when the file does not exist.
+///
+/// The file is another program's: it keeps its mode, and a symlink to it (a dotfile manager's)
+/// stays a link, the file it points at being the one replaced (review B-L7).
 pub fn rewrite_merging(
     path: &Path,
     change: impl Fn(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<bool> {
+    let resolved = std::fs::canonicalize(path);
+    let path: &Path = match &resolved {
+        Ok(p) => p,
+        Err(_) => path,
+    };
     let mut refused = None;
     for _ in 0..ATTEMPTS {
         let before = stamp(path);
@@ -89,7 +97,7 @@ pub fn rewrite_merging(
             }
         };
         refused = None;
-        let staged = fsutil::stage(path, new.as_bytes(), Mode::Private)
+        let staged = fsutil::stage(path, new.as_bytes(), Mode::KeepExisting)
             .with_context(|| format!("cannot write next to {}", path.display()))?;
         // The stamp alone is not enough: on Windows a quick replace can keep the same time and
         // size, so the text itself must still be what was read.

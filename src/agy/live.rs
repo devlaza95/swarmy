@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::meta::{ConversationMeta, RunStatus};
-use crate::claude::procs::ProcTable;
-use crate::claude::registry::{LiveSession, SessionStatus};
 use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
+use crate::model::live::{LiveSession, SessionStatus};
+use crate::procs::ProcTable;
 
 /// Cached process metadata for one live Antigravity conversation (Linux `/proc`).
 #[derive(Debug, Clone)]
@@ -63,8 +63,9 @@ impl AgyLiveCache {
             return;
         }
         let locked_set: HashSet<&str> = locked.iter().map(String::as_str).collect();
-        self.by_conv
-            .retain(|cid, info| locked_set.contains(cid.as_str()) && pid_is_alive(info.pid));
+        self.by_conv.retain(|cid, info| {
+            locked_set.contains(cid.as_str()) && crate::procs::pid_alive_once(info.pid)
+        });
         let missing = locked.iter().any(|cid| !self.by_conv.contains_key(cid));
         let mut key = locked.to_vec();
         key.sort();
@@ -139,20 +140,6 @@ pub fn build_live_sessions(
     out
 }
 
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
-}
-
 /// Scans `/proc/<pid>` on Linux for running `agy` processes that hold a `presence/<cid>.lock`
 /// file descriptor inside `seat_dir`, extracting their `cwd` and `TMUX_PANE`.
 #[cfg(target_os = "linux")]
@@ -197,7 +184,7 @@ fn scan_agy_procs(seat_dir: &Path) -> HashMap<String, AgyProcInfo> {
         let cwd = std::fs::read_link(pdir.join("cwd"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let pane = crate::claude::pane::of(read_tmux_pane(&pdir.join("environ")), pid, None);
+        let pane = crate::terminal::of(None, pid, None);
         for cid in cids {
             out.insert(
                 cid,
@@ -210,23 +197,6 @@ fn scan_agy_procs(seat_dir: &Path) -> HashMap<String, AgyProcInfo> {
         }
     }
     out
-}
-
-#[cfg(target_os = "linux")]
-fn read_tmux_pane(environ_path: &Path) -> Option<String> {
-    let bytes = std::fs::read(environ_path).ok()?;
-    let mut has_tmux = false;
-    let mut pane = None;
-    for entry in bytes.split(|b| *b == 0) {
-        if entry.starts_with(b"TMUX=") && entry.len() > 5 {
-            has_tmux = true;
-        } else if let Some(rest) = entry.strip_prefix(b"TMUX_PANE=")
-            && !rest.is_empty()
-        {
-            pane = Some(String::from_utf8_lossy(rest).into_owned());
-        }
-    }
-    has_tmux.then_some(pane).flatten()
 }
 
 #[cfg(not(target_os = "linux"))]

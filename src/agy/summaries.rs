@@ -1,8 +1,9 @@
-//! Read-only SQLite reader for Google Antigravity's `conversation_summaries.db`.
-//!
-//! Kept inside `src/index/` so every `rusqlite` call in the crate stays under one module
-//! (`tests/architecture.rs::sql_stays_in_the_index`). Opens the database strictly read-only with a
-//! short busy timeout and falls back to `cache/conversation_metadata.json` when absent or busy.
+//! Read-only SQLite reader for Google Antigravity's `conversation_summaries.db`: a reader of
+//! agy's files, so it lives with them (review A-M2: it sat in `src/index/` only to pass the
+//! SQL check). `tests/architecture.rs::sql_stays_in_the_index` allows it alone outside the
+//! index, and only opened read-only. Opens the database with a short busy timeout and falls back
+//! to `cache/conversation_metadata.json` when absent or busy; a failure other than a missing
+//! file is logged on the debug channel, never silent.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::agy::meta::{
+use super::meta::{
     ConversationMeta, RunStatus, parse_timestamp, parse_workspace_uris, read_metadata_json,
 };
 
@@ -26,9 +27,13 @@ fn open_ro(seat_dir: &Path) -> Option<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = match Connection::open_with_flags(&db, flags) {
         Ok(c) => c,
-        Err(_) => return None,
+        Err(e) => {
+            crate::diag::log("agy", &format!("cannot open {}: {e}", db.display()));
+            return None;
+        }
     };
-    if conn.busy_timeout(BUSY_TIMEOUT).is_err() {
+    if let Err(e) = conn.busy_timeout(BUSY_TIMEOUT) {
+        crate::diag::log("agy", &format!("{}: {e}", db.display()));
         return None;
     }
     Some(conn)

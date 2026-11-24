@@ -19,13 +19,11 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     let total = idx.total(span, &filter)?;
     if a.by == Dim::Account {
         for r in &mut rows {
-            r.label = ctx.account_name(&r.key);
+            r.label = ctx.shown_account_name(&r.key);
         }
     }
-    if a.by == Dim::Project && ctx.mask {
-        for r in &mut rows {
-            r.label = ctx.show_path(&r.label);
-        }
+    if ctx.mask {
+        mask_paths(a.by, &mut rows, |p| ctx.show_path(p));
     }
     if a.by == Dim::Weekday {
         const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -232,10 +230,40 @@ pub fn filter_label(ctx: &Ctx, f: &Filter) -> String {
     if let Some(m) = &f.model {
         parts.push(format!("model~{m}"));
     }
+    match f.in_worktree {
+        Some(true) => parts.push("checkout=worktrees".into()),
+        Some(false) => parts.push("checkout=main".into()),
+        None => {}
+    }
     if parts.is_empty() {
         String::new()
     } else {
         format!("· {}", parts.join(" "))
+    }
+}
+
+/// `--mask` covers every column that can hold a path, the JSON and CSV `key` too: a project's or
+/// checkout's dir, a branch key (`<dir> ⎇ <branch>`), and a label that fell back to a cwd.
+/// `show` is `Ctx::show_path` (masked, it keeps the last component).
+fn mask_paths(dim: Dim, rows: &mut [Row], show: impl Fn(&str) -> String) {
+    if !matches!(dim, Dim::Project | Dim::Worktree | Dim::Branch) {
+        return;
+    }
+    let path_like = |s: &str| {
+        s.starts_with(['/', '~', '\\']) || s.as_bytes().get(1..3) == Some(b":\\".as_slice())
+    };
+    let mask = |s: &str| {
+        if let Some((dir, branch)) = s.split_once(" ⎇ ").filter(|(d, _)| path_like(d)) {
+            format!("{} ⎇ {branch}", show(dir))
+        } else if path_like(s) {
+            show(s)
+        } else {
+            s.to_string()
+        }
+    };
+    for r in rows {
+        r.key = mask(&r.key);
+        r.label = mask(&r.label);
     }
 }
 
@@ -244,5 +272,52 @@ fn csv(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review B-M25: `report --mask --format csv|json` printed the git root (with the home dir)
+    /// in the `key` column; only the table's label was masked.
+    #[test]
+    fn mask_covers_keys_and_cwd_labels() {
+        let row = |key: &str, label: &str| Row {
+            key: key.into(),
+            label: label.into(),
+            requests: 1,
+            usage: Default::default(),
+            cost: 0.0,
+            unpriced: 0,
+            pending: 0,
+        };
+        let show = |p: &str| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let mut rows = vec![
+            row("/home/alice/work/shop", "shop"),
+            row("/home/alice/scratch", "/home/alice/scratch"),
+        ];
+        mask_paths(Dim::Project, &mut rows, show);
+        assert_eq!(
+            (rows[0].key.as_str(), rows[0].label.as_str()),
+            ("shop", "shop")
+        );
+        assert_eq!(
+            (rows[1].key.as_str(), rows[1].label.as_str()),
+            ("scratch", "scratch")
+        );
+        let mut rows = vec![row("/home/alice/work/shop ⎇ main", "shop ⎇ main")];
+        mask_paths(Dim::Branch, &mut rows, show);
+        assert_eq!(rows[0].key, "shop ⎇ main");
+        let mut rows = vec![row("claude-opus-5-5", "opus")];
+        mask_paths(Dim::Model, &mut rows, show);
+        assert_eq!(rows[0].key, "claude-opus-5-5");
+        let text = serde_json::to_string(&rows).unwrap();
+        assert!(!text.contains("alice"));
     }
 }

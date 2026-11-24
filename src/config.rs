@@ -8,10 +8,10 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::claude::project::Alias;
 use crate::core::harness::Harness;
 use crate::core::pricing::{PriceBook, RateOverrides, Rates};
 use crate::errors::ConfigError;
+use crate::model::project::Alias;
 
 #[derive(Debug, Clone)]
 pub struct Dirs {
@@ -226,16 +226,47 @@ impl Config {
             .collect()
     }
 
+    /// The `[[seat]]` paths and labels of harness `h`: those that say so, and those without
+    /// `harness` whose files are `h`'s ([`detect_harness`]; a dir whose files fit several is read
+    /// as Claude Code's). Every front end finds configured seats through this (reviews A-M3,
+    /// B-M19: the status line and `jump` had their own scans, which missed them).
+    pub fn seats_of(&self, home: &Path, h: Harness) -> Vec<(PathBuf, Option<String>)> {
+        self.seat_entries(home)
+            .into_iter()
+            .filter(|(path, _, explicit)| {
+                explicit.unwrap_or_else(|| detect_harness(path).unwrap_or(Harness::Claude)) == h
+            })
+            .map(|(path, label, _)| (path, label))
+            .collect()
+    }
+
     pub fn harness_enabled(&self, h: Harness) -> bool {
         !self.disabled_harnesses.contains(&h)
     }
 
-    /// Rules TOML cannot express: prices are finite and not negative.
+    /// Rules TOML cannot express: prices are finite and not negative; a subscription costs a
+    /// finite amount above zero (review A-M5: a negative or NaN price gave a payback figure).
     pub fn validate(&self) -> Result<(), String> {
+        for (account, usd) in &self.subscription {
+            if !(usd.is_finite() && *usd > 0.0) {
+                return Err(format!(
+                    "[subscription] {account}: a monthly price above 0 (got {usd})"
+                ));
+            }
+        }
         for p in &self.price {
-            Rates::derive(p.input, p.output, &p.overrides(), None)
+            let rates = Rates::derive(p.input, p.output, &p.overrides(), None);
+            rates
                 .validate()
                 .map_err(|e| format!("[[price]] {}: {e}", p.model))?;
+            // USD per request, unlike the rest (per million tokens): a price per 1000 searches
+            // would price each one 1000 times too high (review B-L11).
+            if rates.web_search > crate::core::pricing::MAX_WEB_SEARCH_USD {
+                return Err(format!(
+                    "[[price]] {}: web_search is USD per request (got {}; $10 per 1000 searches is 0.01)",
+                    p.model, rates.web_search
+                ));
+            }
         }
         Ok(())
     }
@@ -273,9 +304,47 @@ pub fn expand_home(p: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// The harness of a config dir, by the files in it (`Harness::detect`); `Err` names the
+/// harnesses whose files are all there.
+pub fn detect_harness(dir: &Path) -> Result<Harness, Vec<Harness>> {
+    Harness::detect(|f| dir.join(f).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review A-M5: a typo in `segments` or a nonsense subscription price fails the config,
+    /// instead of a segment silently missing or a payback from a negative price.
+    #[test]
+    fn segments_and_subscriptions_are_checked() {
+        assert!(toml::from_str::<Config>("[statusline]\nsegments = [\"wek\"]\n").is_err());
+        let ok: Config =
+            toml::from_str("[statusline]\nsegments = [\"week\", \"five_hour\"]\n").unwrap();
+        assert_eq!(
+            ok.statusline.segments,
+            [StatusSegment::Week, StatusSegment::FiveHour]
+        );
+        let bad: Config = toml::from_str("[subscription]\nwork = -20\n").unwrap();
+        assert!(bad.validate().is_err());
+        let good: Config = toml::from_str("[subscription]\nwork = 200\n").unwrap();
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn a_web_search_price_per_thousand_is_refused() {
+        let c: Config = toml::from_str(
+            "[[price]]\nmodel = \"claude-opus-5-5\"\ninput = 4\noutput = 20\nweb_search = 10\n",
+        )
+        .unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("USD per request"), "{e}");
+        let ok: Config = toml::from_str(
+            "[[price]]\nmodel = \"claude-opus-5-5\"\ninput = 4\noutput = 20\nweb_search = 0.01\n",
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
 
     /// First review L3: a misspelt theme is an error naming the themes, not a silent default.
     #[test]
@@ -397,12 +466,26 @@ fn migrate_dir(from: &std::path::Path, to: &std::path::Path) {
     let _ = std::fs::remove_dir(from);
 }
 
+/// A piece of the status line (`[statusline] segments`). A name it does not know fails
+/// `config.toml` when it is read, instead of a segment silently missing (review A-M5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSegment {
+    Attention,
+    Agents,
+    Week,
+    FiveHour,
+    Context,
+    Cost,
+    Burn,
+}
+
 /// `[statusline]` in config.toml.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatuslineConf {
     /// Segments in display order: attention, agents, week, five_hour, context, cost, burn.
-    pub segments: Vec<String>,
+    pub segments: Vec<StatusSegment>,
     /// 1, or 2 for a second line with the model, effort, branch and session name.
     pub lines: u8,
     /// Seconds between refreshes of an idle session's line (`swarmy setup` writes it into
@@ -419,17 +502,15 @@ pub struct StatuslineConf {
 impl Default for StatuslineConf {
     fn default() -> Self {
         StatuslineConf {
-            segments: [
-                "attention",
-                "agents",
-                "week",
-                "five_hour",
-                "context",
-                "cost",
-                "burn",
-            ]
-            .map(String::from)
-            .to_vec(),
+            segments: vec![
+                StatusSegment::Attention,
+                StatusSegment::Agents,
+                StatusSegment::Week,
+                StatusSegment::FiveHour,
+                StatusSegment::Context,
+                StatusSegment::Cost,
+                StatusSegment::Burn,
+            ],
             lines: 1,
             refresh_seconds: 10,
             fresh_seconds: 15,

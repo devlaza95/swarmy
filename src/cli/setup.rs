@@ -227,99 +227,103 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|s| s.harness.supports_statusline())
         .collect();
-    if claude_seats.is_empty() {
-        println!("No Claude Code config dir found. Run `claude` once, then run setup again.");
-        return Ok(());
-    }
-    println!("\nClaude Code config dirs (seats) found:");
-    for s in &claude_seats {
-        let state = match seat_status_line(s) {
-            StatusLine::None => p.paint("no status line", Tone::Dim),
-            StatusLine::Swarmy { .. } => p.paint("swarmy status line ✓", Tone::Good),
-            StatusLine::Other(_) => p.paint("has its own status line", Tone::Dim),
-        };
-        println!("  {:<12} {:<34} {state}", s.label, show(&s.dir));
-    }
-    let exe = std::env::current_exe().context("cannot find the swarmy binary")?;
-    let exe = crate::fsutil::canonical(&exe).unwrap_or(exe);
+    // The status line is Claude Code's; a machine with only agy or Codex seats still gets the
+    // saved-logins step below (review A-L2).
+    'statusline: {
+        if claude_seats.is_empty() {
+            println!("No Claude Code config dir found: no status line to install.");
+            break 'statusline;
+        }
+        println!("\nClaude Code config dirs (seats) found:");
+        for s in &claude_seats {
+            let state = match seat_status_line(s) {
+                StatusLine::None => p.paint("no status line", Tone::Dim),
+                StatusLine::Swarmy { .. } => p.paint("swarmy status line ✓", Tone::Good),
+                StatusLine::Other(_) => p.paint("has its own status line", Tone::Dim),
+            };
+            println!("  {:<12} {:<34} {state}", s.label, show(&s.dir));
+        }
+        let exe = std::env::current_exe().context("cannot find the swarmy binary")?;
+        let exe = crate::fsutil::canonical(&exe).unwrap_or(exe);
 
-    // 1. The status line.
-    let todo: Vec<&Seat> = claude_seats
-        .iter()
-        .copied()
-        .filter(|s| match read_settings(&settings_file(s)) {
-            Ok(settings) => with_status_line(
-                settings,
-                &exe,
-                a.remove,
-                ctx.config.statusline.refresh_seconds,
-            )
-            .is_some(),
-            // Never taken for an empty file: that seat is left out, and says why.
-            Err(e) => {
-                println!("  {} {e:#}", p.paint("skipped:", Tone::Warn));
-                false
-            }
-        })
-        .collect();
-    println!();
-    if todo.is_empty() {
-        println!(
-            "{}",
-            if a.remove {
-                "No seat has the swarmy status line."
-            } else {
-                "Every seat already has the swarmy status line."
-            }
-        );
-    } else {
-        let q = if a.remove {
-            format!("Take the swarmy status line out of {} seat(s)?", todo.len())
-        } else {
-            println!(
-                "The swarmy status line shows week and 5-hour use under Claude Code's prompt, and"
-            );
-            println!(
-                "gives swarmy the exact limits after every response (no network, nothing else changes)."
-            );
-            println!("A status line you already have stays and is shown first.");
-            let fresh = todo
-                .iter()
-                .filter(|s| !matches!(seat_status_line(s), StatusLine::Swarmy { .. }))
-                .count();
-            if fresh == 0 {
-                format!(
-                    "Update the swarmy status line in {} seat(s) (refresh every {} s)?",
-                    todo.len(),
-                    ctx.config.statusline.refresh_seconds
-                )
-            } else {
-                format!("Add it to {} seat(s)?", todo.len())
-            }
-        };
-        if ask(&q, a.yes) {
-            for s in todo {
-                let path = settings_file(s);
-                let settings = read_settings(&path)?;
-                if let Some(new) = with_status_line(
+        // 1. The status line.
+        let todo: Vec<&Seat> = claude_seats
+            .iter()
+            .copied()
+            .filter(|s| match read_settings(&settings_file(s)) {
+                Ok(settings) => with_status_line(
                     settings,
                     &exe,
                     a.remove,
                     ctx.config.statusline.refresh_seconds,
-                ) {
-                    let backup = write_settings(&path, &new)?;
-                    println!(
-                        "  {} {}{}",
-                        p.paint("✓", Tone::Good),
-                        show(&path),
-                        backup
-                            .map(|b| format!(" (backup: {})", show(&b)))
-                            .unwrap_or_default()
-                    );
+                )
+                .is_some(),
+                // Never taken for an empty file: that seat is left out, and says why.
+                Err(e) => {
+                    println!("  {} {e:#}", p.paint("skipped:", Tone::Warn));
+                    false
                 }
-            }
-            if !a.remove {
-                println!("  Claude Code shows it with the next response (or after a restart).");
+            })
+            .collect();
+        println!();
+        if todo.is_empty() {
+            println!(
+                "{}",
+                if a.remove {
+                    "No seat has the swarmy status line."
+                } else {
+                    "Every seat already has the swarmy status line."
+                }
+            );
+        } else {
+            let q = if a.remove {
+                format!("Take the swarmy status line out of {} seat(s)?", todo.len())
+            } else {
+                println!(
+                    "The swarmy status line shows week and 5-hour use under Claude Code's prompt, and"
+                );
+                println!(
+                    "gives swarmy the exact limits after every response (no network, nothing else changes)."
+                );
+                println!("A status line you already have stays and is shown first.");
+                let fresh = todo
+                    .iter()
+                    .filter(|s| !matches!(seat_status_line(s), StatusLine::Swarmy { .. }))
+                    .count();
+                if fresh == 0 {
+                    format!(
+                        "Update the swarmy status line in {} seat(s) (refresh every {} s)?",
+                        todo.len(),
+                        ctx.config.statusline.refresh_seconds
+                    )
+                } else {
+                    format!("Add it to {} seat(s)?", todo.len())
+                }
+            };
+            if ask(&q, a.yes) {
+                for s in todo {
+                    let path = settings_file(s);
+                    let settings = read_settings(&path)?;
+                    if let Some(new) = with_status_line(
+                        settings,
+                        &exe,
+                        a.remove,
+                        ctx.config.statusline.refresh_seconds,
+                    ) {
+                        let backup = write_settings(&path, &new)?;
+                        println!(
+                            "  {} {}{}",
+                            p.paint("✓", Tone::Good),
+                            show(&path),
+                            backup
+                                .map(|b| format!(" (backup: {})", show(&b)))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+                if !a.remove {
+                    println!("  Claude Code shows it with the next response (or after a restart).");
+                }
             }
         }
     }

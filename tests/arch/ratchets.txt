@@ -1,7 +1,14 @@
 # Counts in production code (tests excluded) that may only go down (tests/architecture.rs).
 fallbacks_index_vault_app_cli_limits = 41
 unwraps = 0
-wildcard_arms = 50
+wildcard_arms = 43
 files_over_900_lines = 0
 limit_threshold_copies = 0
 tui_duration_literals_outside_jobs = 1
+clock_reads_below_front_ends = 8
+env_reads_outside_config_cli_app = 16
+mask_below_front_ends = 0
+claude_dir_scans_outside_seats = 0
+midnight_copies_outside_core = 0
+pts_on_screen = 0
+functions_over_120_lines = 44

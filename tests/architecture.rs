@@ -130,6 +130,71 @@ fn read_list(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether `text` names the top-level module `m`: `crate::m::…`, `use crate::m;`,
+/// `use crate::m as x;`, or `m` (or `m::…`) inside a `use crate::{…}` group (review B-L8: the
+/// check saw only the first form).
+fn names_module(text: &str, m: &str) -> bool {
+    if [
+        format!("crate::{m}::"),
+        format!("crate::{m};"),
+        format!("crate::{m} as "),
+    ]
+    .iter()
+    .any(|p| text.contains(p.as_str()))
+    {
+        return true;
+    }
+    let mut rest = text;
+    while let Some(i) = rest.find("crate::{") {
+        let group = &rest[i + "crate::{".len()..];
+        let (mut depth, mut item, mut end) = (0usize, String::new(), group.len());
+        let mut items = Vec::new();
+        for (j, ch) in group.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' if depth == 0 => {
+                    end = j;
+                    break;
+                }
+                '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(std::mem::take(&mut item));
+                    continue;
+                }
+                _ => {}
+            }
+            item.push(ch);
+        }
+        items.push(item);
+        let hit = items.iter().map(|x| x.trim()).any(|x| {
+            x == m || x.starts_with(&format!("{m}::")) || x.starts_with(&format!("{m} as "))
+        });
+        if hit {
+            return true;
+        }
+        rest = &group[end..];
+    }
+    false
+}
+
+#[test]
+fn the_edge_check_sees_every_form_of_use() {
+    assert!(names_module("crate::limits::all_reports(ctx)", "limits"));
+    assert!(names_module("use crate::limits;", "limits"));
+    assert!(names_module("use crate::limits as l;", "limits"));
+    assert!(names_module("use crate::{app, limits};", "limits"));
+    assert!(names_module(
+        "use crate::{\n    limits::{a, b},\n    ui,\n};",
+        "limits"
+    ));
+    assert!(names_module("use crate::{app::{x, y}, ui as u};", "ui"));
+    assert!(!names_module(
+        "use crate::{app::{limits, y}, ui};",
+        "limits"
+    ));
+    assert!(!names_module("use crate::limitsx;", "limits"));
+}
+
 #[test]
 fn module_edges_only_shrink() {
     let (root, files) = files();
@@ -138,7 +203,7 @@ fn module_edges_only_shrink() {
     for (p, text) in &files {
         let from = module_of(&root, p);
         for m in &modules {
-            if *m != from && m != "main" && production(text).contains(&format!("crate::{m}::")) {
+            if *m != from && m != "main" && names_module(production(text), m) {
                 edges.insert(format!("{from} -> {m}"));
             }
         }
@@ -154,6 +219,57 @@ fn module_edges_only_shrink() {
         gone.is_empty(),
         "these dependencies are gone, remove them from tests/arch/edges.txt: {gone:?}"
     );
+}
+
+/// Functions whose body runs over `max` lines (reviews A-M7, B-M23: orchestrators of 300+ lines
+/// mixed every level of abstraction). Counted by braces from the `fn` line; braces inside
+/// strings may shift a count, which a ratchet can live with.
+fn long_functions(text: &str, max: usize) -> usize {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_fn = |l: &str| {
+        let t = l.trim_start();
+        let t = t
+            .strip_prefix("pub(crate) ")
+            .or_else(|| t.strip_prefix("pub(super) "))
+            .or_else(|| t.strip_prefix("pub "))
+            .unwrap_or(t);
+        let t = t.strip_prefix("const ").unwrap_or(t);
+        let t = t.strip_prefix("async ").unwrap_or(t);
+        t.starts_with("fn ")
+    };
+    let mut n = 0;
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_fn(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let (mut depth, mut opened, mut j) = (0i64, false, i);
+        while j < lines.len() {
+            for ch in lines[j].chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if lines[j].trim_end().ends_with(';') && !opened {
+                break; // a declaration without a body
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+            j += 1;
+        }
+        if opened && j - i + 1 > max {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
 }
 
 /// What the ratchet counts, in production code only.
@@ -179,8 +295,38 @@ fn counts() -> BTreeMap<&'static str, usize> {
             *c.entry("tui_duration_literals_outside_jobs").or_default() +=
                 n("Duration::from_secs(") + n("Duration::from_millis(") + n(".as_secs() <");
         }
+        // The clock below the composition root and the front ends (reviews A-M6, B-M17): time
+        // is an input there, so a pass reads one instant and tests can fix it.
+        if !matches!(
+            m.as_str(),
+            "app" | "cli" | "tui" | "main" | "demo" | "statusline"
+        ) {
+            *c.entry("clock_reads_below_front_ends").or_default() +=
+                n("Utc::now()") + n("Local::now()");
+        }
+        // The environment is read where the process starts (reviews A-M6, B-M26).
+        if !matches!(m.as_str(), "app" | "cli" | "config" | "main" | "diag") {
+            *c.entry("env_reads_outside_config_cli_app").or_default() += n("std::env::var");
+        }
+        // `--mask` is presentation: applied by the front ends only (reviews A-H4, B-M16).
+        if matches!(m.as_str(), "index" | "limits" | "live" | "vault" | "core") {
+            *c.entry("mask_below_front_ends").or_default() += n(".mask") + n("show_path(");
+        }
+        // One seat discovery (`claude::seats::discover`; reviews A-M3, B-M19).
+        if !p.ends_with("claude/seats.rs") {
+            *c.entry("claude_dir_scans_outside_seats").or_default() +=
+                n("starts_with(\".claude-\")") + n("starts_with(\".claude_\")");
+        }
+        // One local midnight (`core::period`; review B-M20).
+        if m != "core" {
+            *c.entry("midnight_copies_outside_core").or_default() += n("NaiveTime::MIN)");
+        }
+        // Never "pt" on screen (AGENTS.md; reviews A-L1, B-L2).
+        *c.entry("pts_on_screen").or_default() +=
+            n("} pts") + n(" pts\"") + n("pts/h") + n("/pt\"");
         *c.entry("unwraps").or_default() += n(".unwrap()") + n(".expect(");
         *c.entry("wildcard_arms").or_default() += n("_ =>");
+        *c.entry("functions_over_120_lines").or_default() += long_functions(prod, 120);
         if prod.lines().count() > 900 {
             *c.entry("files_over_900_lines").or_default() += 1;
         }
@@ -239,13 +385,30 @@ fn core_is_pure() {
 #[test]
 fn sql_stays_in_the_index() {
     let (root, files) = files();
+    // One reader of another program's database may query it, read-only (review A-M2: it was
+    // kept in `src/index/` only to pass this check).
+    let read_only_readers = ["agy/summaries.rs"];
     let found: Vec<String> = files
         .iter()
         .filter(|(p, _)| module_of(&root, p) != "index")
         .filter(|(_, t)| t.contains("SELECT ") || t.contains("rusqlite"))
         .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
+        .filter(|p| !read_only_readers.contains(&p.replace('\\', "/").as_str()))
         .collect();
     assert!(found.is_empty(), "SQL outside src/index/: {found:?}");
+    for r in read_only_readers {
+        let (_, text) = files.iter().find(|(p, _)| p.ends_with(r)).unwrap();
+        let text = production(text);
+        assert!(
+            text.contains("SQLITE_OPEN_READ_ONLY")
+                && !text.contains("OpenFlags::SQLITE_OPEN_READ_WRITE")
+                && !text.contains("Connection::open(")
+                && !["INSERT ", "UPDATE ", "DELETE ", "CREATE "]
+                    .iter()
+                    .any(|w| text.contains(w)),
+            "{r} must only read its database"
+        );
+    }
 }
 
 /// One way to replace a file (review M8): `fsutil::atomic_write`. A rename elsewhere is a second

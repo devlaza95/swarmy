@@ -15,7 +15,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::app::context::Ctx;
-    use crate::claude::procs::ProcTable;
     use crate::config::{Config, Dirs};
     use crate::core::period::{BUCKET_MS, Period, Span};
     use crate::core::pricing::PriceBook;
@@ -26,6 +25,7 @@ mod tests {
     use crate::index::query::{Dim, Filter};
     use crate::index::scenarios::{World, account, at, owner};
     use crate::index::{Index, SeatInfo};
+    use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
 
     /// A small deterministic generator (xorshift), so the world is the same on every run.
@@ -166,7 +166,8 @@ mod tests {
             let t = self.tick();
             let text = "x".repeat(5 + self.rng.below(200) as usize);
             self.lines.push(
-                json!({"type": "user", "timestamp": ts(t), "message": {"role": "user", "content": text}})
+                json!({"type": "user", "uuid": format!("{}-p{}", self.id, self.lines.len()), "timestamp": ts(t),
+                       "message": {"role": "user", "content": text}})
                     .to_string(),
             );
         }
@@ -174,7 +175,8 @@ mod tests {
         fn api_error(&mut self) {
             let t = self.tick();
             let kind = self.rng.pick(&["rate_limit", "overloaded"]);
-            self.lines.push(json!({"type": "assistant", "isApiErrorMessage": true, "error": kind, "timestamp": ts(t),
+            let uuid = format!("{}-e{}", self.id, self.lines.len());
+            self.lines.push(json!({"type": "assistant", "uuid": uuid, "isApiErrorMessage": true, "error": kind, "timestamp": ts(t),
                 "message": {"id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "API Error"}]}})
             .to_string());
         }
@@ -537,7 +539,10 @@ mod tests {
                 .unwrap()),
         );
         // Limits: the windows in force and the calibration over older windows.
-        let reports = crate::limits::all_reports(&ctx(w), idx).unwrap();
+        let reports = {
+            let c = ctx(w);
+            crate::limits::all_reports(&c.limits_inputs(idx).unwrap(), idx).unwrap()
+        };
         let curves: Vec<Vec<crate::core::units::Pct>> = reports
             .iter()
             .flat_map(|r| r.windows.iter().map(|x| x.curve.clone()))
@@ -816,7 +821,11 @@ mod tests {
         // A fresh process (no memoized totals) reads the archive.
         let idx = Index::open(&path).unwrap();
         let all = Period::All.span(at(NOW), None);
-        assert!(archive::plan(&idx.conn, all, false).unwrap().archive);
+        assert!(
+            archive::plan(&idx.conn, all, false, idx.now())
+                .unwrap()
+                .archive
+        );
         let after = snapshot(&w, &idx);
         let mut d = Vec::new();
         diff(&before, &after, "", &mut d);
@@ -828,7 +837,11 @@ mod tests {
         );
         // Spans inside the raw window keep the plain raw read.
         let week = Period::Days(7).span(at(NOW), None);
-        assert!(!archive::plan(&idx.conn, week, false).unwrap().archive);
+        assert!(
+            !archive::plan(&idx.conn, week, false, idx.now())
+                .unwrap()
+                .archive
+        );
     }
 
     #[test]
@@ -882,7 +895,7 @@ mod tests {
     #[should_panic(expected = "must start on a quarter hour")]
     fn a_span_into_the_archive_off_the_quarter_hour_is_caught() {
         let w = World::new(&["work"]);
-        let idx = w.index("i.sqlite");
+        let mut idx = w.index("i.sqlite");
         idx.set_meta("rolled_until", &at(CUT).timestamp_millis().to_string())
             .unwrap();
         let span = Span {
@@ -890,7 +903,7 @@ mod tests {
             end: at(NOW),
         };
         // Limit calibration floors such a start instead.
-        let p = archive::plan(&idx.conn, span, true).unwrap();
+        let p = archive::plan(&idx.conn, span, true, idx.now()).unwrap();
         assert!(p.archive && p.start == at("2026-10-01T10:00:00Z").timestamp_millis());
         let _ = idx.total(span, &Filter::default());
     }

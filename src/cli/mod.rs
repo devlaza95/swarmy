@@ -215,7 +215,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::diag::log("config", &format!("{e:#}"));
                 crate::config::Config::default()
             });
-            crate::statusline::run(&dirs, &config.statusline, then.as_deref())
+            crate::statusline::run(&dirs, &config, then.as_deref())
         }
         Some(Command::Man) => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
@@ -344,17 +344,16 @@ fn jump(list: bool) -> anyhow::Result<()> {
             .map(|n| (n.name, n.what, n.pane))
             .collect(),
         None => {
-            let mut seat_dirs = vec![dirs.home.join(".claude")];
-            if let Ok(rd) = std::fs::read_dir(&dirs.home) {
-                for e in rd.flatten() {
-                    if e.file_name().to_string_lossy().starts_with(".claude-") {
-                        seat_dirs.push(e.path());
-                    }
-                }
-            }
-            let mut found: Vec<(String, String, Option<crate::core::pane::Pane>)> = seat_dirs
+            // Every seat the dashboard would find, short of running processes.
+            let env_dir = crate::statusline::current_config_dir(&dirs.home);
+            let mut found: Vec<(String, String, Option<crate::core::pane::Pane>)> =
+                crate::claude::seats::discover(&crate::claude::seats::Candidates {
+                    home: &dirs.home,
+                    env_dirs: vec![env_dir],
+                    configured: config.seats_of(&dirs.home, crate::core::harness::Harness::Claude),
+                })
                 .iter()
-                .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
+                .flat_map(|s| crate::claude::registry::waiting_sessions(&s.sessions_dir()))
                 .map(|w| (w.label(), w.what.clone(), w.pane.clone()))
                 .collect();
             // Every Antigravity seat the dashboard would find, short of running processes.
@@ -362,15 +361,7 @@ fn jump(list: bool) -> anyhow::Result<()> {
                 crate::agy::discovery::discover(&crate::agy::discovery::AgyCandidates {
                     home: &dirs.home,
                     env_dirs: Vec::new(),
-                    configured: config
-                        .seat_entries(&dirs.home)
-                        .into_iter()
-                        .filter(|(p, _, h)| {
-                            *h == Some(crate::core::harness::Harness::Agy)
-                                || (h.is_none() && crate::agy::discovery::looks_like_agy_dir(p))
-                        })
-                        .map(|(p, l, _)| (p, l))
-                        .collect(),
+                    configured: config.seats_of(&dirs.home, crate::core::harness::Harness::Agy),
                 });
             for seat in &agy_seats {
                 let agy_dir = &seat.dir;
@@ -380,7 +371,7 @@ fn jump(list: bool) -> anyhow::Result<()> {
                 }
                 let mut cache = crate::agy::live::AgyLiveCache::default();
                 cache.resolve_procs(agy_dir, &locked);
-                let metas = crate::index::agy_summaries::read_all(agy_dir);
+                let metas = crate::agy::summaries::read_all(agy_dir);
                 for cid in &locked {
                     if let Some(m) = metas.get(cid)
                         && m.status == crate::agy::meta::RunStatus::WaitingForUser
@@ -418,12 +409,12 @@ fn jump(list: bool) -> anyhow::Result<()> {
             waiting.len()
         );
     };
-    match crate::claude::pane::jump(&pane) {
-        crate::claude::pane::Jump::Done => {
+    match crate::terminal::jump(&pane) {
+        crate::terminal::Jump::Done => {
             println!("→ {name}: {what}");
             Ok(())
         }
-        crate::claude::pane::Jump::Unreachable(why) | crate::claude::pane::Jump::Failed(why) => {
+        crate::terminal::Jump::Unreachable(why) | crate::terminal::Jump::Failed(why) => {
             anyhow::bail!(why)
         }
     }

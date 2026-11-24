@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use super::pane::{JUMP_TIMEOUT, RunOutcome, run_with_timeout};
+use super::{JUMP_TIMEOUT, RunOutcome, run_with_timeout};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FocusError {

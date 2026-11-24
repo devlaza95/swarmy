@@ -291,12 +291,13 @@ impl Index {
                     tx.execute("DELETE FROM readings WHERE account_uuid = ?1", [user])?;
                     tx.execute("DELETE FROM accounts WHERE account_uuid = ?1", [user])?;
                     // Schedule any transcript indexed under the bare id (or holding a bare owner)
-                    // for re-read from offset 0 (`size + 1` forces `reset = true` on all OSes, and
-                    // `marks` skips rolled-up records while repopulating `owners` with
-                    // `<account>/<org>`).
+                    // for re-read from offset 0: `offset > size` is the mark, which the next
+                    // refresh reads as `reset = true` whatever the file did meanwhile, and which
+                    // `finish_reattribution` waits for (`marks` skips rolled-up records while
+                    // repopulating `owners` with `<account>/<org>`).
                     let reset_files = tx.execute(
                         "UPDATE files
-                         SET size = size + 1, offset = size + 1, account_uuid = NULL, last_ts = 0
+                         SET offset = size + 1, account_uuid = NULL, last_ts = 0
                          WHERE account_uuid = ?1
                             OR (kind = 'main' AND EXISTS (
                                   SELECT 1 FROM owners o
@@ -378,13 +379,15 @@ pub(super) fn record_seat_facts(
         if let Some(u) = &si.utilization {
             for r in &u.readings {
                 // A reading that says what one a few minutes away already said (same account,
-                // window and value) adds nothing: sources report every few seconds.
+                // window and value) adds nothing: sources report every few seconds. "Same
+                // window" is `Reading::window_end` (the reset to the nearest minute), the rule
+                // of `core::limits` (review B-L4: here it was "less than 60 s apart").
                 tx.prepare_cached(
                     "INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at)
                      SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (
                        SELECT 1 FROM readings WHERE account_uuid = ?1 AND kind = ?2
                          AND fetched_at BETWEEN ?3 - ?6 AND ?3 + ?6
-                         AND utilization = ?4 AND ABS(resets_at - ?5) < 60000)
+                         AND utilization = ?4 AND (resets_at + 30000) / 60000 = ?7)
                      ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING",
                 )?
                 .execute(params![
@@ -393,7 +396,8 @@ pub(super) fn record_seat_facts(
                     ms(r.fetched_at),
                     r.utilization,
                     ms(r.resets_at),
-                    READING_REPEAT_MS
+                    READING_REPEAT_MS,
+                    ms(r.window_end()) / 60_000
                 ])?;
             }
         }

@@ -230,7 +230,9 @@ fn files_edited(c: &rusqlite::Connection, p: Plan) -> anyhow::Result<(u64, u64)>
 
 impl Index {
     pub fn efficiency(&self, span: Span) -> anyhow::Result<Efficiency> {
-        archive::read(&self.conn, span, false, |c, p| self.efficiency_in(c, p))
+        archive::read(&self.conn, span, false, self.now(), |c, p| {
+            self.efficiency_in(c, p)
+        })
     }
 
     /// [`Index::efficiency`] over one plan: raw rows, plus the rollups when the span reaches them.
@@ -418,11 +420,11 @@ impl Index {
 
         mark("types");
         // The fleet over the last 24 hours (always raw).
-        let now = chrono::Utc::now();
+        let now = self.now();
         let h0 = ms(now - chrono::Duration::hours(24)) / 3_600_000;
         e.fleet = vec![0; 25];
         let mut st = c.prepare_cached(
-            "SELECT ts / 3600000, COUNT(DISTINCT seat || session_id || agent_id) FROM requests WHERE ts >= ?1 GROUP BY 1",
+            "SELECT ts / 3600000, COUNT(DISTINCT seat || char(31) || session_id || char(31) || agent_id) FROM requests WHERE ts >= ?1 GROUP BY 1",
         )?;
         for row in st.query_map(params![h0 * 3_600_000], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -478,7 +480,7 @@ impl Index {
     ) -> anyhow::Result<Vec<(String, u32)>> {
         let mut st = self.conn.prepare(&format!(
             "SELECT target, MAX(n) FROM (
-               SELECT target, ts / 3600000, COUNT(DISTINCT seat || session_id || agent_id) n FROM tool_calls
+               SELECT target, ts / 3600000, COUNT(DISTINCT seat || char(31) || session_id || char(31) || agent_id) n FROM tool_calls
                WHERE name IN ({}) AND ts >= ?1 AND target IS NOT NULL GROUP BY 1, 2)
              WHERE n > 1 GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
             tool_names(ToolClass::Edit)
@@ -493,7 +495,7 @@ impl Index {
 impl Index {
     /// Spend per local day and model (for stacked daily bars).
     pub fn days_by_model(&self, span: Span) -> anyhow::Result<Vec<(String, String, f64)>> {
-        archive::read(&self.conn, span, false, |c, p| {
+        archive::read(&self.conn, span, false, self.now(), |c, p| {
             let mut st = c.prepare(&format!(
                 "SELECT r.ts / {BUCKET_MS}, r.model, TOTAL(r.cost) FROM {} r WHERE r.ts >= ?1 AND r.ts < ?2 GROUP BY 1, 2",
                 p.source()

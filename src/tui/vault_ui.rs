@@ -85,7 +85,7 @@ impl App {
 
     /// The saved login with this id.
     pub fn login_by_id(&self, id: &str) -> Option<&Login> {
-        self.vault.logins.iter().find(|l| l.id == id)
+        self.vault.logins.iter().find(|l| l.id.as_str() == id)
     }
 
     /// The label of the saved login `id` (the id itself when it is gone).
@@ -101,8 +101,8 @@ impl App {
             .logins
             .iter()
             .filter(|l| h.is_none_or(|h| l.harness == h))
-            .find(|l| l.id == key || l.label == key || l.email.as_deref() == Some(key))
-            .map(|l| l.id.clone())
+            .find(|l| l.id.as_str() == key || l.label == key || l.email.as_deref() == Some(key))
+            .map(|l| l.id.to_string())
     }
 
     pub fn vault_reload(&mut self) {
@@ -157,7 +157,7 @@ impl App {
             .filter(|l| l.harness == s.harness && !l.is_in(&s.id))
             .collect();
         v.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
-        v.into_iter().map(|l| l.id.clone()).collect()
+        v.into_iter().map(|l| l.id.to_string()).collect()
     }
 
     /// The login `S` puts into `seat`: the most limit left among the candidates, not of the
@@ -311,7 +311,10 @@ impl App {
                 let s = vault_seats
                     .iter()
                     .find(|s| s.label == seat)
-                    .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
+                    .ok_or_else(|| crate::errors::LookupError::NoSeat {
+                        name: seat.to_string(),
+                        known: Vec::new(),
+                    })?;
                 tx.switch_moving(s, login, &vault_seats)
             })
         });
@@ -376,7 +379,10 @@ impl App {
                 let s = vault_seats
                     .iter()
                     .find(|s| s.label == seat)
-                    .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
+                    .ok_or_else(|| crate::errors::LookupError::NoSeat {
+                        name: seat.to_string(),
+                        known: Vec::new(),
+                    })?;
                 tx.capture(s, (!label.is_empty()).then_some(label))?
                     .ok_or_else(|| anyhow::anyhow!("seat '{seat}' has no login"))
             })
@@ -640,51 +646,40 @@ impl App {
     /// Runs the harness (`claude`, `agy`; a harness the vault keeps) in a scratch seat to sign in, then saves the login.
     /// Called with the dashboard suspended (the terminal belongs to the harness meanwhile).
     pub fn run_add_login(&mut self, label: &str, harness: Harness) {
-        let scratch = self
-            .vault_dir
-            .join(format!("new-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+        let scratch = crate::vault::new_login_scratch(&self.vault_dir, chrono::Utc::now());
         let (program, hint) = crate::vault::new_login_recipe(harness);
         println!(
             "\nswarmy: starting {} in a scratch seat for '{label}'. {hint}\n",
             harness.display_name()
         );
-        let res = (|| -> anyhow::Result<()> {
+        let res = (|| -> anyhow::Result<crate::vault::NewLogin> {
+            let mut v = Vault::open(&self.vault_dir)?;
+            v.check_new_label(label, harness)?;
             std::fs::create_dir_all(&scratch)?;
             let (mut cmd, seat) = crate::vault::new_login(harness, label, &scratch);
-            cmd.status()
-                .map_err(|e| anyhow::anyhow!("cannot start `{program}`: {e}"))?;
-            let s = crate::vault::read_seat(&seat)?;
-            let secret = s
-                .secret
-                .ok_or_else(|| anyhow::anyhow!("no login was made"))?;
-            Vault::open(&self.vault_dir)?.edit(|tx| {
-                tx.put(
-                    &secret,
-                    s.oauth_account,
-                    s.account.as_ref(),
-                    Some(label),
-                    None,
-                )
-            })?;
-            Ok(())
+            if let Err(e) = cmd.status() {
+                if let Err(rm) = std::fs::remove_dir_all(&scratch) {
+                    crate::diag::log("vault", &format!("{}: {rm}", scratch.display()));
+                }
+                anyhow::bail!("cannot start `{program}`: {e}");
+            }
+            crate::vault::save_new_login(&mut v, label, &scratch, &seat)
         })();
-        // A scratch dir left behind holds a live login: say where it is (as the CLI does).
-        if let Err(e) = std::fs::remove_dir_all(&scratch)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            let msg = format!(
-                "cannot remove {} (it holds a login): {e}",
-                scratch.display()
-            );
-            crate::diag::log("vault", &msg);
-            self.log_event("⚿", msg, Tone::Bad);
-        }
         match res {
-            Ok(()) => {
+            Ok(saved) => {
+                if let Some(msg) = saved.left_behind {
+                    crate::diag::log("vault", &msg);
+                    self.log_event("⚿", msg, Tone::Bad);
+                }
                 self.log_event("⚿", format!("new login saved: {label}"), Tone::Accent);
                 self.toast(format!("saved '{label}'"), Tone::Good);
             }
-            Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                // A kept scratch dir holds a live login: the event log keeps where.
+                self.log_event("⚿", msg.clone(), Tone::Bad);
+                self.toast(msg, Tone::Bad);
+            }
         }
         self.vault_reload();
         self.request_analytics();

@@ -70,6 +70,57 @@ impl fmt::Display for SeatId {
     }
 }
 
+/// A project's identity: its key in the index (`projects.key`: the git root, or a dir outside any
+/// repo). Two repositories with the same dir name are two projects; a project's name is for
+/// display only, so joining on it mixed their numbers (review B-H3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct ProjectKey(String);
+
+impl ProjectKey {
+    /// A key as the index stores it (a query's `Row::key` for `Dim::Project`).
+    pub fn from_stored(s: impl Into<String>) -> ProjectKey {
+        ProjectKey(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A saved login's id in the vault: `l` and the first hex digits of its first grant's
+/// fingerprint (`-2`, `-3`… when taken). Made only by the vault (`logins::Index::new_login_id`);
+/// what a user types (a label, an id, an email) is resolved to one at the edge, so a label can
+/// never be taken for an id inside the vault (review B-M5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct LoginId(String);
+
+impl LoginId {
+    /// An id as the vault stores it (`logins.json`, `secrets.json` keys).
+    pub fn from_stored(s: impl Into<String>) -> LoginId {
+        LoginId(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for LoginId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LoginId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A Claude Code session id (a uuid in practice, but read from files that may hold anything).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

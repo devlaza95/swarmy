@@ -44,7 +44,7 @@ pub fn pane_of(pid: u32, proc_start: Option<&str>) -> Option<Pane> {
     {
         let start = match proc_start {
             Some(s) if !s.is_empty() => s.to_string(),
-            Some(_) | None => super::procs::proc_start_ticks(pid).unwrap_or_default(),
+            Some(_) | None => crate::procs::proc_start_ticks(pid).unwrap_or_default(),
         };
         let key = (pid, start);
         if let Some(hit) = lookup_cached(&key) {

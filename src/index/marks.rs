@@ -96,7 +96,10 @@ impl Marks {
 
 /// Whether every response older than `rolled_until` in `events` is one the archive holds: a
 /// rollup row of its quarter hour and model whose token sums are at least the response's own
-/// (any seat, session and account: a fork keeps the times, models and usage of what it copies).
+/// (any seat, session and account: a fork keeps the times, models, dirs and usage of what it
+/// copies). The dir narrows it: a rollup row sums a whole agent's quarter hour, so a response
+/// from another machine in a busy local quarter hour of another dir passed for a copy, and its
+/// file was skipped (review B-M9).
 /// A file with no response that old repeats nothing. A response the archive cannot hold is new,
 /// and then the whole file is (a fork copies only what was there).
 pub(super) fn all_held(
@@ -106,7 +109,7 @@ pub(super) fn all_held(
 ) -> rusqlite::Result<bool> {
     let mut st = conn.prepare_cached(
         "SELECT 1 FROM usage_rollup WHERE bucket = ?1 AND model = ?2 AND input >= ?3 AND cw5 >= ?4
-           AND cw1h >= ?5 AND cread >= ?6 AND output >= ?7 LIMIT 1",
+           AND cw1h >= ?5 AND cread >= ?6 AND output >= ?7 AND cwd IS NULLIF(?8, '') LIMIT 1",
     )?;
     let mut seen: HashSet<&str> = HashSet::new();
     let mut any = false;
@@ -129,7 +132,8 @@ pub(super) fn all_held(
             tok(u.cache_write_5m),
             tok(u.cache_write_1h),
             tok(u.cache_read),
-            tok(u.output)
+            tok(u.output),
+            r.cwd.as_deref().unwrap_or("")
         ])? {
             return Ok(false);
         }

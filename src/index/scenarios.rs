@@ -317,6 +317,27 @@ mod tests {
         ]
     }
 
+    /// Review B-M8: a fork (a new session) or a moved config dir (a new seat) repeats records
+    /// with their own ids; a prompt and an API error are counted once, not once per copy.
+    #[test]
+    fn a_forked_prompt_counts_once() {
+        let w = World::new(&["work", "moved"]);
+        let p = serde_json::json!({"type": "user", "uuid": "rec-p1", "timestamp": "2026-11-20T10:00:00Z",
+            "message": {"role": "user", "content": "Fix the VAT report"}})
+        .to_string();
+        let e = serde_json::json!({"type": "assistant", "uuid": "rec-e1", "isApiErrorMessage": true,
+            "error": "rate_limit", "timestamp": "2026-11-20T10:01:00Z",
+            "message": {"id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "API Error"}]}})
+        .to_string();
+        w.append("work", "s1", &[p.clone(), e.clone()]);
+        w.append("work", "fork", &[p.clone(), e.clone()]);
+        w.append("moved", "s1", &[p, e]);
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        assert_eq!(dump(&idx, "SELECT COUNT(*) FROM prompts"), ["1"]);
+        assert_eq!(dump(&idx, "SELECT COUNT(*) FROM api_errors"), ["1"]);
+    }
+
     #[test]
     fn incremental_refresh_equals_a_full_rebuild_and_a_reread_counts_once() {
         let w = World::new(&["work"]);
@@ -570,7 +591,7 @@ mod tests {
         drop(idx);
         Index::open(&path)
             .unwrap()
-            .set_meta("schema_version", "8")
+            .set_meta("schema_version", "6")
             .unwrap();
         let mut idx = Index::open(&path).unwrap();
         assert_eq!(

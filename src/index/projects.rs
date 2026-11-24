@@ -49,8 +49,9 @@ pub(super) fn assign(
     // Never fold into a home dir or anything as shallow (`/home/x/work` is the least).
     let under = |dir: &str, root: &str| {
         root.matches(['/', '\\']).count() >= 4
-            && dir.starts_with(root)
-            && dir[root.len()..].starts_with(['/', '\\'])
+            && dir
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with(['/', '\\']))
     };
     let mut recorded = tx.prepare("SELECT 1 FROM projects WHERE cwd = ?1")?;
     for (cwd, own) in orphans {

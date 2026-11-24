@@ -319,6 +319,35 @@ impl ProcTable {
 
 /// The start time of a process in clock ticks since boot (Linux `/proc/<pid>/stat` field 22), the
 /// value Claude Code records as `procStart` to tell a live session from a reused PID.
+/// Whether process `pid` runs, looked at once without a process table (the status line, the
+/// lock-file readers): `/proc` on Linux, a single-process refresh elsewhere. It used to say yes
+/// for every pid off Linux, so a dead session's registry entry showed as "needs you" there
+/// (review B-M18).
+pub fn pid_alive_once(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        // A machine where the process list cannot be read: taken as running, as before.
+        let Ok(mut sys) = System::new() else {
+            return true;
+        };
+        let spid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[spid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys.process(spid).is_some()
+    }
+}
+
 pub fn proc_start_ticks(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
