@@ -150,6 +150,20 @@ impl Snapshot {
     pub fn count(&self, f: impl Fn(&State) -> bool) -> usize {
         self.agents.iter().filter(|a| f(&a.state)).count()
     }
+
+    /// Dollars per hour by model family: each family's spend over the last 60 minutes (its part
+    /// of [`Snapshot::burn_per_hour`], which is their sum), the largest first; families that
+    /// spent nothing are left out.
+    pub fn burn_by_family(&self) -> Vec<(&str, f64)> {
+        let mut v: Vec<(&str, f64)> = self
+            .burn
+            .iter()
+            .map(|(fam, mins)| (fam.as_str(), mins.iter().sum::<f64>()))
+            .filter(|(_, r)| *r > 0.0)
+            .collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+        v
+    }
 }
 
 pub fn build(
@@ -795,6 +809,29 @@ pub fn key_of(a: &Agent) -> AgentKey<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_burn_per_family_adds_up_to_the_burn_per_hour() {
+        // opus: $1.50 + $0.25 over the hour = $1.75/h; sonnet: $0.30; haiku spent nothing.
+        let mut snap = Snapshot::default();
+        let mins = |v: &[(usize, f64)]| {
+            let mut m = vec![0.0; 60];
+            for (i, c) in v {
+                m[*i] = *c;
+            }
+            m
+        };
+        snap.burn
+            .insert("opus".into(), mins(&[(3, 1.5), (59, 0.25)]));
+        snap.burn.insert("sonnet".into(), mins(&[(10, 0.3)]));
+        snap.burn.insert("haiku".into(), mins(&[]));
+        snap.burn_per_hour = 2.05;
+        let rates = snap.burn_by_family();
+        assert_eq!(rates, vec![("opus", 1.75), ("sonnet", 0.3)]);
+        let sum: f64 = rates.iter().map(|(_, r)| r).sum();
+        assert!((sum - snap.burn_per_hour).abs() < 1e-9);
+    }
+
     use super::*;
 
     fn agent(id: &str, parent: Option<&str>, state: State) -> Agent {

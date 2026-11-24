@@ -31,14 +31,11 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("{b:.2}")
     };
-    let period_label = app
-        .analytics
-        .period
-        .as_ref()
-        .map(|p| p.label())
-        .unwrap_or_default();
-    let today = fmt::usd(app.snapshot.today_cost);
-    let period_cost = app.analytics.total.as_ref().map(|t| fmt::usd(t.cost));
+    // The rate per model family over the last 60 minutes (the families' sums are the total):
+    // what burns the money now. The total itself is in the header bar; here it is the headline
+    // only on a big panel.
+    let rates = app.snapshot.burn_by_family();
+    let rate_of = |r: f64| format!("{}/h", fmt::usd(r));
     // Today by harness, when more than one runs here (`cc $98 · agy $22`).
     let split = if app.multi_harness() {
         crate::core::harness::Harness::ALL
@@ -60,38 +57,49 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    // The left column fits the big number and all captions, so the chart never covers them.
-    let labels_w = (6 + w(&today)).max(w(&split)).max(
-        period_cost
-            .as_ref()
-            .map_or(0, |c| w(&period_label) + 1 + w(c)),
-    );
-    let big_w = (bigdigits::width(&rate).max(labels_w).max(10) + 2) as u16;
+    // Spend today, not a rate: said so under the rates per hour.
+    let split = if split.is_empty() {
+        split
+    } else {
+        format!("today {split}")
+    };
+    let name_w = rates.iter().map(|(n, _)| w(n)).max().unwrap_or(0);
+    let model_lines: Vec<String> = rates
+        .iter()
+        .map(|(n, r)| format!("{n:<name_w$}  {}", rate_of(*r)))
+        .collect();
+    // The left column fits the big number and its lines, so the chart never covers them.
+    let labels_w = model_lines
+        .iter()
+        .map(|l| w(l))
+        .max()
+        .unwrap_or(0)
+        .max(w(&split))
+        .max(10);
+    let big_w = (bigdigits::width(&rate).max(labels_w) + 2) as u16;
+    let accent = if app.snapshot.burn_per_hour > 0.0 {
+        th.accent
+    } else {
+        th.dim
+    };
     let chart_area = if inner.width >= big_w + 30 && inner.height >= 6 {
-        let rows = bigdigits::render(&rate);
-        let c = if app.snapshot.burn_per_hour > 0.0 {
-            th.accent
-        } else {
-            th.dim
-        };
-        let mut lines: Vec<Line> = rows
+        let mut lines: Vec<Line> = bigdigits::render(&rate)
             .into_iter()
-            .map(|r| Line::from(Span::styled(r, th.bold(c))))
+            .map(|r| Line::from(Span::styled(r, th.bold(accent))))
             .collect();
         lines.push(Line::from(Span::styled("$ per hour", dim(app))));
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("today ", faint(app)),
-            Span::styled(today, th.bold(th.fg)),
-        ]));
+        // As many families as the column holds, the largest first; the harness split last.
+        let room =
+            (inner.height as usize).saturating_sub(lines.len() + usize::from(!split.is_empty()));
+        for ((n, _), l) in rates.iter().zip(&model_lines).take(room) {
+            lines.push(Line::from(Span::styled(
+                l.clone(),
+                Style::new().fg(th.family_name(n)),
+            )));
+        }
         if !split.is_empty() {
             lines.push(Line::from(Span::styled(split.clone(), faint(app))));
-        }
-        if let Some(c) = period_cost {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{period_label} "), faint(app)),
-                Span::styled(c, th.bold(th.fg)),
-            ]));
         }
         put(
             f,
@@ -107,8 +115,35 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
             ..inner
         }
     } else {
-        inner
+        // A small panel: the chart takes it, with the rates per family on one line above it
+        // (as many as fit, the largest first).
+        let mut spans: Vec<Span> = Vec::new();
+        let mut left = inner.width as usize;
+        for (n, r) in &rates {
+            let piece = format!(
+                "{}{n} {}",
+                if spans.is_empty() { "" } else { " · " },
+                rate_of(*r)
+            );
+            if w(&piece) > left {
+                break;
+            }
+            left -= w(&piece);
+            spans.push(Span::styled(piece, th.bold(th.family_name(n))));
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled("nothing spent in the last hour", faint(app)));
+        }
+        put(f, Rect { height: 1, ..inner }, vec![Line::from(spans)]);
+        Rect {
+            y: inner.y + 1,
+            height: inner.height - 1,
+            ..inner
+        }
     };
+    if chart_area.height < 2 {
+        return;
+    }
     let [chart, legend] = [
         Rect {
             height: chart_area.height - 1,
