@@ -1863,3 +1863,34 @@ fn grants_taken_out_of_the_vault_are_kept_apart() -> anyhow::Result<()> {
     assert_eq!(entries[0]["secret"]["refreshToken"], "r-alice");
     Ok(())
 }
+
+/// A Codex move empties only a seat that still holds the grant that moves. Signed into another
+/// account there meanwhile (not saved yet), the seat is left alone and nothing moves: emptying
+/// it would delete a grant the vault does not have.
+#[test]
+fn a_codex_move_never_empties_a_seat_holding_another_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    // Another account signed in in `codex` since; the vault still records sam there.
+    write_codex(&main, "rt-new-1", "user-new", "ws-9")?;
+    let seats = [main.clone(), other.clone()];
+    let err = v
+        .edit(|tx| tx.switch_moving(&other, "sam", &seats))
+        .unwrap_err();
+    assert_eq!(
+        crate::errors::code_of(&err),
+        Some("vault-seat-changed"),
+        "{err:#}"
+    );
+    assert_eq!(
+        codex_refresh(&main)?,
+        "rt-new-1",
+        "the new login is still there"
+    );
+    assert!(!other.credentials_file().exists(), "nothing moved");
+    Ok(())
+}

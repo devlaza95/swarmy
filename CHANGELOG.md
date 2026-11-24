@@ -22,11 +22,13 @@ Fixes from two architecture reviews: wrong numbers, lost logins.
 - Vault: a switch interrupted between its two writes can no longer overwrite the previous
   login's tokens with the new one's; a re-imported pre-rotation token gets its own id; a Codex
   move never leaves one single-use token in two seats, saves a token Codex refreshed meanwhile,
-  and is refused by the vault itself while Codex runs in either seat; a new login whose save
+  is refused by the vault itself while Codex runs in either seat, and never empties a seat
+  signed into another account since (it asks to save that login first); a new login whose save
   fails is kept in its scratch dir; `accounts import` reads Codex `auth.json` and takes the
   account agy and Codex files name.
 - `swarmy limits` says `%` instead of "pts", and "pace unknown" instead of "lasts until reset"
-  when there is no usable rate yet.
+  when there is no usable rate yet. In `--format json`, a share names its project by `project`
+  (the git root, what tells two projects of one name apart) and `name`; `key` is gone.
 - Fixed: an account used mostly elsewhere (claude.ai) could show a limit estimate of thousands
   of percent; a rate needs $1 of visible spend now, and spend never takes the estimate past
   100%. A login parked for more than a window no longer sets its tier's rate, and a Codex plan

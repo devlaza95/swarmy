@@ -301,6 +301,7 @@ fn verify(ctx: &Ctx, idx: &Index, keep: i64, out: &mut dyn Write) -> anyhow::Res
     };
     let result = (|| {
         let mut copy = Index::open(&scratch)?;
+        copy.set_now(ctx.now);
         step("every total before");
         let before = numbers(&copy, ctx.now)?;
         step("compacting the copy");

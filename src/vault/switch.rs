@@ -88,7 +88,7 @@ impl VaultTx<'_> {
         };
         let mut emptied: Vec<&Seat> = Vec::new();
         for o in &others {
-            if let Err(e) = self.clear_seat(o) {
+            if let Err(e) = self.clear_seat(o, &target.id) {
                 return Err(self.move_incomplete(seat, &emptied, e));
             }
             emptied.push(o);
@@ -143,10 +143,12 @@ impl VaultTx<'_> {
         .into()
     }
 
-    /// Takes the login out of `seat` (after a backup). Its newest copy is saved first, read from
-    /// the very text that is then removed: a refresh after that read makes the removal refuse
-    /// and start again, so no token is deleted unsaved (review B-M2).
-    fn clear_seat(&mut self, seat: &Seat) -> anyhow::Result<()> {
+    /// Takes login `moving` out of `seat` (after a backup). Its newest copy is saved first, read
+    /// from the very text that is then removed: a refresh after that read makes the removal
+    /// refuse and start again, so no token is deleted unsaved (review B-M2). A seat that holds
+    /// another grant now (signed into another account since) is left alone and the move refused:
+    /// the vault may not have that grant.
+    fn clear_seat(&mut self, seat: &Seat, moving: &LoginId) -> anyhow::Result<()> {
         let path = seat.credentials_file();
         for _ in 0..SWITCH_ATTEMPTS {
             let text = store::read_optional(&path)?;
@@ -155,6 +157,19 @@ impl VaultTx<'_> {
                 continue;
             }
             self.sync_seat(seat, &now);
+            let holds = now.secret.as_ref().map(|s| s.meta().fingerprint);
+            let expected = self
+                .index
+                .logins
+                .iter()
+                .find(|l| l.id == *moving)
+                .map(|l| l.meta.fingerprint.clone());
+            if holds.is_some() && holds != expected {
+                return Err(VaultError::SeatChanged {
+                    seat: seat.label.clone(),
+                }
+                .into());
+            }
             self.save()?;
             let bdir = self.seat_backups(seat)?;
             let name = match path.file_name() {

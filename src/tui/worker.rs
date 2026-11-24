@@ -39,6 +39,7 @@ pub(super) fn worker(
             return;
         }
     };
+    idx.set_now(ctx.now);
     idx.set_known_accounts(ctx.saved_accounts());
     let mut resolver = crate::claude::project::Resolver::new(ctx.config.project.clone());
     let mut progress = |p: Progress| {

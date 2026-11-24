@@ -14,6 +14,7 @@ pub fn run(ctx: &Ctx, format: Format) -> anyhow::Result<()> {
     let today = ctx.now.with_timezone(&chrono::Local).date_naive();
     // Claude Code's prices carry the day the index first saw them.
     let mut idx = crate::index::Index::open(&ctx.dirs.index_file())?;
+    idx.set_now(ctx.now);
     let prices = idx.dated_prices(&ctx.prices, ctx.now)?;
     // A cached price names the seat it came from; seats gone since keep their last label.
     let gone: BTreeMap<_, _> = idx.seat_labels()?.into_iter().collect();
