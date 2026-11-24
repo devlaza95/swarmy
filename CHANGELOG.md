@@ -3,6 +3,11 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+- **Jump to Warp** (macOS): `J` and `swarmy jump` focus the Warp tab and pane a Claude Code runs
+  in, through the session's `warp://session/<id>` URL. No setup needed.
+
 ## v0.2.1
 
 Codex logins in the vault, and Codex 0.172's tool calls read as what they run.

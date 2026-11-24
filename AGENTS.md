@@ -157,7 +157,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
   (`vault/seats.rs::is_rotation`), never taken for a new one.
 - `sessions/<pid>.json` holds live status (`busy`/`idle`/`waiting` + `waitingFor`), tmux pane and
   `procStart` (check it against `/proc/<pid>/stat` to ignore reused pids). Other terminals and
-  multiplexers (Zellij, kitty, WezTerm, iTerm2) are not recorded there: `claude::proc_env` reads
+  multiplexers (Zellij, kitty, WezTerm, iTerm2, Warp) are not recorded there: `claude::proc_env` reads
   their environment variables once per process (`/proc/<pid>/environ` on Linux, `sysinfo` single-PID
   refresh on macOS) and parses them through `core::pane::Pane::from_environ_pairs`.
 - `.claude.json`: `cachedUsageUtilization` (limits, no network needed), `additionalModelCostsCache`

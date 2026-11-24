@@ -1,6 +1,6 @@
 //! Where a Claude Code runs, so `J` and `swarmy jump` can take the user there: a tmux pane,
-//! a Zellij pane, a kitty window, a WezTerm pane, or an iTerm2 session. Plain data; finding and
-//! focusing it is `claude::pane`.
+//! a Zellij pane, a kitty window, a WezTerm pane, an iTerm2 session, or a Warp session. Plain
+//! data; finding and focusing it is `claude::pane`.
 
 use std::fmt;
 
@@ -25,6 +25,14 @@ pub enum Pane {
     },
     /// iTerm2 session unique ID (extracted from `ITERM_SESSION_ID`).
     ITerm2 { session_id: String },
+    /// `WARP_TERMINAL_SESSION_UUID`.
+    Warp { session_id: String },
+}
+
+/// Whether `id` looks like a Warp session id (hex, maybe with dashes), so only such an id ends up
+/// in the `warp://session/<id>` URL.
+pub fn is_warp_session_id(id: &str) -> bool {
+    (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +50,8 @@ impl Pane {
     /// Detect a terminal or multiplexer pane from `(key, value)` environment pairs.
     ///
     /// Precedence follows nesting (innermost multiplexer wins over outer terminal):
-    /// Zellij -> Kitty -> WezTerm -> iTerm2. (`tmux` is checked first from Claude Code's registry.)
+    /// Zellij -> Kitty -> WezTerm -> iTerm2 -> Warp. (`tmux` is checked first from Claude Code's
+    /// registry.)
     pub fn from_environ_pairs<'a, I>(vars: I) -> Option<Pane>
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -55,6 +64,7 @@ impl Pane {
         let mut wezterm_pane: Option<u32> = None;
         let mut wezterm_socket: Option<String> = None;
         let mut iterm_session: Option<String> = None;
+        let mut warp_session: Option<String> = None;
 
         for (k, v) in vars {
             if v.is_empty() {
@@ -82,6 +92,8 @@ impl Pane {
                     Some(_) | None => v,
                 };
                 iterm_session = Some(id.to_string());
+            } else if k == "WARP_TERMINAL_SESSION_UUID" && is_warp_session_id(v) {
+                warp_session = Some(v.to_string());
             }
         }
 
@@ -103,7 +115,10 @@ impl Pane {
                 socket: wezterm_socket,
             });
         }
-        iterm_session.map(|session_id| Pane::ITerm2 { session_id })
+        if let Some(session_id) = iterm_session {
+            return Some(Pane::ITerm2 { session_id });
+        }
+        warp_session.map(|session_id| Pane::Warp { session_id })
     }
 
     /// Detect a pane from `/proc/<pid>/environ` bytes (NUL-separated `KEY=VALUE` entries).
@@ -124,6 +139,7 @@ impl Pane {
             Pane::Kitty { .. } => "kitty",
             Pane::WezTerm { .. } => "wezterm",
             Pane::ITerm2 { .. } => "iTerm2",
+            Pane::Warp { .. } => "Warp",
         }
     }
 
@@ -134,7 +150,9 @@ impl Pane {
             Pane::Zellij { session, pane_id } => format!("{session} · pane {pane_id}"),
             Pane::Kitty { window } => format!("window {}", window.id),
             Pane::WezTerm { pane_id, .. } => format!("pane {pane_id}"),
-            Pane::ITerm2 { session_id } => format!("session {}", short(session_id)),
+            Pane::ITerm2 { session_id } | Pane::Warp { session_id } => {
+                format!("session {}", short(session_id))
+            }
         }
     }
 }
@@ -230,6 +248,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_warp_session_uuid() {
+        let env = b"TERM_PROGRAM=WarpTerminal\0WARP_TERMINAL_SESSION_UUID=0123456789abcdef0123456789abcdef\0WARP_FOCUS_URL=warp://session/0123456789abcdef0123456789abcdef\0";
+        assert_eq!(
+            Pane::from_proc_environ(env),
+            Some(Pane::Warp {
+                session_id: "0123456789abcdef0123456789abcdef".into(),
+            })
+        );
+        // Anything but a hex id is ignored, so it never reaches the focus URL.
+        assert_eq!(
+            Pane::from_proc_environ(b"WARP_TERMINAL_SESSION_UUID=abc/../x?y\0"),
+            None
+        );
+    }
+
+    #[test]
+    fn multiplexer_wins_over_warp() {
+        let zellij_in_warp = b"WARP_TERMINAL_SESSION_UUID=0123456789abcdef0123456789abcdef\0ZELLIJ_SESSION_NAME=work\0ZELLIJ_PANE_ID=5\0";
+        assert_eq!(
+            Pane::from_proc_environ(zellij_in_warp),
+            Some(Pane::Zellij {
+                session: "work".into(),
+                pane_id: "5".into(),
+            })
+        );
+    }
+
+    #[test]
     fn multiplexer_wins_over_outer_terminal() {
         let zellij_in_kitty =
             b"KITTY_WINDOW_ID=7\0KITTY_LISTEN_ON=unix:@k\0ZELLIJ_SESSION_NAME=work\0ZELLIJ_PANE_ID=5\0";
@@ -296,6 +342,10 @@ mod tests {
             session_id: "11223344-5566-7788-99AA-BBCCDDEEFF00".into(),
         };
         assert_eq!(iterm.to_string(), "iTerm2 session 11223344");
+        let warp = Pane::Warp {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        assert_eq!(warp.to_string(), "Warp session 01234567");
     }
 
     #[test]
@@ -321,6 +371,9 @@ mod tests {
             },
             Pane::ITerm2 {
                 session_id: "11223344-5566".into(),
+            },
+            Pane::Warp {
+                session_id: "0123456789abcdef0123456789abcdef".into(),
             },
         ];
         for pane in cases {

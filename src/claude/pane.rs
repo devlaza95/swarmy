@@ -4,7 +4,7 @@ use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{iterm2, kitty, proc_env, tmux, wezterm, zellij};
+use super::{iterm2, kitty, proc_env, tmux, warp, wezterm, zellij};
 use crate::core::pane::Pane;
 
 /// Bound how long an external terminal/multiplexer jump command may block the TUI or CLI.
@@ -121,6 +121,13 @@ pub fn jump(pane: &Pane) -> Jump {
                 Jump::Failed(format!("iTerm2 could not focus session: {why}"))
             }
         },
+        Pane::Warp { session_id } => match warp::focus(session_id) {
+            Ok(()) => Jump::Done,
+            Err(warp::FocusError::Unreachable(why)) => Jump::Unreachable(why),
+            Err(warp::FocusError::Failed(why)) => {
+                Jump::Failed(format!("Warp could not focus session: {why}"))
+            }
+        },
     }
 }
 
@@ -145,6 +152,7 @@ mod tests {
             "WEZTERM_PANE",
             "ZELLIJ_SESSION_NAME",
             "ITERM_SESSION_ID",
+            "WARP_TERMINAL_SESSION_UUID",
         ]
         .iter()
         .any(|k| std::env::var_os(k).is_some());

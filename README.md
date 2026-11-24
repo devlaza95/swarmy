@@ -35,7 +35,7 @@ worktrees) and put swarmy in a spare terminal next to them.
   stalled), for how long, its model and effort, context fill, cost, and a 30-minute activity lane.
 - **The moment one needs you, and a key to get there.** A permission prompt, a question or a plan
   to approve blinks in the tree, rings the terminal bell and goes to the top of ATTENTION. `J`
-  jumps straight to that Claude Code's pane or window (tmux, Zellij, kitty, WezTerm, iTerm2);
+  jumps straight to that Claude Code's pane or window (tmux, Zellij, kitty, WezTerm, iTerm2, Warp);
   `swarmy jump` does the same from a key binding.
 - **Where the weekly limit went, and when it runs out.** Per account: the week used, the share
   each project took, and the time it runs out at the current pace. Early limit resets and logins
@@ -110,7 +110,7 @@ What swarmy adds:
 
 What the others do better: a launcher runs the work (sessions that survive a reboot, worktrees on
 demand, remote machines), and ccusage covers far more agent CLIs. `J` jumps into tmux, Zellij,
-kitty, WezTerm and iTerm2 panes; herdr's own panes are not among them yet.
+kitty, WezTerm, iTerm2 and Warp panes; herdr's own panes are not among them yet.
 
 ## Quick start
 
@@ -205,7 +205,7 @@ that (`L` switches by hand). Every panel can be zoomed (`z`).
 | `Tab` `Shift-Tab` · `1`–`9` `0` | next / previous panel · focus a panel by number (again: zoom); in tabs, `1`–`5` switch tabs |
 | `↑↓` `PgUp` `PgDn` · `Enter` | move in the focused panel · open: agent → details, alert → go to it, project → its agents, seat → pick a login |
 | `n` `N` | next / previous thing that needs attention |
-| `J` | jump to the selected agent's Claude Code (tmux, Zellij, kitty, WezTerm, iTerm2) |
+| `J` | jump to the selected agent's Claude Code (tmux, Zellij, kitty, WezTerm, iTerm2, Warp) |
 | `/` | filter: words, `p:project`, `m:model`, `s:seat`, `state:needs` |
 | `:` | commands: `switch <seat> <login>`, `capture <seat>`, `period 7d`, `layout wall` |
 | `t` · `g` · `v` | period (today, 7d, 30d, all) · spend grouping · SWARM lanes ↔ spend |
@@ -452,18 +452,20 @@ days less than the shortest transcript retention of your seats. Nothing is ever 
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | Dashboard, reports, status line | ✓ | ✓ | ✓ |
-| Jump to a session (`J`, `swarmy jump`) | ✓ tmux, Zellij, kitty, WezTerm | ✓ tmux, Zellij, kitty, WezTerm, iTerm2 | — |
+| Jump to a session (`J`, `swarmy jump`) | ✓ tmux, Zellij, kitty, WezTerm | ✓ tmux, Zellij, kitty, WezTerm, iTerm2, Warp | — |
 | Vault: save and switch logins | ✓ | not yet (Keychain) | ✓ |
 | Eco mode on battery | ✓ | ✓ | with `--eco` |
 
 Jumping detects where a Claude Code runs (multiplexers take precedence over the outer terminal:
-tmux → Zellij → kitty → WezTerm → iTerm2). Notes per terminal:
+tmux → Zellij → kitty → WezTerm → iTerm2 → Warp). Notes per terminal:
 - **tmux**: works inside tmux (`swarmy` switches your client to the target pane).
 - **Zellij**: requires Zellij 0.44+ (`action focus-pane-id`) inside the same Zellij session.
 - **kitty**: needs `allow_remote_control socket-only` and `listen_on unix:@kitty-{kitty_pid}` in
   `kitty.conf`; without them `J` says so.
 - **WezTerm**: works out of the box via `WEZTERM_UNIX_SOCKET`, even from another terminal.
 - **iTerm2** (macOS): focuses via AppleScript; macOS prompts once for Automation permission.
+- **Warp** (macOS): opens the session's `warp://session/<id>` URL (`WARP_TERMINAL_SESSION_UUID`);
+  no setup. For a session that is closed, Warp only comes to the front.
 
 Linux is the main platform. The tests run on Linux, macOS and Windows in CI. Builds: Linux x86_64,
 aarch64, ARMv7 and ARMv6 (static musl), macOS universal, Windows x86_64. Release details:

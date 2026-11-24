@@ -14,5 +14,6 @@ pub mod registry;
 pub mod seats;
 pub mod tmux;
 pub mod transcript;
+pub mod warp;
 pub mod wezterm;
 pub mod zellij;

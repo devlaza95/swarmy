@@ -62,7 +62,7 @@ pub enum Command {
     Compact(compact::CompactArgs),
     /// Optional: add the swarmy status line to Claude Code (exact limits) and save logins.
     Setup(setup::SetupArgs),
-    /// Jump to the Claude Code that has waited for you the longest (tmux, zellij, kitty, wezterm, iTerm2).
+    /// Jump to the Claude Code that has waited for you the longest (tmux, zellij, kitty, wezterm, iTerm2, Warp).
     Jump {
         /// Only list who waits, do not switch.
         #[arg(long)]
@@ -414,7 +414,7 @@ fn jump(list: bool) -> anyhow::Result<()> {
     }
     let Some((name, what, Some(pane))) = waiting.iter().find(|w| w.2.is_some()).cloned() else {
         anyhow::bail!(
-            "{} session(s) wait for you, none in a supported terminal (tmux, zellij, kitty, wezterm, iTerm2)",
+            "{} session(s) wait for you, none in a supported terminal (tmux, zellij, kitty, wezterm, iTerm2, Warp)",
             waiting.len()
         );
     };
