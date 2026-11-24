@@ -194,6 +194,45 @@ impl Theme {
         self.family(Family::of(name))
     }
 
+    /// The `k`-th model of a family in the BURN chart: the family's colour (`k` = 0), then
+    /// lighter and darker shades of it in turn, so two models of one family stack apart. The
+    /// 16-colour theme has no shades: its models alternate between the colour and its light or
+    /// dark twin.
+    pub fn model_shade(&self, family: Color, k: usize) -> Color {
+        if k == 0 {
+            return family;
+        }
+        match family {
+            Color::Rgb(r, g, b) => {
+                // 1: 45% to white, 2: 40% to black, 3: 75% to white, 4: 65% to black, …
+                let step = k.div_ceil(2);
+                let (to, f) = if !k.is_multiple_of(2) {
+                    (255.0, (0.45 + 0.3 * (step - 1) as f64).min(0.85))
+                } else {
+                    (0.0, (0.4 + 0.25 * (step - 1) as f64).min(0.8))
+                };
+                let mix = |c: u8| (c as f64 + (to - c as f64) * f).round() as u8;
+                Color::Rgb(mix(r), mix(g), mix(b))
+            }
+            c if k.is_multiple_of(2) => c,
+            Color::Red => Color::LightRed,
+            Color::Green => Color::LightGreen,
+            Color::Yellow => Color::LightYellow,
+            Color::Blue => Color::LightBlue,
+            Color::Magenta => Color::LightMagenta,
+            Color::Cyan => Color::LightCyan,
+            Color::LightRed => Color::Red,
+            Color::LightGreen => Color::Green,
+            Color::LightYellow => Color::Yellow,
+            Color::LightBlue => Color::Blue,
+            Color::LightMagenta => Color::Magenta,
+            Color::LightCyan => Color::Cyan,
+            Color::White => Color::Gray,
+            Color::Gray => Color::White,
+            c => c,
+        }
+    }
+
     /// The colour of a limit's level (`core::limits::Level`).
     pub fn utilization(&self, pct: f64) -> Color {
         match Level::of(pct) {

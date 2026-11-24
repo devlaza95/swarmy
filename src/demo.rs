@@ -708,9 +708,15 @@ fn live(
                 append(&p, &[v, tool_result(now, &tid)]);
             }
         }
-        // The agy conversation takes a step now and then.
+        // The agy conversation takes a step now and then, a quick one on Hydrogen among them
+        // (BURN tells the two Gemini 4 models apart).
         if tick.is_multiple_of(4) {
-            let (p, g) = agy_planner(3_000_000 + tick, agy_step, now, "gemini-4-neon-high", tick);
+            let model = if tick.is_multiple_of(12) {
+                "gemini-4-hydrogen"
+            } else {
+                "gemini-4-neon-high"
+            };
+            let (p, g) = agy_planner(3_000_000 + tick, agy_step, now, model, tick);
             append(&agy_live, &[p, g]);
             agy_step += 2;
         }

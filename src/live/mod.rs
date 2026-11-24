@@ -125,7 +125,8 @@ pub struct Snapshot {
     pub taken_at: Option<DateTime<Utc>>,
     /// Ordered as a forest: each main thread followed by its descendants.
     pub agents: Vec<Agent>,
-    /// USD per minute for the last 60 minutes, per model family.
+    /// USD per minute for the last 60 minutes, per model (`models::short_name`: `opus-5.5`,
+    /// `gem-4-neon`).
     pub burn: BTreeMap<String, Vec<f64>>,
     pub burn_per_hour: f64,
     pub today_cost: f64,
@@ -151,10 +152,10 @@ impl Snapshot {
         self.agents.iter().filter(|a| f(&a.state)).count()
     }
 
-    /// Dollars per hour by model family: each family's spend over the last 60 minutes (its part
-    /// of [`Snapshot::burn_per_hour`], which is their sum), the largest first; families that
-    /// spent nothing are left out.
-    pub fn burn_by_family(&self) -> Vec<(&str, f64)> {
+    /// Dollars per hour by model: each model's spend over the last 60 minutes (its part of
+    /// [`Snapshot::burn_per_hour`], which is their sum), the largest first; models that spent
+    /// nothing are left out.
+    pub fn burn_by_model(&self) -> Vec<(&str, f64)> {
         let mut v: Vec<(&str, f64)> = self
             .burn
             .iter()
@@ -488,13 +489,13 @@ pub fn build(
         ..Default::default()
     };
 
-    // Burn per minute by family, last 60 minutes.
+    // Burn per minute by model, last 60 minutes.
     let start = now - Duration::minutes(60);
     let mut total = 0.0;
     for (i, model, c) in idx.spend_per_minute_by_model(start)? {
         if (0..60).contains(&i) {
-            let fam = Family::of(&model).name().to_string();
-            snap.burn.entry(fam).or_insert_with(|| vec![0.0; 60])[i as usize] += c;
+            let name = crate::core::models::short_name(&model);
+            snap.burn.entry(name).or_insert_with(|| vec![0.0; 60])[i as usize] += c;
             total += c;
         }
     }
@@ -811,8 +812,9 @@ pub fn key_of(a: &Agent) -> AgentKey<'_> {
 mod tests {
 
     #[test]
-    fn the_burn_per_family_adds_up_to_the_burn_per_hour() {
-        // opus: $1.50 + $0.25 over the hour = $1.75/h; sonnet: $0.30; haiku spent nothing.
+    fn the_burn_per_model_adds_up_to_the_burn_per_hour() {
+        // opus-5.5: $1.50 + $0.25 over the hour = $1.75/h; gem-4-neon: $0.30; gem-4-hydrogen
+        // spent nothing.
         let mut snap = Snapshot::default();
         let mins = |v: &[(usize, f64)]| {
             let mut m = vec![0.0; 60];
@@ -822,12 +824,12 @@ mod tests {
             m
         };
         snap.burn
-            .insert("opus".into(), mins(&[(3, 1.5), (59, 0.25)]));
-        snap.burn.insert("sonnet".into(), mins(&[(10, 0.3)]));
-        snap.burn.insert("haiku".into(), mins(&[]));
+            .insert("opus-5.5".into(), mins(&[(3, 1.5), (59, 0.25)]));
+        snap.burn.insert("gem-4-neon".into(), mins(&[(10, 0.3)]));
+        snap.burn.insert("gem-4-hydrogen".into(), mins(&[]));
         snap.burn_per_hour = 2.05;
-        let rates = snap.burn_by_family();
-        assert_eq!(rates, vec![("opus", 1.75), ("sonnet", 0.3)]);
+        let rates = snap.burn_by_model();
+        assert_eq!(rates, vec![("opus-5.5", 1.75), ("gem-4-neon", 0.3)]);
         let sum: f64 = rates.iter().map(|(_, r)| r).sum();
         assert!((sum - snap.burn_per_hour).abs() < 1e-9);
     }

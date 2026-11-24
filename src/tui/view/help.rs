@@ -313,8 +313,18 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled("opus ", Style::new().fg(th.opus)),
             Span::styled("sonnet ", Style::new().fg(th.sonnet)),
             Span::styled("haiku ", Style::new().fg(th.haiku)),
-            Span::styled("gemini", Style::new().fg(th.gemini)),
+            Span::styled("gemini ", Style::new().fg(th.gemini)),
+            Span::styled("gpt", Style::new().fg(th.gpt)),
             Span::styled(" (the same in every panel)", Style::new().fg(th.dim)),
+        ]),
+        Line::from(vec![
+            Span::styled(fit("", 16), th.bold(th.fg)),
+            Span::styled("gem-4-hydrogen ", Style::new().fg(th.gemini)),
+            Span::styled("gem-4-neon", Style::new().fg(th.model_shade(th.gemini, 1))),
+            Span::styled(
+                " BURN: two models of one family in shades of its colour",
+                Style::new().fg(th.dim),
+            ),
         ]),
         row("project", th.dir, "project and directory names"),
         row(
