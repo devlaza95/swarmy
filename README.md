@@ -120,7 +120,7 @@ platform, with the man page and shell completions. `SHA256SUMS` covers every fil
 **Linux** (any distribution, x86_64 or ARM):
 
 ```sh
-V=0.2.1 T=x86_64-unknown-linux-musl     # other targets in the table below
+V=0.2.2 T=x86_64-unknown-linux-musl     # other targets in the table below
 curl -fLO https://github.com/koorchik/swarmy/releases/download/v$V/swarmy-$V-$T.tar.gz
 tar xzf swarmy-$V-$T.tar.gz && install -m 755 swarmy-$V-$T/swarmy ~/.local/bin/
 ```
@@ -137,8 +137,8 @@ new. The `.deb` and `.rpm` packages wrap the same binary and are installed by ha
 `armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit Raspberry Pi):
 
 ```sh
-sudo apt install ./swarmy_0.2.1-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
-sudo dnf install ./swarmy-0.2.1-1.x86_64.rpm      # Fedora, RHEL, openSUSE
+sudo apt install ./swarmy_0.2.2-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
+sudo dnf install ./swarmy-0.2.2-1.x86_64.rpm      # Fedora, RHEL, openSUSE
 ```
 
 **macOS** (one universal binary for Apple silicon and Intel), with Homebrew:
@@ -189,7 +189,7 @@ that (`L` switches by hand). Every panel can be zoomed (`z`).
 |---|---|
 | **1 SWARM** | live agents grouped by session, each with its state, activity, context and cost and a 30-minute activity lane (`v`: spend per 15 minutes instead); each session's checkout (`shop/fix-1` in a worktree), branch, and `⇄N` when sessions share a checkout; what finished recently |
 | **2 LIMITS · SEATS** | each account's week used, 5-hour window, reset and "runs out in …"; seats and saved logins; the week as a curve per account with the projection to the reset; where each account's week went by project |
-| **3 BURN** | dollars per hour, and per minute by model over the last hour |
+| **3 BURN** | dollars per hour and what burns them: the rate of each model over the last hour, and its spend per minute |
 | **4 ATTENTION** | needs you, stalled, a limit about to run out, two agents editing one file, logins not saved or about to expire; the event log |
 | **5 AGENT** | the selected agent: card, last message, cost of each request, context growth, compactions, tool timeline |
 | **6 PROJECTS** | which clients worked on it (`cc+agy`), live agents, $/hour, today, the period with ▲▼ against the previous one, the share made in worktrees, share of the week |

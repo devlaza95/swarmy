@@ -3,10 +3,17 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
-## Unreleased
+## v0.2.2
+
+Jump to Warp, and the burn rate on every screen size.
 
 - **Jump to Warp** (macOS): `J` and `swarmy jump` focus the Warp tab and pane a Claude Code runs
-  in, through the session's `warp://session/<id>` URL. No setup needed.
+  in, through the session's `warp://session/<id>` URL. No setup needed. Thanks to
+  [@DDexster](https://github.com/DDexster) (#6).
+- **BURN says what burns the money**: the rate of each model family over the last hour
+  (`fable $38.74/h · opus $29.43/h …`, adding up to the total), under the big digits on a big
+  panel and above the chart on a small one, where it used to show the chart alone. The totals
+  that the header bar already shows are not repeated there.
 
 ## v0.2.1
 
