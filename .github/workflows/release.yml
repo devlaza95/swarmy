@@ -43,21 +43,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal \
-            --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,arm-unknown-linux-musleabihf
-          rustup default stable
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: docker/setup-buildx-action@v4.4.1
+      # The Dockerfile runs tools/release-local.sh linux with its pinned toolchain: the four
+      # targets, each checked static (readelf: no INTERP, no NEEDED), the archives, the .deb and
+      # the .rpm packages, into dist/ (what `docker build --output dist .` gives locally).
+      - uses: docker/build-push-action@v7.4.0
         with:
-          version: 0.16.0
-      - uses: taiki-e/install-action@v2.90.8
-        with:
-          tool: cargo-zigbuild@0.24.0,cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
-      # Builds the four targets, checks each is static (readelf: no INTERP, no NEEDED), packs
-      # the archives, the .deb and the .rpm packages into dist/.
-      - run: tools/release-local.sh linux
-      - run: target/x86_64-unknown-linux-musl/release/swarmy --version
+          context: .
+          target: dist
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=toolchain
+      - run: |
+          tar -xzf dist/swarmy-*-x86_64-unknown-linux-musl.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP"/swarmy-*-x86_64-unknown-linux-musl/swarmy --version
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: dist-linux
