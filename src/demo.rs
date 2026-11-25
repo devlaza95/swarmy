@@ -90,6 +90,9 @@ pub enum Load {
     /// about 12,600 requests a day in long sessions full of subagents, and three live sessions,
     /// each with a long history of its own, keeping about 18 agents at work.
     Wall,
+    /// A Codex-only machine (issue #8): the Codex home at work, and a `~/.claude` that Claude
+    /// Code left a `settings.json` in but was never signed into or used — an empty seat.
+    CodexOnly,
 }
 
 pub struct Demo {
@@ -273,9 +276,12 @@ pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
         Err(p) => p.into_inner().clear(),
     }
     let now = Utc::now();
+    if load == Load::CodexOnly {
+        return codex_only(root, now);
+    }
     let mut seats = Vec::new();
     let defs = match load {
-        Load::Demo => &SEATS[..2],
+        Load::Demo | Load::CodexOnly => &SEATS[..2],
         Load::Wall => SEATS,
     };
     for (si, s) in defs.iter().enumerate() {
@@ -297,7 +303,7 @@ pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
             .to_string(),
         )?;
         match load {
-            Load::Demo => history(&dir, s, si as u64, now),
+            Load::Demo | Load::CodexOnly => history(&dir, s, si as u64, now),
             Load::Wall => wall_history(&dir, s, si as u64, now),
         }
         seats.push(Seat {
@@ -318,6 +324,46 @@ pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
     std::thread::Builder::new()
         .name("demo-writer".into())
         .spawn(move || live(seat_dirs, agy_dir, (codex_dir, codex_live), st, load))?;
+    Ok(Demo {
+        root: root.to_path_buf(),
+        seats,
+        stop,
+    })
+}
+
+/// [`Load::CodexOnly`]: an empty Claude Code seat (only a `settings.json`) and the Codex home,
+/// whose running thread keeps working.
+fn codex_only(root: &Path, now: DateTime<Utc>) -> anyhow::Result<Demo> {
+    let claude = root.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    std::fs::write(claude.join("settings.json"), "{}")?;
+    let (codex, rollout) = codex_seat(root, now)?;
+    let codex_dir = codex.dir.clone();
+    let seats = vec![
+        Seat {
+            found_by: vec!["demo"],
+            ..Seat::new(
+                "default",
+                claude.clone(),
+                claude.join(".claude.json"),
+                false,
+            )
+        },
+        codex,
+    ];
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    std::thread::Builder::new()
+        .name("demo-writer".into())
+        .spawn(move || {
+            let mut thread = codex::Live::start(&codex_dir, rollout);
+            let mut tick = 0;
+            while !st.load(Ordering::Relaxed) {
+                thread.step(Utc::now(), tick);
+                tick += 1;
+                std::thread::sleep(std::time::Duration::from_millis(700));
+            }
+        })?;
     Ok(Demo {
         root: root.to_path_buf(),
         seats,

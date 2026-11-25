@@ -131,4 +131,15 @@ impl Index {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?)
     }
+
+    /// The seats of which the index has read a transcript: those it reads now (`files`) and
+    /// those whose transcripts are gone but whose sessions it keeps (`sessions` outlives them).
+    /// A few thousand rows: read on the analytics cadence, never per tick.
+    pub fn seats_with_transcripts(&self) -> anyhow::Result<std::collections::BTreeSet<SeatId>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT seat FROM files UNION SELECT seat FROM sessions")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
 }

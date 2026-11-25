@@ -95,6 +95,9 @@ pub enum Command {
         /// work), for measuring the battery budget (`tools/perf.sh`).
         #[arg(long, hide = true)]
         wall: bool,
+        /// A Codex-only machine with an empty `~/.claude` (no login, no transcripts).
+        #[arg(long, hide = true)]
+        codex_only: bool,
     },
     /// Print shell completions.
     Completions {
@@ -227,10 +230,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             size,
             keys,
             wall,
+            codex_only,
         }) => {
             let dirs = crate::config::Dirs::resolve()?;
             let load = if wall {
                 crate::demo::Load::Wall
+            } else if codex_only {
+                crate::demo::Load::CodexOnly
             } else {
                 crate::demo::Load::Demo
             };
@@ -243,25 +249,30 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 for s in ctx.seats.iter().filter(|s| s.harness.supports_vault()) {
                     v.edit(|tx| tx.capture(s, Some(&format!("alex-{}", s.label))))?;
                 }
-                let spare = crate::claude::credentials::Secret::new(serde_json::json!({
-                    "accessToken": "demo-access-spare", "refreshToken": "demo-refresh-spare",
-                    "refreshTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::days(4)).timestamp_millis()
-                }));
-                let acct = crate::claude::config_json::Account {
-                    account_uuid: "acc-demo-spare".into(),
-                    email: Some("alex+spare@example.com".into()),
-                    ..Default::default()
-                };
-                v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
-                // A second Google login for the agy seat.
-                let team = crate::claude::credentials::Secret::of(
-                    crate::core::harness::Harness::Agy,
-                    serde_json::json!({"token": {"access_token": "demo-agy-access-team", "refresh_token": "demo-agy-refresh-team",
-                                                 "expiry": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
-                                       "auth_method": "consumer", "id_token_email": "alex.team@example.com"}),
-                );
-                let team_acct = crate::agy::account::account_of(team.expose());
-                v.edit(|tx| tx.put(&team, None, team_acct.as_ref(), Some("alex-g-team"), None))?;
+                // A Codex-only machine has no other login: nothing keeps its empty seat shown.
+                if !codex_only {
+                    let spare = crate::claude::credentials::Secret::new(serde_json::json!({
+                        "accessToken": "demo-access-spare", "refreshToken": "demo-refresh-spare",
+                        "refreshTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::days(4)).timestamp_millis()
+                    }));
+                    let acct = crate::claude::config_json::Account {
+                        account_uuid: "acc-demo-spare".into(),
+                        email: Some("alex+spare@example.com".into()),
+                        ..Default::default()
+                    };
+                    v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
+                    // A second Google login for the agy seat.
+                    let team = crate::claude::credentials::Secret::of(
+                        crate::core::harness::Harness::Agy,
+                        serde_json::json!({"token": {"access_token": "demo-agy-access-team", "refresh_token": "demo-agy-refresh-team",
+                                                     "expiry": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
+                                           "auth_method": "consumer", "id_token_email": "alex.team@example.com"}),
+                    );
+                    let team_acct = crate::agy::account::account_of(team.expose());
+                    v.edit(|tx| {
+                        tx.put(&team, None, team_acct.as_ref(), Some("alex-g-team"), None)
+                    })?;
+                }
                 // On the wall, one login serves two seats.
                 if wall && let Some(lab) = ctx.seats.iter().find(|s| s.label == "lab") {
                     v.edit(|tx| tx.switch(lab, "alex-work"))?;

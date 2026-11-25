@@ -594,7 +594,7 @@ fn panel_keys(p: Panel) -> &'static str {
         Panel::Swarm => "↑↓ select · Enter details · J jump · / filter",
         Panel::Agent => "↑↓ scroll tools · J jump",
         Panel::Limits => {
-            "↑↓ · Enter switch · S best · c save · a add · r rename · d forget · R re-read"
+            "↑↓ · Enter switch · S best · c save · a add · r rename · d forget · R re-read · . show/hide empty seats"
         }
         Panel::Attention => "↑↓ · Enter go there · n/N next",
         Panel::Projects => "↑↓ · Enter its agents · t period · g group",

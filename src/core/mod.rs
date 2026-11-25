@@ -21,6 +21,7 @@ pub mod models;
 pub mod pane;
 pub mod period;
 pub mod pricing;
+pub mod seat_use;
 pub mod storage;
 pub mod tools;
 pub mod units;

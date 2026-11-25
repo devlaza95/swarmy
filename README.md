@@ -219,6 +219,7 @@ that (`L` switches by hand). Every panel can be zoomed (`z`).
 | `t` · `g` · `v` | period (today, 7d, 30d, all) · spend grouping · SWARM lanes ↔ spend |
 | `z` · `Esc` | zoom the focused panel · back (closes dialogs, zoom, filter) |
 | `m` · `p` · `T` · `L` | mask names · pause animations · theme · layout |
+| `.` | LIMITS · SEATS: show / hide the seats of a client that were never used (`hidden:` line) |
 | `?` · `q` | keys and a legend of every glyph, number, colour and word · quit |
 
 The mouse works too: a click focuses a panel or selects an agent, the wheel scrolls.
@@ -319,7 +320,7 @@ the saved logins that fit it, the one with the most limit left first; `S` puts t
 directly. `Enter` on a saved login picks the seats for it.
 
 ```sh
-swarmy accounts                               # seats and saved logins, per client
+swarmy accounts                               # seats and saved logins, per client (--all: empty seats too)
 swarmy accounts capture work --label alice    # save the login of seat "work"
 swarmy accounts add --label bob               # log into another account in a scratch seat, save it
 swarmy accounts add --harness agy --label bob # the same for Antigravity (labels are per client)

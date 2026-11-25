@@ -130,6 +130,7 @@ impl App {
                     self.focus = Panel::Swarm;
                 }
             }
+            KeyCode::Char('.') => self.toggle_hidden(),
             KeyCode::Char('n') => self.jump_attention(1),
             KeyCode::Char('N') => self.jump_attention(-1),
             KeyCode::Char('J') => self.jump(),

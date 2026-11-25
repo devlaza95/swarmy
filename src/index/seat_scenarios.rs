@@ -258,4 +258,30 @@ mod tests {
         );
         assert_eq!(counts(&idx), before);
     }
+
+    /// Issue #8: a seat counts as used once the index has read a transcript of it, and stays so
+    /// after the transcript is gone (its sessions outlive it); a seat never read is not named.
+    #[test]
+    fn seats_with_transcripts_names_the_seats_ever_read() {
+        let w = World::new(&["work", "empty"]);
+        session(&w, "work", "s1", &[("r1", "2026-11-10T10:00:00Z")]);
+        let mut idx = w.index("i.sqlite");
+        let empty = SeatInfo {
+            seat: Default::default(),
+            label: "empty".into(),
+            account: None,
+            utilization: None,
+        };
+        w.refresh(
+            &mut idx,
+            &[info("work", "acc-a", "2026-11-01T00:00:00Z"), empty],
+            &PriceBook::builtin(),
+        );
+        let read = idx.seats_with_transcripts().unwrap();
+        assert_eq!(read.into_iter().collect::<Vec<_>>(), [w.id("work")]);
+        // Claude Code's retention removed the transcript; the compactor dropped its file row.
+        idx.conn.execute("DELETE FROM files", []).unwrap();
+        let read = idx.seats_with_transcripts().unwrap();
+        assert_eq!(read.into_iter().collect::<Vec<_>>(), [w.id("work")]);
+    }
 }

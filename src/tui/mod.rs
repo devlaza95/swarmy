@@ -119,6 +119,9 @@ pub struct SeatRow {
     /// Spend of the last 7 days (shown for seats whose harness has no local quota).
     pub week_cost: f64,
     pub state: crate::vault::SeatState,
+    /// Nothing of the seat is in use (`core::seat_use`): no login, no account, nothing live, no
+    /// transcript, not in `[[seat]]`.
+    pub empty: bool,
 }
 
 /// (seat, session name, pid, cpu %, bytes, top children (cmd, cpu, bytes))
@@ -320,7 +323,15 @@ pub fn record(
         term.draw(|f| view::draw(f, &mut app))?;
         sync_wants(&mut app, &wants);
         let boot_rec = app.boot.is_some() && std::env::var_os("SWARMY_RECORD_BOOT").is_some();
-        if live && !app.analytics.limits.is_empty() || boot_rec {
+        // The limits come with the analytics; a world without a Claude Code account (the
+        // Codex-only demo) has none to wait for.
+        let no_limits = !app.analytics.seats.is_empty()
+            && !app
+                .analytics
+                .seats
+                .iter()
+                .any(|s| s.harness.supports_limits() && s.account.is_some());
+        if live && (!app.analytics.limits.is_empty() || no_limits) || boot_rec {
             let buf = term.backend().buffer();
             let mut rows = Vec::new();
             for y in 0..buf.area.height {

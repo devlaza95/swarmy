@@ -630,6 +630,7 @@ mod tests {
                 fingerprint: Some("f1".into()),
                 ..Default::default()
             },
+            empty: false,
         }
     }
 
