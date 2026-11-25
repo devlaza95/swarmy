@@ -412,18 +412,11 @@ mod tests {
             std::fs::write(&p, text(&l)).unwrap();
         }
         // A fork of the third day's session: a new session id, the old records (same message,
-        // tool and record ids, same times), then a new response. Its API errors are the old ones
-        // again, counted once (review B-M8: keyed by session, they counted twice). Its prompts
-        // are left out here: with them the fork is the larger file, read first, and which
-        // session the copied responses land in depends on that order (prompts by record id:
-        // `index::scenarios::a_forked_prompt_counts_once`).
-        let old: Vec<String> = lines(&work.join("s03.jsonl"))
-            .into_iter()
-            .filter(|l| {
-                let v: Value = serde_json::from_str(l).unwrap();
-                !(v["type"] == "user" && v["message"]["content"].is_string())
-            })
-            .collect();
+        // tool and record ids, same times), then a new response. Its prompts and API errors are
+        // the old ones again, counted once (review B-M8: keyed by session, they counted twice).
+        // The fork is the larger file, read first by a rebuild: the copies still belong to the
+        // session that started first (`index::scenarios::a_forks_copies_belong_to_…`).
+        let old = lines(&work.join("s03.jsonl"));
         let mut fork = vec![owner("acc-a")];
         fork.extend(old);
         fork.push(fresh("fork-new", "2026-10-30T22:00:00Z"));

@@ -149,6 +149,10 @@ logins. Users run it in a spare terminal, mostly on laptops.
 
 - One API response is written as several `assistant` records (one per content block) with the same
   usage: dedupe by `message.id`, merge with `max`.
+- A fork or a resume copies records of its session into a new file under a new `sessionId`
+  (same message, tool and record ids, same times; nothing names the original). Every copy is
+  counted once and belongs to the session that started first, the one that ended first on a tie
+  (`index::write::takes_over`), so any read order gives the same rows.
 - `session-owner` records give the account per turn; subagent files inherit it from the session.
   They decide a request's account (`index::SEAT_ACCOUNT_AT`); a seat's login history
   (`seat_accounts`, a change dated when swarmy sees it, never at `profileFetchedAt`) only fills
