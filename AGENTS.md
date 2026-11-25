@@ -276,11 +276,10 @@ readelf -l target/x86_64-unknown-linux-musl/release/swarmy | grep -c INTERP   # 
 # .rpm, Windows (cargo-xwin) into dist/
 tools/release-local.sh
 
-# the same Linux packages with no toolchain on the host: the Dockerfile pins the release
-# toolchain (Rust, zig, cargo-zigbuild, cargo-deb, cargo-generate-rpm); CI's static build and
-# the release's Linux job run it, so a version changes there, once
-docker build --output dist .
-docker build --target toolchain -t swarmy-toolchain .   # then: docker run -u "$(id -u):$(id -g)" -v "$PWD:/src" swarmy-toolchain tools/check.sh
+# The Dockerfile pins the release toolchain (Rust, zig, cargo-zigbuild, cargo-deb,
+# cargo-generate-rpm) for CI's static build and the release's Linux job: a version changes
+# there, once. Development stays native (cargo, tools/check.sh); the Dockerfile is for CI and
+# for people without Rust (`docker build --output dist .`).
 
 tools/record-readme.sh                     # refresh docs/img (screenshots + demo.gif)
 tools/perf.sh && tools/perf.sh --mask      # battery budget on the wall load (needs tmux, ~5 min)
