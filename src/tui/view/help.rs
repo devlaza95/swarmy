@@ -64,6 +64,10 @@ pub(super) fn help(f: &mut Frame, app: &App, area: Rect) {
         ("L", "layout: auto · wall · column · tabs"),
         ("m · p · T", "mask names · pause animations · theme"),
         (
+            ".",
+            "LIMITS · SEATS: show / hide the empty seats its hidden: line names",
+        ),
+        (
             "mouse",
             "click focuses a panel / selects an agent; wheel scrolls",
         ),
@@ -213,6 +217,11 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             "CLAUDE CODE",
             th.fg,
             "LIMITS · SEATS sections per harness: its seats and logins (a login fits only its harness)",
+        ),
+        row(
+            "hidden:",
+            th.dim,
+            "LIMITS · SEATS: a harness left out, its seats all empty (no login, no transcripts, nothing live, not in [[seat]]) and no saved login; . shows it",
         ),
         row(
             "+ ✓ ✎ ◆ !",

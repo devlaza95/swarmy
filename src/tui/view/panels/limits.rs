@@ -413,6 +413,13 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             )));
         }
     }
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", fit(no_rows_hint(app), width.saturating_sub(2))),
+            dim(app),
+        )));
+    }
+    lines.extend(hidden_note(app, width));
     if focused && (lines.len() as u16) < inner.height {
         lines.push(Line::from(Span::styled(
             "  Enter: seat → pick a saved login · saved login → pick seats · S best · c save the seat's login · a add · r rename · d forget",
@@ -448,6 +455,55 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             );
         }
     }
+}
+
+/// What an empty panel says: where seats come from.
+fn no_rows_hint(app: &App) -> &'static str {
+    if app.hidden_harnesses().is_empty() {
+        "no seats found — run claude, agy or codex once, or add [[seat]] to config.toml"
+    } else {
+        "no seats in use — run claude, agy or codex once, or add [[seat]] to config.toml"
+    }
+}
+
+/// The line under the rows that names the harnesses left out because all their seats are empty
+/// (`App::hidden_harnesses`), and the key that shows them.
+fn hidden_note(app: &App, width: usize) -> Option<Line<'static>> {
+    let hidden = app.hidden_harnesses();
+    if hidden.is_empty() {
+        return None;
+    }
+    let (lead, key) = if app.show_hidden {
+        ("shown", ". hides")
+    } else {
+        ("hidden", ". shows")
+    };
+    let text = |dirs: bool| {
+        let parts: Vec<String> = hidden
+            .iter()
+            .map(|(h, seats)| {
+                let n = seats.len();
+                let mut p = format!(
+                    "{} — {n} empty seat{}",
+                    h.display_name(),
+                    if n == 1 { "" } else { "s" }
+                );
+                if dirs {
+                    let d: Vec<String> = seats.iter().map(|s| seat_dir(app, &s.label)).collect();
+                    p.push_str(&format!(" ({})", d.join(", ")));
+                }
+                p
+            })
+            .collect();
+        format!("{lead}: {} · {key}", parts.join(" · "))
+    };
+    let room = width.saturating_sub(2);
+    let full = text(true);
+    let shown = if w(&full) <= room { full } else { text(false) };
+    Some(Line::from(Span::styled(
+        format!("  {}", fit(&shown, room)),
+        dim(app),
+    )))
 }
 
 /// A harness's section heading: its name on a plate, then what it holds.
@@ -802,5 +858,222 @@ fn seat_dir(app: &App, label: &str) -> String {
     match home.and_then(|h| s.dir.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
         Some(rest) => format!("~/{}", rest.display()),
         None => s.dir.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::seats::Seat;
+    use crate::tui::SeatRow;
+    use crate::tui::theme::Theme;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    /// A seat of `h` in a made-up home.
+    fn seat(h: Harness, label: &str, dir: &str) -> Seat {
+        let dir = PathBuf::from("/home/alice").join(dir);
+        match h {
+            Harness::Claude => Seat::new(label, dir.clone(), dir.join(".claude.json"), false),
+            Harness::Agy => Seat::agy(label, dir),
+            Harness::Codex => Seat::codex(label, dir),
+        }
+    }
+
+    /// What the analytics pass says of a seat: `empty` as `core::seat_use` judged it.
+    fn row(s: &Seat, empty: bool) -> SeatRow {
+        SeatRow {
+            id: s.id.clone(),
+            label: s.label.clone(),
+            harness: s.harness,
+            account: (!empty).then(|| "cdx:user/ws".to_string()),
+            login: None,
+            email: None,
+            live: usize::from(!empty),
+            today_cost: 0.0,
+            today_requests: 0,
+            week_cost: 0.0,
+            state: Default::default(),
+            empty,
+        }
+    }
+
+    fn login(h: Harness, id: &str) -> crate::vault::Login {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "label": id, "harness": h, "account_uuid": null, "email": null, "plan": null,
+            "meta": {"fingerprint": id, "subscription_type": null, "rate_limit_tier": null,
+                     "access_expires_at": null, "refresh_expires_at": null, "scopes": []},
+            "oauth_account": null, "captured_at": "2026-11-01T00:00:00Z",
+            "updated_at": "2026-11-01T00:00:00Z", "mounted": []
+        }))
+        .unwrap()
+    }
+
+    /// A Codex-only machine: `~/.claude` found (a marker file) but empty, `~/.codex` in use.
+    fn codex_only(t: &tempfile::TempDir) -> App {
+        let claude = seat(Harness::Claude, "default", ".claude");
+        let codex = seat(Harness::Codex, "codex", ".codex");
+        let mut app = App::new(
+            Theme::named(None),
+            false,
+            true,
+            vec![claude.clone(), codex.clone()],
+            t.path().into(),
+        );
+        app.boot = None;
+        app.analytics.seats = vec![row(&claude, true), row(&codex, false)];
+        app
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| limits_seats(f, app, f.area(), false))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_codex_only_machine_shows_one_harness_and_names_the_hidden_seat() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = codex_only(&t);
+        assert_eq!(app.limits_rows(), [LimitsRow::Seat("codex".into())]);
+        assert!(!app.limits_sections(), "a single-harness panel");
+        let text = draw(&mut app, 200, 20);
+        assert!(!text.contains("CLAUDE CODE"), "{text}");
+        assert!(!text.contains("default"), "{text}");
+        assert!(text.contains("codex"), "{text}");
+        assert!(
+            text.contains("hidden: Claude Code — 1 empty seat (/home/alice/.claude) · . shows"),
+            "{text}"
+        );
+        // `.` shows it, with its section; `.` again hides it.
+        press(&mut app, '.');
+        assert_eq!(
+            app.limits_rows(),
+            [
+                LimitsRow::Seat("default".into()),
+                LimitsRow::Seat("codex".into())
+            ]
+        );
+        assert!(app.limits_sections());
+        let text = draw(&mut app, 200, 20);
+        assert!(
+            text.contains("CLAUDE CODE") && text.contains("default"),
+            "{text}"
+        );
+        assert!(text.contains("shown: Claude Code — 1 empty seat"), "{text}");
+        assert!(text.contains(". hides"), "{text}");
+        press(&mut app, '.');
+        assert_eq!(app.limits_rows(), [LimitsRow::Seat("codex".into())]);
+    }
+
+    #[test]
+    fn a_masked_hidden_line_names_the_dir_only() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = codex_only(&t);
+        app.mask = true;
+        let text = draw(&mut app, 200, 20);
+        assert!(text.contains("1 empty seat (.claude)"), "{text}");
+        assert!(!text.contains("alice"), "{text}");
+    }
+
+    #[test]
+    fn a_saved_login_of_the_harness_keeps_its_empty_seat_shown() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = codex_only(&t);
+        app.vault.logins = vec![login(Harness::Claude, "spare")];
+        assert_eq!(
+            app.limits_rows(),
+            [
+                LimitsRow::Seat("default".into()),
+                LimitsRow::Login("spare".into()),
+                LimitsRow::Seat("codex".into())
+            ]
+        );
+        let text = draw(&mut app, 200, 20);
+        assert!(text.contains("CLAUDE CODE"), "{text}");
+        assert!(!text.contains("hidden:"), "{text}");
+        // A Codex login keeps nothing of Claude Code shown.
+        app.vault.logins = vec![login(Harness::Codex, "cx")];
+        assert!(
+            !app.limits_rows()
+                .contains(&LimitsRow::Seat("default".into()))
+        );
+    }
+
+    #[test]
+    fn nothing_is_hidden_before_the_seats_are_judged() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = codex_only(&t);
+        app.analytics.seats.clear();
+        assert_eq!(app.limits_rows().len(), 2);
+        assert!(app.hidden_harnesses().is_empty());
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_row_when_empty_seats_are_hidden() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = codex_only(&t);
+        let judged = app.analytics.seats.clone();
+        // Before the first pass both seats show; the user selects the Codex seat.
+        app.analytics.seats.clear();
+        app.focus = Panel::Limits;
+        app.cursor.insert(Panel::Limits, 1);
+        let a = crate::tui::Analytics {
+            seats: judged,
+            ..Default::default()
+        };
+        app.on_msg(crate::tui::Msg::Analytics(Box::new(a)));
+        assert_eq!(app.limits_rows(), [LimitsRow::Seat("codex".into())]);
+        assert_eq!(app.cur(Panel::Limits), 0, "still on the Codex seat");
+        press(&mut app, '.');
+        assert_eq!(
+            app.cur(Panel::Limits),
+            1,
+            "the Codex seat, below the shown one"
+        );
+    }
+
+    #[test]
+    fn with_no_seat_at_all_the_panel_says_where_seats_come_from() {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
+        app.boot = None;
+        let text = draw(&mut app, 200, 20);
+        assert!(
+            text.contains(
+                "no seats found — run claude, agy or codex once, or add [[seat]] to config.toml"
+            ),
+            "{text}"
+        );
+        // Every seat empty: the hint, and what was left out.
+        let claude = seat(Harness::Claude, "default", ".claude");
+        let mut app = App::new(
+            Theme::named(None),
+            false,
+            true,
+            vec![claude.clone()],
+            t.path().into(),
+        );
+        app.boot = None;
+        app.analytics.seats = vec![row(&claude, true)];
+        let text = draw(&mut app, 200, 20);
+        assert!(text.contains("no seats in use"), "{text}");
+        assert!(
+            text.contains("hidden: Claude Code — 1 empty seat"),
+            "{text}"
+        );
     }
 }

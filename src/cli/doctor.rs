@@ -258,6 +258,9 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             stats.elapsed.as_secs_f64()
         ))
     );
+    for line in empty_seats(ctx, &idx, &live_by_seat)? {
+        println!("{}", info(&line));
+    }
     let mut ps = ParseStats::default();
     for (t, n) in idx.record_types()? {
         if t == crate::claude::transcript::MALFORMED {
@@ -417,6 +420,58 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
 /// The STORAGE section: the index's size, the raw window and the rollups, growth and the
 /// 12-month projection against the budget, the seats' transcript retention, the last
 /// compaction, and what waits (the one-time VACUUM, rows priced by an old long-context band).
+/// One line per empty seat (`core::seat_use`): doctor hides nothing, it says which seats the
+/// dashboard and `swarmy accounts` leave out, or why one is kept.
+fn empty_seats(
+    ctx: &Ctx,
+    idx: &Index,
+    live: &std::collections::HashMap<crate::core::ids::SeatId, Vec<LiveSession>>,
+) -> anyhow::Result<Vec<String>> {
+    let vault_seats: Vec<crate::claude::seats::Seat> = ctx
+        .seats
+        .iter()
+        .filter(|s| s.harness.supports_vault())
+        .cloned()
+        .collect();
+    let read = crate::vault::Vault::open(&ctx.dirs.vault_dir())
+        .and_then(|v| Ok((v.seat_states(&vault_seats)?, v.logins().to_vec())));
+    let (states, logins) = match read {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(vec![format!(
+                "empty seats not checked: the vault cannot be read ({e:#})"
+            )]);
+        }
+    };
+    let uses = ctx.seat_uses(idx, &states, |s| live.get(&s.id).map_or(0, Vec::len))?;
+    let mut out = Vec::new();
+    for h in Harness::ALL {
+        let of: Vec<(&crate::claude::seats::Seat, bool)> = ctx
+            .seats
+            .iter()
+            .zip(&uses)
+            .filter(|(s, _)| s.harness == h)
+            .map(|(s, u)| (s, u.is_empty()))
+            .collect();
+        let saved = logins.iter().filter(|l| l.harness == h).count();
+        let empty: Vec<bool> = of.iter().map(|(_, e)| *e).collect();
+        let hidden = crate::core::seat_use::hides_harness(&empty, saved);
+        for (s, _) in of.iter().filter(|(_, e)| *e) {
+            let what = if hidden {
+                "hidden in the dashboard (. shows it) and in swarmy accounts (--all lists it)"
+            } else {
+                "shown: its harness has other seats in use or saved logins that could go in"
+            };
+            out.push(format!(
+                "seat '{}' ({}): empty (no login, no transcripts): {what}",
+                s.label,
+                ctx.show_path(&s.dir.to_string_lossy())
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
     let p = &ctx.painter;
     let ok = |s: &str| format!("{} {s}", p.paint("[ OK ]", Tone::Good));

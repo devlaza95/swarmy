@@ -148,7 +148,10 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         .into_iter()
         .map(|r| (r.key, r.cost))
         .collect();
-    for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
+    let uses = ctx.seat_uses(idx, &states, |s| {
+        live.iter().filter(|l| l.seat == s.id).count()
+    })?;
+    for ((s, si), used) in ctx.seats.iter().zip(&ctx.seat_info).zip(&uses) {
         let state = states.get(&s.id).cloned().unwrap_or_default();
         let (today_cost, today_requests) = today_by_seat
             .get(s.id.as_str())
@@ -174,11 +177,12 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 None
             },
             email: si.account.as_ref().and_then(|a| a.email.clone()),
-            live: live.iter().filter(|l| l.seat == s.id).count(),
+            live: used.live,
             today_cost,
             today_requests,
             week_cost: week_by_seat.get(s.id.as_str()).copied().unwrap_or(0.0),
             state,
+            empty: used.is_empty(),
         });
     }
     let dbg = debug();

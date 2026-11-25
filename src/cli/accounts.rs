@@ -10,6 +10,7 @@ use crate::claude::registry;
 use crate::claude::seats::Seat;
 use crate::core::harness::Harness;
 use crate::core::limits::WindowKind;
+use crate::core::seat_use::{SeatUse, hides_harness};
 use crate::limits::{AccountReport, all_reports};
 use crate::ui::fmt;
 use crate::ui::mask;
@@ -23,12 +24,19 @@ use crate::app::context::Ctx;
 pub struct AccountsArgs {
     #[command(subcommand)]
     pub cmd: Option<AccountsCmd>,
+    /// List every seat, the empty ones too (no login, no transcripts) that are left out.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum AccountsCmd {
     /// Seats, saved logins, and how much limit each has left.
-    List,
+    List {
+        /// Every seat, the empty ones too (no login, no transcripts) that are left out.
+        #[arg(long)]
+        all: bool,
+    },
     /// Save the login a seat uses now.
     Capture {
         seat: String,
@@ -143,8 +151,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     let seats = vault_seats(ctx);
     v.edit(|tx| tx.sync(&seats))?;
     let p = &ctx.painter;
-    match a.cmd.clone().unwrap_or(AccountsCmd::List) {
-        AccountsCmd::List => list(ctx, &mut v),
+    match a.cmd.clone().unwrap_or(AccountsCmd::List { all: false }) {
+        AccountsCmd::List { all } => list(ctx, &mut v, a.all || all),
         AccountsCmd::Capture { seat: key, label } => {
             let s = seat(ctx, &key)?;
             match v.edit(|tx| tx.capture(s, label.as_deref()))? {
@@ -357,10 +365,13 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     }
 }
 
-fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
+fn list(ctx: &Ctx, v: &mut Vault, all: bool) -> anyhow::Result<()> {
     let vault_seats = vault_seats(ctx);
     let states = v.edit(|tx| tx.seat_states(&vault_seats))?;
     let (idx, _) = ctx.index()?;
+    let uses = ctx.seat_uses(&idx, &states, |s| live_in(ctx, s))?;
+    // Harnesses left out because all their seats are empty: (harness, their dirs).
+    let mut hidden: Vec<(Harness, Vec<String>)> = Vec::new();
     let reports = all_reports(&ctx.limits_inputs(&idx)?, &idx)?;
     let p = &ctx.painter;
     let week_cell = |acct: Option<&str>| match weekly(&reports, acct) {
@@ -386,14 +397,27 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     let mut best: Option<(f64, String, Harness)> = None;
     let mut first = true;
     for h in Harness::ALL {
-        let seats: Vec<(&Seat, &crate::index::SeatInfo)> = ctx
+        let seats: Vec<(&Seat, &crate::index::SeatInfo, SeatUse)> = ctx
             .seats
             .iter()
             .zip(&ctx.seat_info)
-            .filter(|(s, _)| s.harness == h && s.harness.supports_vault())
+            .zip(&uses)
+            .filter(|((s, _), _)| s.harness == h && s.harness.supports_vault())
+            .map(|((s, si), u)| (s, si, *u))
             .collect();
         let logins: Vec<&vault::Login> = v.logins().iter().filter(|l| l.harness == h).collect();
         if seats.is_empty() && logins.is_empty() {
+            continue;
+        }
+        let empty: Vec<bool> = seats.iter().map(|(.., u)| u.is_empty()).collect();
+        if !all && hides_harness(&empty, logins.len()) {
+            hidden.push((
+                h,
+                seats
+                    .iter()
+                    .map(|(s, ..)| ctx.show_path(&s.dir.to_string_lossy()))
+                    .collect(),
+            ));
             continue;
         }
         if !first {
@@ -438,7 +462,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         }
         cols.push(("LIVE", Align::Right));
         let mut t = Table::new(&cols);
-        for (s, si) in &seats {
+        for (s, si, used) in &seats {
             let st = states.get(&s.id).cloned().unwrap_or_default();
             let acct = si.account.as_ref().map(|a| a.id().to_string());
             let mut row = vec![
@@ -481,7 +505,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                 let (week, resets, _) = week_cell(acct.as_deref());
                 row.extend([week, resets]);
             }
-            row.push(Cell::new(live_in(ctx, s).to_string()));
+            row.push(Cell::new(used.live.to_string()));
             t.row(row);
         }
         if seats.is_empty() {
@@ -583,6 +607,35 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
             t.row(row);
         }
         println!("{}", indent(&t.render(p)));
+    }
+    for (h, dirs) in &hidden {
+        if !first {
+            println!();
+        }
+        first = false;
+        println!(
+            "{}",
+            p.paint(
+                &format!(
+                    "hidden: {} — {} empty seat{} ({}): no login, no transcripts · swarmy accounts --all lists {}",
+                    h.display_name(),
+                    dirs.len(),
+                    if dirs.len() == 1 { "" } else { "s" },
+                    dirs.join(", "),
+                    if dirs.len() == 1 { "it" } else { "them" }
+                ),
+                Tone::Dim
+            )
+        );
+    }
+    if first {
+        println!(
+            "{}",
+            p.paint(
+                "no seats found — run claude, agy or codex once, or add [[seat]] to config.toml",
+                Tone::Dim
+            )
+        );
     }
     println!();
     println!(

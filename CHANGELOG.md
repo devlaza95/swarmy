@@ -7,6 +7,11 @@ release workflow takes a release's notes from its section here.
 
 Fixes from two architecture reviews: wrong numbers, lost logins.
 
+- A harness whose seats are all empty (a `~/.claude` with no login, no transcripts, nothing
+  running, not in `[[seat]]`) and that has no saved login is left out of LIMITS · SEATS and
+  `swarmy accounts` (#8): a Codex-only setup shows one section. A `hidden:` line names what was
+  left out, `.` shows it, `swarmy accounts --all` lists it, `swarmy doctor` names each empty
+  seat; with no seat at all the panel says how to get one.
 - Fixed: a `[[seat]]` without `harness` that points at a used Claude Code dir was read as a
   Codex home, and the seat's spend, limits and sessions vanished. A dir whose files fit two
   harnesses is now named in ATTENTION.

@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 mod keys;
+mod limits;
 
 use super::alerts;
 pub use super::alerts::{Attn, AttnTarget, Tone};
@@ -207,7 +208,7 @@ pub struct ShotKey {
 
 /// One row of the LIMITS · SEATS panel (section headings are drawn between them, never
 /// selected).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LimitsRow {
     /// A seat, by label.
     Seat(String),
@@ -277,6 +278,8 @@ pub struct App {
     /// The animation clock stopped at this time (tests).
     pub t_fixed: Option<f64>,
     analytics_request: bool,
+    /// `.`: LIMITS · SEATS shows the sections of empty seats too.
+    pub show_hidden: bool,
     pub(super) seats: Vec<Seat>,
     pub(super) vault_dir: PathBuf,
     pub vault: super::vault_ui::VaultUi,
@@ -342,6 +345,7 @@ impl App {
             pulses: Default::default(),
             t_fixed: None,
             analytics_request: false,
+            show_hidden: false,
             seats,
             vault_dir,
             vault: Default::default(),
@@ -505,62 +509,6 @@ impl App {
             .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short_account(uuid)))
     }
 
-    /// Rows of the LIMITS · SEATS panel, one section per harness (in `Harness::ALL` order): its
-    /// seats, then every saved login of that harness, in a seat or not, the most limit left
-    /// first. A login fits only its harness's seats, so it is listed with them.
-    pub fn limits_rows(&self) -> Vec<LimitsRow> {
-        let mut rows = Vec::new();
-        for h in Harness::ALL {
-            rows.extend(
-                self.seats
-                    .iter()
-                    .filter(|s| s.harness == h)
-                    .map(|s| LimitsRow::Seat(s.label.clone())),
-            );
-            let mut logins: Vec<&crate::vault::Login> = self
-                .vault
-                .logins
-                .iter()
-                .filter(|l| l.harness == h)
-                .collect();
-            logins.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
-            rows.extend(
-                logins
-                    .into_iter()
-                    .map(|l| LimitsRow::Login(l.id.to_string())),
-            );
-        }
-        rows
-    }
-
-    /// The harness a row of LIMITS · SEATS belongs to.
-    pub fn row_harness(&self, r: &LimitsRow) -> Harness {
-        match r {
-            LimitsRow::Seat(label) => self
-                .seats
-                .iter()
-                .find(|s| &s.label == label)
-                .map_or(Harness::Claude, |s| s.harness),
-            LimitsRow::Login(id) => self
-                .vault
-                .logins
-                .iter()
-                .find(|l| l.id.as_str() == id)
-                .map_or(Harness::Claude, |l| l.harness),
-        }
-    }
-
-    /// Whether LIMITS · SEATS shows one section per harness: when seats or logins of more than
-    /// one harness are there (a Claude-only setup looks as before).
-    pub fn limits_sections(&self) -> bool {
-        let rows = self.limits_rows();
-        rows.iter()
-            .map(|r| self.row_harness(r))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            > 1
-    }
-
     // ───────────── attention ─────────────
 
     /// What needs a look now (`alerts::attention` over what the dashboard holds).
@@ -670,11 +618,14 @@ impl App {
             }
             Msg::Analytics(a) => {
                 self.limit_alerts(&a);
-                if self.vault.modal.is_none() && self.vault.picker.is_none() {
-                    self.vault.logins = a.logins.clone();
-                    self.vault.loaded = true;
-                }
-                self.analytics = *a;
+                // Seats judged empty and logins reordered: the selection stays on its row.
+                self.keep_limits_row(|app| {
+                    if app.vault.modal.is_none() && app.vault.picker.is_none() {
+                        app.vault.logins = a.logins.clone();
+                        app.vault.loaded = true;
+                    }
+                    app.analytics = *a;
+                });
             }
             Msg::Timeline(k, t, last, life) => {
                 self.life = (k.clone(), life);

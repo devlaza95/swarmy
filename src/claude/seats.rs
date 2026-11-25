@@ -167,6 +167,8 @@ mod tests {
         assert_eq!(seats[0].claude_json, home.join(".claude.json"));
         assert!(seats[2].claude_json.ends_with(".claude-work/.claude.json"));
         assert_eq!(seats[2].found_by, ["home scan", "config.toml"]);
+        // `[[seat]]` makes a seat asked for: never hidden as empty (issue #8).
+        assert!(seats[2].configured() && !seats[0].configured());
         // Transcript retention: `cleanupPeriodDays`, else Claude Code's default.
         assert_eq!(
             seats[1].cleanup_period_days().unwrap(),

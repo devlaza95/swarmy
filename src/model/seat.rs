@@ -34,6 +34,11 @@ pub fn seat_id(dir: &Path) -> SeatId {
 }
 
 impl Seat {
+    /// Whether `[[seat]]` of `config.toml` lists this dir (the user asked for it: always shown).
+    pub fn configured(&self) -> bool {
+        self.found_by.contains(&"config.toml")
+    }
+
     /// A Claude Code seat of `dir`, its id derived from the path.
     pub fn new(
         label: impl Into<String>,
