@@ -53,6 +53,8 @@ Fixes from two architecture reviews: wrong numbers, lost logins.
 - Vault: login labels can no longer be another login's id or email; a file without any token
   is no login; `.claude.json` keeps its mode and its symlink; a grant taken out of the vault is
   kept in `retired.json` for 90 days.
+- Build without Rust on the host: `docker build --output dist .` makes the static Linux binaries,
+  archives and packages (the `Dockerfile` pins the release toolchain; CI and the release use it).
 - `config.toml`: an unknown status-line segment, a nonsense `[subscription]` price and a
   `web_search` price per 1000 searches are refused.
 

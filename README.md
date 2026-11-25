@@ -159,6 +159,14 @@ download from the browser is quarantined, so clear that once with
 cargo install --locked --git https://github.com/koorchik/swarmy
 ```
 
+**From source without Rust** (Docker): the static Linux binaries, archives and packages land in
+`dist/`; run the binary on the host (see [Building from source](#building-from-source)).
+
+```sh
+git clone https://github.com/koorchik/swarmy && cd swarmy
+docker build --output dist .
+```
+
 Then:
 
 ```sh
@@ -484,6 +492,21 @@ Rust 2024 edition (a recent stable toolchain) and a C compiler for the bundled S
 Distributions with a system `libsqlite3` can build with `--no-default-features`. The release
 archives and packages are made by `tools/release-local.sh` (Linux and Windows) and the tag
 workflow; see [`packaging/README.md`](packaging/README.md).
+
+**With Docker only**: the [`Dockerfile`](Dockerfile) holds the release toolchain (Rust, zig,
+`cargo-zigbuild`, `cargo-deb`, `cargo-generate-rpm`, the musl targets) at the versions CI uses.
+
+```sh
+docker build --output dist .                       # the four static Linux binaries, .deb, .rpm
+docker build --build-arg TARGETS=x86_64-unknown-linux-musl \
+             --build-arg NO_PACKAGES=1 --output dist .   # one binary, faster
+# the toolchain as a shell on your checkout (builds stay in ./target, incremental)
+docker build --target toolchain -t swarmy-toolchain .
+docker run --rm -it -u "$(id -u):$(id -g)" -v "$PWD:/src" swarmy-toolchain tools/check.sh
+```
+
+The binaries are static: run swarmy on the host, not in the container. It watches the agents,
+processes and terminals of the machine it runs on, which a container does not see.
 
 ## Contributing
 

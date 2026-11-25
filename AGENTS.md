@@ -276,6 +276,11 @@ readelf -l target/x86_64-unknown-linux-musl/release/swarmy | grep -c INTERP   # 
 # .rpm, Windows (cargo-xwin) into dist/
 tools/release-local.sh
 
+# The Dockerfile pins the release toolchain (Rust, zig, cargo-zigbuild, cargo-deb,
+# cargo-generate-rpm) for CI's static build and the release's Linux job: a version changes
+# there, once. Development stays native (cargo, tools/check.sh); the Dockerfile is for CI and
+# for people without Rust (`docker build --output dist .`).
+
 tools/record-readme.sh                     # refresh docs/img (screenshots + demo.gif)
 tools/perf.sh && tools/perf.sh --mask      # battery budget on the wall load (needs tmux, ~5 min)
 ```
