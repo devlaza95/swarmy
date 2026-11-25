@@ -1,6 +1,6 @@
 [package]
 name = "swarmy"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 authors = ["Viktor Turskyi"]
 description = "Real-time analytics dashboard for coding agents (Claude Code, Antigravity, Codex): live swarm, history, API-equivalent spend, weekly limits, and a vault for OAuth logins"

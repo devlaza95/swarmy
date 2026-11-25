@@ -3,15 +3,19 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
-## Unreleased
+## v0.2.4
 
-Fixes from two architecture reviews: wrong numbers, lost logins.
+Fixes from two architecture reviews (wrong numbers, lost logins), a Codex-only dashboard without
+empty Claude Code rows, and a build without Rust.
 
 - A harness whose seats are all empty (a `~/.claude` with no login, no transcripts, nothing
   running, not in `[[seat]]`) and that has no saved login is left out of LIMITS · SEATS and
   `swarmy accounts` (#8): a Codex-only setup shows one section. A `hidden:` line names what was
   left out, `.` shows it, `swarmy accounts --all` lists it, `swarmy doctor` names each empty
   seat; with no seat at all the panel says how to get one.
+- Build without Rust on the host (#7): `docker build --output dist .` makes the static Linux
+  binaries, archives and packages (the `Dockerfile` pins the release toolchain; CI and the
+  release use it). swarmy itself runs on the host.
 - Fixed: a `[[seat]]` without `harness` that points at a used Claude Code dir was read as a
   Codex home, and the seat's spend, limits and sessions vanished. A dir whose files fit two
   harnesses is now named in ATTENTION.
@@ -53,8 +57,6 @@ Fixes from two architecture reviews: wrong numbers, lost logins.
 - Vault: login labels can no longer be another login's id or email; a file without any token
   is no login; `.claude.json` keeps its mode and its symlink; a grant taken out of the vault is
   kept in `retired.json` for 90 days.
-- Build without Rust on the host: `docker build --output dist .` makes the static Linux binaries,
-  archives and packages (the `Dockerfile` pins the release toolchain; CI and the release use it).
 - `config.toml`: an unknown status-line segment, a nonsense `[subscription]` price and a
   `web_search` price per 1000 searches are refused.
 
