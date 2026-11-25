@@ -1,10 +1,11 @@
 //! Writing what was read of one transcript file, inside the batch's transaction.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 
-use super::{Work, marks, ms, schema};
+use super::{AgentOf, Work, marks, ms, schema};
 use crate::claude::files::{self, FileKind};
 use crate::claude::transcript::{self, Event, TitleKind};
+use crate::core::ids::SeatId;
 
 #[derive(Default)]
 struct FileAgg {
@@ -29,6 +30,72 @@ pub(super) struct Written {
     pub late: bool,
     /// Records skipped because they were rolled up already (`marks`).
     pub skipped: u64,
+    /// The agents this file's session took copied rows from (`takes_over`): their totals changed.
+    pub taken_from: Vec<AgentOf>,
+}
+
+/// When a session's responses started and ended (epoch ms), as far as the index and the read in
+/// hand know.
+#[derive(Clone, Copy)]
+struct Span {
+    first: Option<i64>,
+    last: Option<i64>,
+}
+
+/// Who holds a row another file wrote first (a response, a prompt or an API error that a fork or
+/// a resumed session repeats, same id and time): its seat, session and agent, and that
+/// session's span.
+struct Held {
+    seat: String,
+    session: String,
+    agent: String,
+    span: Span,
+}
+
+/// The holders of rows by their record's id; the session's span from `sessions`.
+const REQUEST_HELD: &str =
+    "SELECT r.seat, r.session_id, r.agent_id, s.first_ts, s.last_ts FROM requests r
+     LEFT JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id WHERE r.msg_id = ?1";
+const PROMPT_HELD: &str = "SELECT r.seat, r.session_id, '', s.first_ts, s.last_ts FROM prompts r
+     LEFT JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id WHERE r.record_id = ?1";
+const ERROR_HELD: &str = "SELECT r.seat, r.session_id, r.agent_id, s.first_ts, s.last_ts FROM api_errors r
+     LEFT JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id WHERE r.record_id = ?1";
+
+fn held(tx: &rusqlite::Transaction, sql: &str, id: &str) -> rusqlite::Result<Option<Held>> {
+    tx.prepare_cached(sql)?
+        .query_row([id], |r| {
+            Ok(Held {
+                seat: r.get(0)?,
+                session: r.get(1)?,
+                agent: r.get(2)?,
+                span: Span {
+                    first: r.get(3)?,
+                    last: r.get(4)?,
+                },
+            })
+        })
+        .optional()
+}
+
+/// Whether the session of `span` takes a copied row from the session holding it. Nothing in a
+/// fork's records names the session they were copied from, so the rule is one that every read
+/// order agrees on: the row belongs to the session that started first; on a tie (a fork or a
+/// resume that copied the whole session), to the one that ended first, since the copy holds
+/// the original and more. Rows stay where they are when the two cannot be told apart, when a
+/// span is unknown, and between seats of one session (a moved config dir).
+fn takes_over(span: Span, session: &str, held: &Held) -> bool {
+    use std::cmp::Ordering;
+    if held.session == session {
+        return false;
+    }
+    let (Some(first), Some(their_first)) = (span.first, held.span.first) else {
+        return false;
+    };
+    match first.cmp(&their_first) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => matches!((span.last, held.span.last), (Some(l), Some(t)) if l < t),
+    }
 }
 
 /// Writes what was read of one file. Records the index rolled up already are skipped (requests
@@ -69,6 +136,7 @@ pub(super) fn write_file(
     let mut late = false;
     let mut skipped = 0;
     let mut refused: i64 = 0;
+    let mut taken_from: Vec<AgentOf> = Vec::new();
     let marked = match w.mark {
         marks::Mark::New => false,
         marks::Mark::Repeats => true,
@@ -112,6 +180,35 @@ pub(super) fn write_file(
         )?
         .execute(params![f.path.to_string_lossy(), t, *n as i64])?;
     }
+    // This file's session's span, as far as the index and this read know: what decides which
+    // session a copied row belongs to (`takes_over`). An aggregate: one row, NULLs for a session
+    // the index has not seen.
+    let (known_first, known_last): (Option<i64>, Option<i64>) = tx
+        .prepare_cached(
+            "SELECT MIN(first_ts), MAX(last_ts) FROM sessions WHERE seat = ?1 AND session_id = ?2",
+        )?
+        .query_row(params![f.seat, f.session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let span = chunk.events.iter().fold(
+        Span {
+            first: known_first,
+            last: known_last,
+        },
+        |s, e| {
+            if let Event::Request(r) = e {
+                let t = ms(r.ts);
+                Span {
+                    first: Some(s.first.map_or(t, |x| x.min(t))),
+                    last: Some(s.last.map_or(t, |x| x.max(t))),
+                }
+            } else {
+                s
+            }
+        },
+    );
+    // Responses this write inserted or claimed: their later records are the same response.
+    let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Whether each response of a marked file was rolled up, decided by its first record.
     let mut first_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut account = w.account.clone();
@@ -127,7 +224,8 @@ pub(super) fn write_file(
            input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
            cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
            web = MAX(web, excluded.web),
-           account_uuid = COALESCE(account_uuid, excluded.account_uuid), {}",
+           account_uuid = COALESCE(account_uuid, excluded.account_uuid), {}
+         RETURNING rowid",
         schema::unpriced_sql()
     ))?;
     let mut ins_tool = tx.prepare_cached(
@@ -209,27 +307,46 @@ pub(super) fn write_file(
                 // Numbered above every rowid ever given out (`compact::requests_rowid_high`); a
                 // merge into an existing row leaves the number unused.
                 *rowid += 1;
-                ins_req.execute(params![
-                    r.msg_id,
-                    f.seat,
-                    f.session_id,
-                    f.agent_id,
-                    if main { account.clone() } else { None },
-                    t,
-                    r.model,
-                    r.requested_model,
-                    r.effort,
-                    r.fast as i64,
-                    r.cwd,
-                    input,
-                    cw5,
-                    cw1h,
-                    cread,
-                    output,
-                    thinking,
-                    web,
-                    *rowid,
-                ])?;
+                let account_here = if main { account.clone() } else { None };
+                let row: i64 = ins_req.query_row(
+                    params![
+                        r.msg_id,
+                        f.seat,
+                        f.session_id,
+                        f.agent_id,
+                        account_here,
+                        t,
+                        r.model,
+                        r.requested_model,
+                        r.effort,
+                        r.fast as i64,
+                        r.cwd,
+                        input,
+                        cw5,
+                        cw1h,
+                        cread,
+                        output,
+                        thinking,
+                        web,
+                        *rowid,
+                    ],
+                    |x| x.get(0),
+                )?;
+                // Merged into a row another file wrote first: a copy, which may be this
+                // session's to take (with its tool calls; the account follows the session, or
+                // the next pass gives it the session's owner).
+                if row != *rowid
+                    && !mine.contains(&r.msg_id)
+                    && let Some(h) = held(tx, REQUEST_HELD, &r.msg_id)?
+                    && takes_over(span, &f.session_id, &h)
+                {
+                    tx.prepare_cached("UPDATE requests SET seat = ?2, session_id = ?3, agent_id = ?4, account_uuid = ?5, cwd = COALESCE(?6, cwd) WHERE msg_id = ?1")?
+                        .execute(params![r.msg_id, f.seat, f.session_id, f.agent_id, account_here, r.cwd])?;
+                    tx.prepare_cached("UPDATE tool_calls SET seat = ?2, session_id = ?3, agent_id = ?4 WHERE msg_id = ?1")?
+                        .execute(params![r.msg_id, f.seat, f.session_id, f.agent_id])?;
+                    taken_from.push((SeatId::from_stored(h.seat), h.session, h.agent));
+                }
+                mine.insert(r.msg_id.clone());
                 insert_tools(&mut ins_tool, f, &r, t)?;
                 // A response's tool calls are counted, not added up: its records may be read
                 // more than once, in any order.
@@ -255,7 +372,20 @@ pub(super) fn write_file(
                     } else if main {
                         // A record id already counted (a fork, a moved config dir) is not counted again
                         // (review B-M8): `ON CONFLICT` covers the unique `record_id` too.
-                        tx.prepare_cached("INSERT INTO prompts(seat, session_id, ts, chars, record_id) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, ms(t), text.chars().count() as i64, id])?;
+                        let n = tx.prepare_cached("INSERT INTO prompts(seat, session_id, ts, chars, record_id) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, ms(t), text.chars().count() as i64, id])?;
+                        if n == 0
+                            && let Some(id) = &id
+                            && let Some(h) = held(tx, PROMPT_HELD, id)?
+                            && takes_over(span, &f.session_id, &h)
+                        {
+                            tx.prepare_cached("UPDATE OR IGNORE prompts SET seat = ?2, session_id = ?3 WHERE record_id = ?1")?
+                                .execute(params![id, f.seat, f.session_id])?;
+                            taken_from.push((
+                                SeatId::from_stored(h.seat),
+                                h.session,
+                                f.agent_id.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -293,8 +423,17 @@ pub(super) fn write_file(
                     skipped += 1;
                     continue;
                 }
-                tx.prepare_cached("INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text, record_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                let n = tx.prepare_cached("INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text, record_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, f.agent_id, t, kind, text, id])?;
+                if n == 0
+                    && let Some(id) = &id
+                    && let Some(h) = held(tx, ERROR_HELD, id)?
+                    && takes_over(span, &f.session_id, &h)
+                {
+                    tx.prepare_cached("UPDATE OR IGNORE api_errors SET seat = ?2, session_id = ?3, agent_id = ?4 WHERE record_id = ?1")?
+                        .execute(params![id, f.seat, f.session_id, f.agent_id])?;
+                    taken_from.push((SeatId::from_stored(h.seat), h.session, h.agent));
+                }
             }
         }
     }
@@ -380,7 +519,11 @@ pub(super) fn write_file(
             last_ts,
             account,
         ])?;
-    Ok(Written { late, skipped })
+    Ok(Written {
+        late,
+        skipped,
+        taken_from,
+    })
 }
 
 /// The tool calls of one record of response `r` (at `t`, the record's time). A tool id is written

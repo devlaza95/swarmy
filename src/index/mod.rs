@@ -684,6 +684,8 @@ impl Index {
                     w.file.session_id.clone(),
                     w.file.agent_id.clone(),
                 ));
+                // The agents a copy was taken from read their totals again too.
+                written.extend(wrote.taken_from);
                 late |= wrote.late;
                 skipped += wrote.skipped;
             }

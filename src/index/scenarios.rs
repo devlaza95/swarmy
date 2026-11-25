@@ -338,6 +338,171 @@ mod tests {
         assert_eq!(dump(&idx, "SELECT COUNT(*) FROM api_errors"), ["1"]);
     }
 
+    /// A fork repeats its parent's records (same message, tool and record ids, same times) under
+    /// a new session id, and nothing in them names the parent. The copies belong to the session
+    /// that started first, whichever file is read first: read as they were written (the parent,
+    /// then the fork) or rebuilt at once (the fork, the larger file, first).
+    #[test]
+    fn a_forks_copies_belong_to_the_session_that_started_first_in_any_read_order() {
+        let rec = |v: serde_json::Value| v.to_string();
+        let prompt = |id: &str, ts: &str| {
+            rec(
+                serde_json::json!({"type": "user", "uuid": id, "timestamp": ts,
+                "message": {"role": "user", "content": "Fix the VAT report"}}),
+            )
+        };
+        let error = |id: &str, ts: &str| {
+            rec(
+                serde_json::json!({"type": "assistant", "uuid": id, "isApiErrorMessage": true,
+                "error": "rate_limit", "timestamp": ts,
+                "message": {"id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "API Error"}]}}),
+            )
+        };
+        // The parent started at 09:00 with a response of its own; the fork copies what came from
+        // 10:00 on, then works on.
+        let own = vec![
+            owner("acc-a"),
+            prompt("p0", "2026-11-20T09:00:00Z"),
+            assistant(
+                "m0",
+                "2026-11-20T09:00:05Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (100, 10),
+                &["t0"],
+            ),
+        ];
+        let shared = vec![
+            prompt("p1", "2026-11-20T10:00:00Z"),
+            assistant(
+                "m1",
+                "2026-11-20T10:00:05Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (200, 20),
+                &["t1"],
+            ),
+            error("e1", "2026-11-20T10:01:00Z"),
+            assistant(
+                "m2",
+                "2026-11-20T10:02:00Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (300, 30),
+                &[],
+            ),
+        ];
+        let fork_own = vec![
+            prompt("p9", "2026-11-20T11:00:00Z"),
+            assistant(
+                "m9",
+                "2026-11-20T11:00:05Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (900, 90),
+                &["t9"],
+            ),
+            assistant(
+                "m10",
+                "2026-11-20T11:01:00Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (900, 90),
+                &[],
+            ),
+            assistant(
+                "m11",
+                "2026-11-20T11:02:00Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (900, 90),
+                &[],
+            ),
+        ];
+        let parent = [own, shared.clone()].concat();
+        let fork = [vec![owner("acc-b")], shared, fork_own].concat();
+        let full = read_in_both_orders(&parent, &fork);
+        let by_session = FORK_ROWS;
+        assert_eq!(
+            dump(&full.1, by_session[0]),
+            [
+                "m0|parent|acc-a",
+                "m1|parent|acc-a",
+                "m10|fork|acc-b",
+                "m11|fork|acc-b",
+                "m2|parent|acc-a",
+                "m9|fork|acc-b"
+            ]
+        );
+        assert_eq!(
+            dump(&full.1, by_session[1]),
+            ["t0|parent", "t1|parent", "t9|fork"]
+        );
+        assert_eq!(
+            dump(&full.1, by_session[2]),
+            ["p0|parent", "p1|parent", "p9|fork"]
+        );
+        assert_eq!(dump(&full.1, by_session[3]), ["e1|parent"]);
+
+        // A resume that copied the whole session: both start at once, the copy ends later.
+        let parent = vec![
+            owner("acc-a"),
+            prompt("p1", "2026-11-20T10:00:00Z"),
+            assistant(
+                "m1",
+                "2026-11-20T10:00:05Z",
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (200, 20),
+                &["t1"],
+            ),
+        ];
+        let mut fork = parent.clone();
+        fork.push(assistant(
+            "m9",
+            "2026-11-20T11:00:05Z",
+            "claude-sonnet-5-5",
+            "/w/shop",
+            (900, 90),
+            &[],
+        ));
+        let full = read_in_both_orders(&parent, &fork);
+        assert_eq!(
+            dump(&full.1, by_session[0]),
+            ["m1|parent|acc-a", "m9|fork|acc-a"]
+        );
+        assert_eq!(dump(&full.1, by_session[2]), ["p1|parent"]);
+    }
+
+    const FORK_ROWS: [&str; 4] = [
+        "SELECT msg_id, session_id, account_uuid FROM requests ORDER BY msg_id",
+        "SELECT id, session_id FROM tool_calls ORDER BY id",
+        "SELECT record_id, session_id FROM prompts ORDER BY record_id",
+        "SELECT record_id, session_id FROM api_errors ORDER BY record_id",
+    ];
+
+    /// Sessions `parent` and `fork` read as they were written (the parent first, the fork found
+    /// later) and rebuilt at once (the fork, the larger file, first): the same rows belong to
+    /// the same sessions. Returns the rebuilt index.
+    fn read_in_both_orders(parent: &[String], fork: &[String]) -> (World, Index) {
+        let prices = PriceBook::builtin();
+        let w1 = World::new(&["work"]);
+        w1.append("work", "parent", parent);
+        let mut inc = w1.index("inc.sqlite");
+        w1.refresh(&mut inc, &[], &prices);
+        w1.append("work", "fork", fork);
+        w1.refresh(&mut inc, &[], &prices);
+        let w2 = World::new(&["work"]);
+        w2.append("work", "parent", parent);
+        w2.append("work", "fork", fork);
+        let mut full = w2.index("full.sqlite");
+        w2.refresh(&mut full, &[], &prices);
+        for q in FORK_ROWS {
+            assert_eq!(dump(&inc, q), dump(&full, q), "{q}");
+        }
+        (w2, full)
+    }
+
     #[test]
     fn incremental_refresh_equals_a_full_rebuild_and_a_reread_counts_once() {
         let w = World::new(&["work"]);

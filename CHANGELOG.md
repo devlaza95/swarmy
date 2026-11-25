@@ -37,6 +37,10 @@ Fixes from two architecture reviews: wrong numbers, lost logins.
   last message when the tail cut a non-ASCII character; dead sessions showed as "needs you" on
   macOS and Windows; the status line and `swarmy jump` missed `~/.claude_*` and configured
   seats without a dashboard; a Codex inside tmux jumped to the terminal window, not the pane.
+- Fixed: the responses a fork or a resume copies from its session went to whichever of the two
+  files was read first, so after a rebuild the copy took the original's spend, and the account of
+  the copy's login when it ran under another; they belong to the session that started first now
+  (the one that ended first when both start together), in any read order.
 - Fixed: prompts and API errors of a forked session or a moved config dir counted twice; a
   `null` token count lost the record; a response without an id or a time is counted as unusable
   (`doctor` lists it); an older swarmy refuses a newer index instead of rebuilding it; a cache
