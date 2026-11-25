@@ -954,8 +954,13 @@ mod tests {
         assert!(!text.contains("CLAUDE CODE"), "{text}");
         assert!(!text.contains("default"), "{text}");
         assert!(text.contains("codex"), "{text}");
+        // The dir as shown (outside the real home: in full, with the OS's separator).
+        let dir = PathBuf::from("/home/alice").join(".claude");
         assert!(
-            text.contains("hidden: Claude Code — 1 empty seat (/home/alice/.claude) · . shows"),
+            text.contains(&format!(
+                "hidden: Claude Code — 1 empty seat ({}) · . shows",
+                dir.display()
+            )),
             "{text}"
         );
         // `.` shows it, with its section; `.` again hides it.
