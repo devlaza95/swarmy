@@ -6,6 +6,9 @@
 #   tools/release-local.sh linux           # the four static musl targets, .deb and .rpm
 #   tools/release-local.sh windows         # x86_64-pc-windows-msvc with the static CRT
 #   NO_PACKAGES=1 tools/release-local.sh   # archives only, no .deb / .rpm
+#   LINUX_TARGETS=x86_64-unknown-linux-musl tools/release-local.sh linux   # some targets only
+#
+# The Dockerfile runs `linux` in a container with these tools, for a host without them.
 #
 # Needs (docs/release.md has the details):
 #   linux:   zig 0.16 on PATH (or ZIG_DIR=<dir with zig>), cargo-zigbuild, readelf; for packages
@@ -18,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-LINUX_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf arm-unknown-linux-musleabihf"
+LINUX_TARGETS=${LINUX_TARGETS:-"x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf arm-unknown-linux-musleabihf"}
 WINDOWS_TARGET=x86_64-pc-windows-msvc
 TARGET_DIR=${CARGO_TARGET_DIR:-target}
 
@@ -57,21 +60,28 @@ if [ "$want_linux" = 1 ]; then
         cargo zigbuild --locked --release --target "$t"
         tools/dist.sh check-static "$TARGET_DIR/$t/release/swarmy"
     done
-    # Man page and completions come from the binary that runs here; they are the same for every
-    # target.
-    tools/dist.sh docs "$TARGET_DIR/x86_64-unknown-linux-musl/release/swarmy"
+    # Man page and completions come from the binary that runs here (an x86_64 or an aarch64
+    # machine); they are the same for every target.
+    host="$(uname -m)-unknown-linux-musl"
+    [ -x "$TARGET_DIR/$host/release/swarmy" ] || {
+        echo "release-local: the man page needs the $host build: add it to LINUX_TARGETS" >&2
+        exit 1
+    }
+    tools/dist.sh docs "$TARGET_DIR/$host/release/swarmy"
     for t in $LINUX_TARGETS; do
         tools/dist.sh archive "$t" "$TARGET_DIR/$t/release/swarmy"
     done
     if [ "${NO_PACKAGES:-0}" != 1 ]; then
         # One armhf .deb: the ARMv6 build, which runs on every 32-bit Raspberry Pi (Raspberry Pi
         # OS's armhf is ARMv6) and on any armhf Debian or Ubuntu (ARMv7).
-        tools/dist.sh deb x86_64-unknown-linux-musl
-        tools/dist.sh deb aarch64-unknown-linux-musl
-        tools/dist.sh deb arm-unknown-linux-musleabihf
-        tools/dist.sh rpm x86_64-unknown-linux-musl x86_64
-        tools/dist.sh rpm aarch64-unknown-linux-musl aarch64
-        tools/dist.sh rpm armv7-unknown-linux-musleabihf armv7hl
+        # Packages of the targets built in this run.
+        built() { case " $LINUX_TARGETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+        if built x86_64-unknown-linux-musl; then tools/dist.sh deb x86_64-unknown-linux-musl; fi
+        if built aarch64-unknown-linux-musl; then tools/dist.sh deb aarch64-unknown-linux-musl; fi
+        if built arm-unknown-linux-musleabihf; then tools/dist.sh deb arm-unknown-linux-musleabihf; fi
+        if built x86_64-unknown-linux-musl; then tools/dist.sh rpm x86_64-unknown-linux-musl x86_64; fi
+        if built aarch64-unknown-linux-musl; then tools/dist.sh rpm aarch64-unknown-linux-musl aarch64; fi
+        if built armv7-unknown-linux-musleabihf; then tools/dist.sh rpm armv7-unknown-linux-musleabihf armv7hl; fi
     fi
 fi
 
