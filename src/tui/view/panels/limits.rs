@@ -29,7 +29,13 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
         app,
         Panel::Limits,
         area,
-        &format!("{n_acc} accounts · Enter switch · S best"),
+        // No account count where none has limits (a Codex-only machine): "0 accounts" read as
+        // something missing.
+        &if n_acc > 0 {
+            format!("{n_acc} accounts · Enter switch · S best")
+        } else {
+            "Enter switch · S best".to_string()
+        },
         hot,
     );
     let app: &App = app;

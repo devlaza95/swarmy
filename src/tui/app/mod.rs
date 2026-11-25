@@ -590,7 +590,12 @@ impl App {
                 self.log_event(
                     "◆",
                     format!(
-                        "online · {seats} seats · {accounts} accounts · {} transcripts",
+                        "online · {seats} seats{} · {} transcripts",
+                        if accounts > 0 {
+                            format!(" · {accounts} accounts")
+                        } else {
+                            String::new()
+                        },
                         fmt::count(files as u64)
                     ),
                     Tone::Accent,
