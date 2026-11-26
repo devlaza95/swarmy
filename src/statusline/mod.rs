@@ -37,7 +37,14 @@ const TAIL_MAX_BYTES: u64 = 1 << 20;
 /// Keeps this call's limit reading when it says something new (`reading::next`): only when the
 /// numbers moved is the transcript's tail read for whose numbers they are and since when, so an
 /// unchanged line costs one small file read. The file is the dashboard's trigger.
-fn record(input: &input::Input, data: &Path, home: &Path, dir: &Path, now: chrono::DateTime<Utc>) {
+fn record(
+    input: &input::Input,
+    data: &Path,
+    vault: &Path,
+    home: &Path,
+    dir: &Path,
+    now: chrono::DateTime<Utc>,
+) {
     let Some(windows) = reading::windows(input) else {
         return;
     };
@@ -51,23 +58,38 @@ fn record(input: &input::Input, data: &Path, home: &Path, dir: &Path, now: chron
         .as_deref()
         .and_then(|p| crate::claude::transcript::tail(Path::new(p), TAIL_MAX_BYTES).ok())
         .unwrap_or_default();
-    // The session's owner is who the response was for; the seat's login only fills in (or supplies
-    // the organization uuid when an older transcript's `session-owner` had none).
     let seat_account = || {
         crate::claude::config_json::read_seat_file(&crate::claude::seats::claude_json_of(dir, home))
             .ok()
             .and_then(|cj| cj.account)
     };
-    let account = match tail.owner {
-        Some(owner) if owner.has_org() => Some(owner),
-        Some(owner) => Some(owner.completed(seat_account().map(|a| a.id()).as_ref(), &[])),
-        None => seat_account().map(|a| a.id()),
+    let at = tail.last_response.filter(|t| *t <= now).unwrap_or(now);
+    // A response after the vault switched the seat ran under the seat's login: Claude Code reads
+    // `.credentials.json` again, but a session begun before the switch keeps writing
+    // `session-owner` records of the account it started with (verified on 2.1.332). Until the
+    // seat's profile names the new account, nobody is known to book the numbers to.
+    let switch = crate::vault::last_switch(vault, &crate::claude::seats::seat_id(dir))
+        .unwrap_or_else(|e| {
+            crate::diag::log("statusline", &format!("vault unreadable: {e:#}"));
+            None
+        });
+    let account = match (switch, tail.owner) {
+        (Some(sw), _) if at >= sw.at => {
+            if !sw.account_known {
+                return;
+            }
+            seat_account().map(|a| a.id())
+        }
+        // Else the session's owner is who the response was for; the seat's login only fills in
+        // (or supplies the organization uuid when an older transcript's `session-owner` had none).
+        (_, Some(owner)) if owner.has_org() => Some(owner),
+        (_, Some(owner)) => Some(owner.completed(seat_account().map(|a| a.id()).as_ref(), &[])),
+        (_, None) => seat_account().map(|a| a.id()),
     };
     let Some(account) = account else {
         // Nobody to book the numbers to: better no reading than one under a guessed account.
         return;
     };
-    let at = tail.last_response.filter(|t| *t <= now).unwrap_or(now);
     let Some(live) = live_from(input, dir, account, at) else {
         return;
     };
@@ -93,7 +115,7 @@ pub fn run(
     let input = parse_input(&text);
     let dir = current_config_dir(&dirs.home);
     let now = Utc::now();
-    record(&input, &dirs.data, &dirs.home, &dir, now);
+    record(&input, &dirs.data, &dirs.vault_dir(), &dirs.home, &dir, now);
     let fleet = crate::fleet::read_fresh(&crate::fleet::path(&dirs.data), conf.fresh_seconds, now);
     // No dashboard running: find the sessions that wait for the user ourselves.
     let waiting = if fleet.is_some()
@@ -235,6 +257,7 @@ mod tests {
     fn a_reading_names_the_sessions_owner_and_the_response_time() {
         let t = tempfile::tempdir().unwrap();
         let (data, home) = (t.path().join("data"), t.path().join("home"));
+        let vault = data.join("vault");
         let dir = home.join(".claude-work");
         std::fs::create_dir_all(&dir).unwrap();
         // The seat now holds acc-b; the session's last response ran under acc-a.
@@ -262,7 +285,7 @@ mod tests {
         let now = "2026-11-22T11:00:00Z"
             .parse::<chrono::DateTime<Utc>>()
             .unwrap();
-        record(&input(40.0), &data, &home, &dir, now);
+        record(&input(40.0), &data, &vault, &home, &dir, now);
         let file = file_for(&data, &dir);
         let r = read(&file).unwrap();
         assert_eq!(r.account.as_str(), "acc-a");
@@ -277,6 +300,7 @@ mod tests {
         record(
             &input(40.0),
             &data,
+            &vault,
             &home,
             &dir,
             now + chrono::Duration::minutes(30),
@@ -287,6 +311,7 @@ mod tests {
         record(
             &input(41.0),
             &data,
+            &vault,
             &home,
             &dir,
             now + chrono::Duration::hours(1),
@@ -302,6 +327,7 @@ mod tests {
     fn same_account_uuid_in_two_organizations_records_distinct_accounts() {
         let t = tempfile::tempdir().unwrap();
         let (data, home) = (t.path().join("data"), t.path().join("home"));
+        let vault = data.join("vault");
         let dir_team = home.join(".claude");
         let dir_max = home.join(".claude-work");
         std::fs::create_dir_all(&dir_team).unwrap();
@@ -343,13 +369,81 @@ mod tests {
         let now = "2026-11-22T10:00:00Z"
             .parse::<chrono::DateTime<Utc>>()
             .unwrap();
-        record(&mk(&tr_team, 12.0), &data, &home, &dir_team, now);
-        record(&mk(&tr_max, 67.0), &data, &home, &dir_max, now);
+        record(&mk(&tr_team, 12.0), &data, &vault, &home, &dir_team, now);
+        record(&mk(&tr_max, 67.0), &data, &vault, &home, &dir_max, now);
         let r_team = read(&file_for(&data, &dir_team)).unwrap();
         let r_max = read(&file_for(&data, &dir_max)).unwrap();
         assert_eq!(r_team.account.as_str(), "acc-1/org-team");
         assert_eq!(r_team.seven_day.unwrap().0, 12.0);
         assert_eq!(r_max.account.as_str(), "acc-1/org-max");
         assert_eq!(r_max.seven_day.unwrap().0, 67.0);
+    }
+
+    /// Seen on Claude Code 2.1.332: the vault switches a seat while a session runs there. The
+    /// session's responses go out under the new login at once (Claude Code reads
+    /// `.credentials.json` again) and report the new account's limits, but its `session-owner`
+    /// records keep naming the account it started with. A response after the switch is booked to
+    /// the seat's login; an idle session's line repeating a response from before the switch is
+    /// still its owner's.
+    #[test]
+    fn after_a_vault_switch_a_reading_is_the_seats_login_whatever_the_owner_says() {
+        let t = tempfile::tempdir().unwrap();
+        let (data, home) = (t.path().join("data"), t.path().join("home"));
+        let vault = data.join("vault");
+        let seat = |label: &str, acc: &str| {
+            let dir = home.join(format!(".claude-{label}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let creds = serde_json::json!({"claudeAiOauth": {"accessToken": format!("acc-{acc}"),
+                "refreshToken": format!("r-{acc}"), "expiresAt": 1_795_377_583_375_i64}});
+            std::fs::write(dir.join(".credentials.json"), creds.to_string()).unwrap();
+            let cj = serde_json::json!({"oauthAccount": {"accountUuid": acc,
+                "organizationUuid": format!("org-{acc}")}});
+            std::fs::write(dir.join(".claude.json"), cj.to_string()).unwrap();
+            crate::claude::seats::Seat::new(label, dir.clone(), dir.join(".claude.json"), false)
+        };
+        let (work, spare) = (seat("work", "a"), seat("spare", "b"));
+        let mut v = crate::vault::Vault::open(&vault).unwrap();
+        v.edit(|tx| tx.capture(&work, Some("a"))).unwrap();
+        v.edit(|tx| tx.capture(&spare, Some("b"))).unwrap();
+
+        let transcript = work.dir.join("s1.jsonl");
+        let response = |ts: chrono::DateTime<Utc>| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"m{}","model":"claude-opus-5-5","content":[],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#,
+                ts.to_rfc3339(),
+                ts.timestamp_millis()
+            )
+        };
+        let owner = r#"{"type":"session-owner","accountUuid":"a","organizationUuid":"org-a","sessionId":"s1"}"#;
+        let before = Utc::now() - chrono::Duration::hours(1);
+        std::fs::write(&transcript, format!("{owner}\n{}\n", response(before))).unwrap();
+        let input = |pct: f64| {
+            parse_input(&format!(
+                r#"{{"session_id":"s1","transcript_path":{},"rate_limits":{{"seven_day":{{"used_percentage":{pct},"resets_at":1795960000}}}}}}"#,
+                serde_json::Value::String(transcript.display().to_string())
+            ))
+        };
+        let file = file_for(&data, &work.dir);
+        let booked = || {
+            let r = read(&file).unwrap();
+            (r.account.as_str().to_string(), r.seven_day.unwrap().0)
+        };
+
+        v.edit(|tx| tx.switch(&work, "b")).unwrap();
+        // The session sat idle through the switch: its line repeats a response from before it.
+        let now = Utc::now() + chrono::Duration::minutes(1);
+        record(&input(80.0), &data, &vault, &home, &work.dir, now);
+        assert_eq!(booked(), ("a/org-a".to_string(), 80.0));
+
+        // It answers again: under the new login, while its owner record still says `a`.
+        let after = Utc::now();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut f, format!("{owner}\n{}\n", response(after)).as_bytes())
+            .unwrap();
+        record(&input(91.0), &data, &vault, &home, &work.dir, now);
+        assert_eq!(booked(), ("b/org-b".to_string(), 91.0));
     }
 }

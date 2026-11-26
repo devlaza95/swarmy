@@ -339,18 +339,21 @@ mod tests {
                     seat: Default::default(),
                     label: "work".into(),
                     account: Some(account(work, since)),
+                    switched_at: None,
                     utilization: None,
                 },
                 SeatInfo {
                     seat: Default::default(),
                     label: "home".into(),
                     account: Some(account("acc-b", "2026-09-01T00:00:00Z")),
+                    switched_at: None,
                     utilization: None,
                 },
                 SeatInfo {
                     seat: Default::default(),
                     label: "lab".into(),
                     account: Some(account("acc-a", "2026-09-01T00:00:00Z")),
+                    switched_at: None,
                     utilization: None,
                 },
             ]

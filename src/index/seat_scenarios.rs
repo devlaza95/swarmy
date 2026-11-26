@@ -17,6 +17,7 @@ mod tests {
             seat: Default::default(),
             label: label.into(),
             account: Some(account(acc, since)),
+            switched_at: None,
             utilization: None,
         }
     }
@@ -270,6 +271,7 @@ mod tests {
             seat: Default::default(),
             label: "empty".into(),
             account: None,
+            switched_at: None,
             utilization: None,
         };
         w.refresh(

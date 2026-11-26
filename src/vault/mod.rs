@@ -257,6 +257,29 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
 
 /// The index as a reader sees it: labels an older version duplicated are told apart the way the
 /// next change will save them (`VaultTx::begin`), so a label never names two logins.
+/// The vault's last switch of a seat, as `logins.json` last recorded it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LastSwitch {
+    pub at: DateTime<Utc>,
+    /// Whether the seat's profile (`oauthAccount` in `.claude.json`) names the account of the
+    /// login the vault put there; until Claude Code reads the new login's profile it names the
+    /// previous one.
+    pub account_known: bool,
+}
+
+/// When the vault last switched `seat`'s login (kept while the seat holds that login, rotated or
+/// not): one read of `logins.json`, no lock and no write, for `swarmy statusline`. None when the
+/// vault never switched it (or there is no vault).
+pub fn last_switch(dir: &Path, seat: &SeatId) -> anyhow::Result<Option<LastSwitch>> {
+    let (index, _) = read_index(dir)?;
+    Ok(index.seats.get(seat).and_then(|seen| {
+        Some(LastSwitch {
+            at: seen.switched_at?,
+            account_known: seen.unverified_since.is_none(),
+        })
+    }))
+}
+
 fn read_view(dir: &Path) -> anyhow::Result<Index> {
     let (mut index, _) = read_index(dir)?;
     index.dedupe_labels();

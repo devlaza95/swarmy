@@ -608,11 +608,13 @@ mod tests {
     }
 
     /// Review H1. The transcripts' `session-owner` records say which account a request used;
-    /// the seat's login history only fills in for sessions without one, from the moment a change
-    /// is seen (never from the profile's `profileFetchedAt`: a vault switch restores a profile
-    /// fetched days earlier). Both survive a cache rebuild.
+    /// the seat's login history fills in for sessions without one, from the moment a change is
+    /// seen (never from the profile's `profileFetchedAt`: a vault switch restores a profile
+    /// fetched days earlier), and decides from then on for a session that began before it (its
+    /// owner records go stale, see `a_vault_switch_under_a_running_session_moves_its_requests`).
+    /// Both survive a cache rebuild.
     #[test]
-    fn the_owner_decides_and_a_seen_login_change_only_fills_in() {
+    fn the_owner_decides_and_a_seen_login_change_fills_in() {
         let w = World::new(&["work"]);
         let m = "claude-sonnet-5-5";
         let req = |id: &str, ts: &str| assistant(id, ts, m, "/w/shop", (1000, 0), &[]);
@@ -632,6 +634,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account(acc, since)),
+            switched_at: None,
             utilization: None,
         };
         let path = w.dir.path().join("i.sqlite");
@@ -664,7 +667,8 @@ mod tests {
             switched >= Utc::now().timestamp_millis() - 60_000,
             "dated when seen: {history:?}"
         );
-        // After the change: the owner-less session follows the seat, s1 keeps its owner.
+        // After the change both sessions, begun before it, follow the seat: the owner-less one,
+        // and s1, whose owner record still names the account it started with.
         w.append("work", "s0", &[req("r3", &later(1))]);
         w.append("work", "s1", &[req("r4", &later(1))]);
         w.refresh(
@@ -672,7 +676,7 @@ mod tests {
             &[seat("acc-b", "2026-11-09T00:00:00Z")],
             &PriceBook::builtin(),
         );
-        let expected = ["r0|acc-a", "r1|acc-a", "r2|acc-a", "r3|acc-b", "r4|acc-a"];
+        let expected = ["r0|acc-a", "r1|acc-a", "r2|acc-a", "r3|acc-b", "r4|acc-b"];
         assert_eq!(accounts(&idx), expected);
 
         // A new cache version: the cache is rebuilt from the transcripts. The seat no longer
@@ -695,6 +699,115 @@ mod tests {
         );
         w.refresh(&mut idx, &[], &PriceBook::builtin());
         assert_eq!(accounts(&idx), expected);
+    }
+
+    /// Seen on Claude Code 2.1.332: the vault switches a seat while a session runs there. Claude
+    /// Code reads `.credentials.json` again, so the session's next requests go out under the new
+    /// login (the limits they report are the new account's), but it keeps writing `session-owner`
+    /// records of the account it started with. From the switch on, dated by the vault and not
+    /// when swarmy first sees the new account, the seat's login decides for that session. A
+    /// session begun after the switch has owner records of its own, and they decide. An index
+    /// attributed by the old rule is attributed again once.
+    #[test]
+    fn a_vault_switch_under_a_running_session_moves_its_requests() {
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        let req = |id: &str, ts: &str| assistant(id, ts, m, "/w/shop", (1000, 0), &[]);
+        let now = Utc::now();
+        let t = |min: i64| now + chrono::Duration::minutes(min);
+        let ts = |min: i64| t(min).to_rfc3339();
+        let seat = |acc: &str, switched_at: Option<DateTime<Utc>>| SeatInfo {
+            seat: Default::default(),
+            label: "work".into(),
+            account: Some(account(acc, "2026-11-01T00:00:00Z")),
+            utilization: None,
+            switched_at,
+        };
+        let path = w.dir.path().join("i.sqlite");
+        let mut idx = Index::open(&path).unwrap();
+        // s1 begins under acc-a; swarmy sees the seat with acc-a.
+        w.append("work", "s1", &[owner("acc-a"), req("r1", &ts(-60))]);
+        // s3 names acc-z, which the seat never showed.
+        w.append("work", "s3", &[owner("acc-z"), req("z1", &ts(-55))]);
+        idx.set_now(t(-50));
+        w.refresh(&mut idx, &[seat("acc-a", None)], &PriceBook::builtin());
+        // A row naming the account the seat already had (an older swarmy's migration left such
+        // pairs) is no change of login: s3's owner keeps deciding.
+        idx.conn
+            .execute(
+                "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, 'acc-a')",
+                rusqlite::params![w.id("work"), t(-45).timestamp_millis()],
+            )
+            .unwrap();
+        w.append("work", "s3", &[req("z2", &ts(-42))]);
+
+        // The vault switches the seat to acc-b 30 minutes ago; the next pass that sees it runs
+        // now. s1 went on working and still names acc-a; s2 began after the switch.
+        w.append(
+            "work",
+            "s1",
+            &[
+                req("r2", &ts(-40)),
+                owner("acc-a"),
+                req("r3", &ts(-20)),
+                owner("acc-a"),
+                req("r4", &ts(-5)),
+            ],
+        );
+        w.append("work", "s2", &[owner("acc-c"), req("r5", &ts(-10))]);
+        idx.set_now(now);
+        w.refresh(
+            &mut idx,
+            &[seat("acc-b", Some(t(-30)))],
+            &PriceBook::builtin(),
+        );
+        let accounts = |idx: &Index| {
+            dump(
+                idx,
+                "SELECT msg_id, account_uuid FROM requests ORDER BY msg_id",
+            )
+        };
+        let expected = [
+            "r1|acc-a", "r2|acc-a", "r3|acc-b", "r4|acc-b", "r5|acc-c", "z1|acc-z", "z2|acc-z",
+        ];
+        assert_eq!(accounts(&idx), expected);
+        assert_eq!(
+            dump(
+                &idx,
+                "SELECT ts, account_uuid FROM seat_accounts ORDER BY ts"
+            ),
+            [
+                format!("{}|acc-a", t(-50).timestamp_millis()),
+                format!("{}|acc-a", t(-45).timestamp_millis()),
+                format!("{}|acc-b", t(-30).timestamp_millis()),
+            ],
+            "the change is dated by the switch"
+        );
+
+        // An index attributed by the old rule (the owner decided for r3 and r4): opened by this
+        // swarmy, its next refresh attributes them again, once.
+        idx.conn
+            .execute_batch(
+                "UPDATE requests SET account_uuid = 'acc-a' WHERE msg_id IN ('r3', 'r4');
+                 UPDATE meta SET value = '1' WHERE key = 'owner_rule_rev';",
+            )
+            .unwrap();
+        drop(idx);
+        let mut idx = Index::open(&path).unwrap();
+        w.refresh(
+            &mut idx,
+            &[seat("acc-b", Some(t(-30)))],
+            &PriceBook::builtin(),
+        );
+        assert_eq!(accounts(&idx), expected);
+        assert_eq!(
+            idx.meta(super::super::accounts::OWNERS_PENDING).unwrap(),
+            None
+        );
+        assert_eq!(
+            idx.meta("owner_rule_rev").unwrap().as_deref(),
+            Some(super::super::OWNER_RULE_REV)
+        );
     }
 
     #[test]
@@ -1236,6 +1349,7 @@ mod tests {
             seat: Default::default(),
             label: label.into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly("acc-a", fetched, used, reset)),
         };
         let mut idx = w.index("i.sqlite");

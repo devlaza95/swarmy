@@ -347,8 +347,10 @@ pub fn facts_sql() -> String {
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- Which account each seat (config dir) had logged in, and since when: a change is dated when
--- swarmy first sees the seat's `.claude.json` name another account, never earlier. It only
--- fills in for requests whose session has no `session-owner` record: the owner decides.
+-- the vault switched the seat, else when swarmy first sees the seat's `.claude.json` name
+-- another account, never earlier. It fills in for requests whose session has no
+-- `session-owner` record, and decides for sessions that began before the change (their owner
+-- records go stale: `SEAT_ACCOUNT_AT`).
 CREATE TABLE IF NOT EXISTS seat_accounts (
   seat TEXT NOT NULL,
   ts INTEGER NOT NULL,

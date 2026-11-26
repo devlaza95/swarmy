@@ -402,9 +402,10 @@ pub(super) fn record_seat_facts(
             }
         }
     }
-    // What each seat has logged in now. A change of login is dated when swarmy sees it
-    // (review H1): never at the profile's `profileFetchedAt` nor at a reading's time, and never
-    // before the seat's newest recorded change, so the history only moves forward.
+    // What each seat has logged in now. A change of login is dated when the vault switched the
+    // seat, else when swarmy sees it (review H1): never at the profile's `profileFetchedAt` nor
+    // at a reading's time, and never before the seat's newest recorded change, so the history
+    // only moves forward.
     let mut reattribute: Vec<(SeatId, i64)> = Vec::new();
     for si in seat_info {
         let Some(a) = &si.account else { continue };
@@ -421,7 +422,14 @@ pub(super) fn record_seat_facts(
         {
             continue;
         }
-        let ts = newest.map_or(now, |(t, _)| now.max(t + 1));
+        let switched = si
+            .switched_at
+            .map(|t| t.timestamp_millis())
+            .filter(|t| *t <= now);
+        let ts = match newest {
+            None => now,
+            Some((t, _)) => switched.filter(|s| *s > t).unwrap_or(now.max(t + 1)),
+        };
         tx.prepare_cached("INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)")?
             .execute(params![si.seat, ts, acct_id.as_str()])?;
         reattribute.push((si.seat.clone(), ts));

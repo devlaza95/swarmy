@@ -53,6 +53,7 @@ mod tests {
             seat: Default::default(),
             label: label.into(),
             account: acc.map(|a| account(a, "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: None,
         }
     }

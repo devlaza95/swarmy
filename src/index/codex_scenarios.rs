@@ -208,12 +208,14 @@ mod tests {
                 seat: cc.id.clone(),
                 label: cc.label.clone(),
                 account: Some(account("acc-cc", "2026-10-01T00:00:00Z")),
+                switched_at: None,
                 utilization: None,
             },
             SeatInfo {
                 seat: cdx.id.clone(),
                 label: cdx.label.clone(),
                 account: None,
+                switched_at: None,
                 utilization: None,
             },
         ];
