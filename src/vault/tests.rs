@@ -1114,6 +1114,203 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A grant as Claude Code 2.1.332 writes it after a refresh: a fresh access token, the grant's
+/// own expiry, and (`named`) the account the grant names itself. The profile in `.claude.json`
+/// was read a day ago and names `acc-1/org-1`.
+fn write_grant(
+    s: &Seat,
+    refresh: &str,
+    refresh_expires: chrono::DateTime<Utc>,
+    named: bool,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let mut oauth = json!({
+        "accessToken": format!("acc-{refresh}"),
+        "refreshToken": refresh,
+        "expiresAt": (now + chrono::Duration::hours(8)).timestamp_millis(),
+        "refreshTokenExpiresAt": refresh_expires.timestamp_millis(),
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    });
+    if named {
+        oauth["accountUuid"] = json!("acc-1");
+        oauth["organizationUuid"] = json!("org-1");
+    }
+    std::fs::write(
+        s.credentials_file(),
+        json!({"claudeAiOauth": oauth}).to_string(),
+    )?;
+    let profile = json!({"oauthAccount": {
+        "accountUuid": "acc-1", "organizationUuid": "org-1", "emailAddress": "sam@example.com",
+        "profileFetchedAt": (now - chrono::Duration::days(1)).timestamp_millis()}});
+    std::fs::write(&s.claude_json, profile.to_string())?;
+    Ok(())
+}
+
+/// Seen on Claude Code 2.1.332: a rotation writes the grant's `refreshTokenExpiresAt` again from
+/// its own clock, here 1.2 s earlier than the saved copy. It is still the same grant: the login
+/// follows it, stays mounted, and the seat stays saved (it used to show "not saved" and leave the
+/// login mounted nowhere).
+#[test]
+fn a_rotation_that_moves_the_grant_expiry_back_a_second_is_followed() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let expiry = Utc::now() + chrono::Duration::days(28);
+    write_grant(&work, "r-1", expiry, false)?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("sam")))?;
+    assert_eq!(
+        login(&v, "sam")?.account_uuid.as_deref(),
+        Some("acc-1/org-1")
+    );
+
+    write_grant(
+        &work,
+        "r-2",
+        expiry - chrono::Duration::milliseconds(1_181),
+        false,
+    )?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert_eq!(st.saved_as.as_deref(), Some("sam"), "{st:?}");
+    assert_eq!(st.unverified_since, None, "{st:?}");
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.mounted, vec![work.id.clone()]);
+    assert_eq!(secret_of(&v, &sam.id)?["refreshToken"], "r-2");
+
+    // A grant that expires a day earlier is not this one, even of the same account.
+    write_grant(&work, "r-3", expiry - chrono::Duration::days(1), false)?;
+    v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
+    let sam = login(&v, "sam")?.clone();
+    assert!(sam.mounted.is_empty());
+    assert_eq!(secret_of(&v, &sam.id)?["refreshToken"], "r-2");
+    Ok(())
+}
+
+/// A grant that names its account confirms the seat without a newer profile, and its rotation is
+/// followed even for a login saved with no account (saved while the seat was unconfirmed, which
+/// used to make every later rotation look like another login). The login then takes the profile.
+#[test]
+fn a_grant_naming_its_account_confirms_the_seat_and_its_rotation() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let expiry = Utc::now() + chrono::Duration::days(28);
+    write_grant(&work, "r-1", expiry, true)?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    let first = read_seat(&work)?.secret.context("no grant")?;
+    assert_eq!(first.meta().account.as_deref(), Some("acc-1/org-1"));
+    // Saved with no account, as an unconfirmed seat saves it.
+    v.edit(|tx| tx.put(&first, None, None, Some("sam"), Some(&work.id)))?;
+    assert_eq!(login(&v, "sam")?.account_uuid, None);
+
+    write_grant(&work, "r-2", expiry, true)?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert_eq!(st.unverified_since, None, "{st:?}");
+    assert_eq!(st.account_uuid.as_deref(), Some("acc-1/org-1"));
+    assert_eq!(st.saved_as.as_deref(), Some("sam"));
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.mounted, vec![work.id.clone()]);
+    assert_eq!(sam.account_uuid.as_deref(), Some("acc-1/org-1"));
+    assert_eq!(sam.email.as_deref(), Some("sam@example.com"));
+    assert_eq!(secret_of(&v, &sam.id)?["refreshToken"], "r-2");
+    Ok(())
+}
+
+/// A rotation the vault did not follow left the saved login mounted nowhere and the seat holding
+/// a grant the vault does not know. The next look takes the login back: same grant lifetime,
+/// same account, the only such login. Two such logins, or one whose grant expires at another
+/// time, are left alone.
+#[test]
+fn a_login_left_unmounted_by_a_missed_rotation_is_taken_back() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let expiry = Utc::now() + chrono::Duration::days(28);
+    let grant = |refresh: &str, exp: chrono::DateTime<Utc>| {
+        Secret::new(
+            json!({"accessToken": format!("acc-{refresh}"), "refreshToken": refresh,
+            "refreshTokenExpiresAt": exp.timestamp_millis(), "subscriptionType": "max",
+            "accountUuid": "acc-1", "organizationUuid": "org-1"}),
+        )
+    };
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    let acct = json!({"accountUuid": "acc-1", "organizationUuid": "org-1"});
+    v.edit(|tx| {
+        tx.put(
+            &grant("r-1", expiry),
+            Some(acct.clone()),
+            None,
+            Some("sam"),
+            None,
+        )
+    })?;
+    v.edit(|tx| {
+        tx.put(
+            &grant("r-other", expiry - chrono::Duration::days(3)),
+            Some(acct.clone()),
+            None,
+            Some("older"),
+            None,
+        )
+    })?;
+
+    write_grant(&work, "r-2", expiry + chrono::Duration::seconds(1), true)?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    assert_eq!(states[&work.id].saved_as.as_deref(), Some("sam"));
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.mounted, vec![work.id.clone()]);
+    assert_eq!(secret_of(&v, &sam.id)?["refreshToken"], "r-2");
+    assert!(login(&v, "older")?.mounted.is_empty());
+
+    // Two candidates with the same lifetime: which one it is cannot be told.
+    let later = expiry + chrono::Duration::days(1);
+    v.edit(|tx| {
+        tx.put(
+            &grant("r-a", later),
+            Some(acct.clone()),
+            None,
+            Some("a"),
+            None,
+        )
+    })?;
+    v.edit(|tx| {
+        tx.put(
+            &grant("r-b", later),
+            Some(acct.clone()),
+            None,
+            Some("b"),
+            None,
+        )
+    })?;
+    let other = seat(t.path(), "other")?;
+    write_grant(&other, "r-c", later, true)?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&other)))?;
+    assert_eq!(states[&other.id].saved_as, None);
+    assert!(login(&v, "a")?.mounted.is_empty());
+    assert!(login(&v, "b")?.mounted.is_empty());
+    Ok(())
+}
+
+/// Signing out leaves `claudeAiOauth` with empty tokens: no login to save (it used to be saved
+/// as one, named by the fingerprint of an empty string), and the login that was there is no
+/// longer mounted.
+#[test]
+fn a_signed_out_seat_holds_no_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    let creds = json!({"claudeAiOauth": {"accessToken": "", "refreshToken": "",
+        "refreshTokenExpiresAt": 1_797_969_583_375_i64, "subscriptionType": "max"}});
+    std::fs::write(work.credentials_file(), creds.to_string())?;
+    assert!(read_seat(&work)?.secret.is_none());
+    assert_eq!(v.edit(|tx| tx.capture(&work, None))?, None);
+    assert!(login(&v, "alice")?.mounted.is_empty());
+    assert_eq!(v.logins().len(), 1);
+    Ok(())
+}
+
 /// Review L4: reading the seats' state takes no lock and writes nothing, so a report or the
 /// dashboard never waits for (or fails on) another swarmy's change. The dashboard does the
 /// bookkeeping on the side, only when the vault is free.

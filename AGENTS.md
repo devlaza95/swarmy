@@ -157,10 +157,16 @@ logins. Users run it in a spare terminal, mostly on laptops.
   They decide a request's account (`index::SEAT_ACCOUNT_AT`); a seat's login history
   (`seat_accounts`, a change dated when swarmy sees it, never at `profileFetchedAt`) only fills
   in for sessions without one.
-- `.credentials.json`: Claude Code refreshes the access token every few hours and keeps the
-  refresh token, so a login (OAuth grant) is named by the refresh token's fingerprint. A rotated
-  refresh token (same account and plan, fresh access token) is followed as the same login
-  (`vault/seats.rs::is_rotation`), never taken for a new one.
+- `.credentials.json`: a login (OAuth grant) is named by the refresh token's fingerprint. Claude
+  Code (2.1.332) refreshes the access token every few hours and rotates the refresh token on most
+  refreshes; `refreshTokenExpiresAt` stays the grant's (recomputed from its clock, so it moves by
+  a second or so). A rotated refresh token (same account and plan, fresh access token, expiry
+  not earlier beyond that slack) is followed as the same login (`vault/seats.rs::is_rotation`),
+  never taken for a new one; a saved login a missed rotation left mounted nowhere is taken back
+  by the seat holding its grant (`orphan_of`). Grants signed in by recent versions name their
+  account (`accountUuid`, `organizationUuid` in `claudeAiOauth`, `LoginMeta::account`), which
+  confirms the seat without a newer profile. Signing out leaves the object with empty tokens: no
+  login.
 - `sessions/<pid>.json` holds live status (`busy`/`idle`/`waiting` + `waitingFor`), tmux pane and
   `procStart` (check it against `/proc/<pid>/stat` to ignore reused pids). Other terminals and
   multiplexers (Zellij, kitty, WezTerm, iTerm2, Warp) are not recorded there: `claude::proc_env` reads

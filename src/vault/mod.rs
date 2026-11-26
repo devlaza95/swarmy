@@ -5,10 +5,10 @@
 //! whole `antigravity-oauth-token`; an OAuth grant) plus facts about it, named by the fingerprint
 //! of its refresh token. It belongs to one harness and only goes into seats of that harness. A
 //! *seat* is a harness's config dir; one login may be in several seats at once (`mounted`).
-//! Claude Code refreshes the access token every few hours and keeps the refresh token (verified
-//! on 2.1.329), so a saved copy's access token goes stale while the login is in use: the vault
-//! tracks which seat each login is mounted in and, before every change, takes the seat's
-//! current tokens back first. A refresh token that rotates anyway is followed explicitly
+//! Claude Code refreshes the access token every few hours and, on most refreshes, rotates the
+//! refresh token too (verified on 2.1.332), so a saved copy goes stale while the login is in
+//! use: the vault tracks which seat each login is mounted in and, before every change, takes the
+//! seat's current tokens back first. A rotated refresh token is followed explicitly
 //! (`VaultTx::sync_seat`), so the login keeps its identity.
 //!
 //! Secrets live in `vault/secrets.json` with mode 0600 — the same protection Claude Code gives the

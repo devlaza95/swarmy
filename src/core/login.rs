@@ -3,7 +3,9 @@
 //! each harness's reader (`claude::credentials`, `agy::credentials`).
 //!
 //! - Claude Code: the `claudeAiOauth` object of `.credentials.json` (`refreshToken`,
-//!   `expiresAt` in ms, `refreshTokenExpiresAt`, `subscriptionType`, `rateLimitTier`, `scopes`).
+//!   `expiresAt` in ms, `refreshTokenExpiresAt`, `subscriptionType`, `rateLimitTier`, `scopes`;
+//!   grants signed in by Claude Code 2.1.33x also name their account: `accountUuid`,
+//!   `organizationUuid`). A signed-out file keeps the object with empty token strings.
 //! - Antigravity: the whole `antigravity-oauth-token` file (`token.refresh_token`,
 //!   `token.expiry` as RFC 3339, `auth_method`, `id_token_email`).
 //! - Codex: the whole `auth.json` (`tokens.refresh_token`, `tokens.access_token` whose JWT `exp`
@@ -17,6 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::harness::Harness;
+use super::ids::AccountId;
 
 /// The verbatim secret object of a login, tagged with the harness whose format it is in. Debug
 /// shows only the fingerprint; the token strings are wiped when it is dropped.
@@ -98,6 +101,11 @@ pub struct LoginMeta {
     pub access_expires_at: Option<DateTime<Utc>>,
     pub refresh_expires_at: Option<DateTime<Utc>>,
     pub scopes: Vec<String>,
+    /// The account the grant names itself (Claude Code: `accountUuid`/`organizationUuid` in the
+    /// credentials, as an [`AccountId`] string), when it does: unlike the profile in
+    /// `.claude.json`, it can never describe another login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl LoginMeta {
@@ -112,15 +120,14 @@ impl LoginMeta {
 
 fn claude_meta(v: &Value) -> LoginMeta {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let nonempty = |k: &str| v.get(k).and_then(Value::as_str).filter(|x| !x.is_empty());
     let t = |k: &str| {
         v.get(k)
             .and_then(Value::as_i64)
             .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     };
-    let token = v
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .or_else(|| v.get("accessToken").and_then(Value::as_str));
+    // Signing out leaves `""` in both: no grant.
+    let token = nonempty("refreshToken").or_else(|| nonempty("accessToken"));
     LoginMeta {
         fingerprint: token.map(fingerprint).unwrap_or_else(|| NO_TOKEN.into()),
         subscription_type: s("subscriptionType"),
@@ -136,6 +143,11 @@ fn claude_meta(v: &Value) -> LoginMeta {
                     .collect()
             })
             .unwrap_or_default(),
+        account: nonempty("accountUuid").map(|a| {
+            AccountId::of(a, nonempty("organizationUuid"))
+                .as_str()
+                .to_string()
+        }),
     }
 }
 
@@ -164,6 +176,7 @@ fn agy_meta(v: &Value) -> LoginMeta {
         // Google refresh tokens have no fixed lifetime.
         refresh_expires_at: None,
         scopes: Vec::new(),
+        account: None,
     }
 }
 
@@ -204,6 +217,7 @@ fn codex_meta(v: &Value) -> LoginMeta {
             .and_then(|t| Utc.timestamp_opt(t, 0).single()),
         refresh_expires_at: None,
         scopes: Vec::new(),
+        account: None,
     }
 }
 
