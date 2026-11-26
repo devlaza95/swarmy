@@ -3,6 +3,21 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## v0.2.6
+
+Limits and spend follow a vault switch under a running session.
+
+- Fixed: after the vault switched a seat while a Claude Code session ran there, that session's
+  requests and its status-line limit readings stayed on the account it started with. Claude Code
+  (2.1.332) sends the next requests under the new login at once, but keeps naming the old
+  account in its transcript, so the dashboard showed the new account's weekly limit as of its
+  last reading elsewhere (80% while the status line said 91%) and booked the spend to the old
+  account. From a change of the seat's login on, sessions that began before it follow the seat;
+  the change is dated by the vault's switch. Requests booked by the old rule are moved once on
+  the first start (a few seconds).
+- Fixed: the vault forgot when it switched a seat as soon as Claude Code refreshed the new
+  login's token.
+
 ## v0.2.5
 
 Saved Claude Code logins stay in their seats again.
