@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "swarmy"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "chrono",

@@ -3,6 +3,18 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## v0.2.7
+
+One saved login in two seats stays put.
+
+- Fixed: with one saved login in two Claude Code seats, a refresh in one seat rotates its refresh
+  token while the other seat keeps the token from before. The vault took that older token for a
+  rotation too, so the saved login flipped between the two tokens on every look (a "rotated"
+  journal line every half minute, the vault's files and backups rewritten each time) and stayed
+  with whichever seat was looked at last, often the spent token. A rotation now never moves
+  back: the seat with the older token holds another login ("not saved"), and the saved login
+  keeps the newest token.
+
 ## v0.2.6
 
 Limits and spend follow a vault switch under a running session.
