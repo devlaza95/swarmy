@@ -3,6 +3,21 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## v0.2.5
+
+Saved Claude Code logins stay in their seats again.
+
+- Fixed: the vault lost track of a saved Claude Code login after a token refresh. Claude Code
+  2.1.332 rotates the refresh token on most refreshes and writes the grant's expiry again from
+  its own clock, a second or so off; the vault took such a rotation for another login, showed
+  the seat as "not saved" and the saved login in no seat. Rotations are followed again, and a
+  saved login left in no seat by a missed rotation goes back to the seat that holds its grant
+  (same grant lifetime, same account) on the next look, so nothing needs to be saved again.
+- Grants signed in by recent Claude Code versions name their account in `.credentials.json`;
+  the vault reads it, so a seat is confirmed without waiting for Claude Code to fetch the
+  profile again, and a login saved meanwhile keeps its account and email.
+- Fixed: a signed-out seat (empty tokens) was saved as a login.
+
 ## v0.2.4
 
 Fixes from two architecture reviews (wrong numbers, lost logins), a Codex-only dashboard without

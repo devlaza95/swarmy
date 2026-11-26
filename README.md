@@ -120,7 +120,7 @@ platform, with the man page and shell completions. `SHA256SUMS` covers every fil
 **Linux** (any distribution, x86_64 or ARM):
 
 ```sh
-V=0.2.4 T=x86_64-unknown-linux-musl     # other targets in the table below
+V=0.2.5 T=x86_64-unknown-linux-musl     # other targets in the table below
 curl -fLO https://github.com/koorchik/swarmy/releases/download/v$V/swarmy-$V-$T.tar.gz
 tar xzf swarmy-$V-$T.tar.gz && install -m 755 swarmy-$V-$T/swarmy ~/.local/bin/
 ```
@@ -137,8 +137,8 @@ new. The `.deb` and `.rpm` packages wrap the same binary and are installed by ha
 `armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit Raspberry Pi):
 
 ```sh
-sudo apt install ./swarmy_0.2.4-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
-sudo dnf install ./swarmy-0.2.4-1.x86_64.rpm      # Fedora, RHEL, openSUSE
+sudo apt install ./swarmy_0.2.5-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
+sudo dnf install ./swarmy-0.2.5-1.x86_64.rpm      # Fedora, RHEL, openSUSE
 ```
 
 **macOS** (one universal binary for Apple silicon and Intel), with Homebrew:
