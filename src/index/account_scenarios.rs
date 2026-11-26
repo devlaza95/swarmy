@@ -122,6 +122,7 @@ mod tests {
                 seat: w.id("default"),
                 label: "default".into(),
                 account: Some(team),
+                switched_at: None,
                 utilization: Some(weekly(
                     "acc-same/org-team",
                     "2026-11-20T00:00:00Z",
@@ -133,6 +134,7 @@ mod tests {
                 seat: w.id("work"),
                 label: "work".into(),
                 account: Some(max),
+                switched_at: None,
                 utilization: Some(weekly(
                     "acc-same/org-max",
                     "2026-11-20T01:00:00Z",
@@ -212,6 +214,7 @@ mod tests {
                 seat: w.id("default"),
                 label: "default".into(),
                 account: Some(a()),
+                switched_at: None,
                 utilization: Some(weekly(
                     "acc-same/org-shared",
                     "2026-11-20T00:00:00Z",
@@ -223,6 +226,7 @@ mod tests {
                 seat: w.id("work"),
                 label: "work".into(),
                 account: Some(a()),
+                switched_at: None,
                 utilization: Some(weekly(
                     "acc-same/org-shared",
                     "2026-11-20T01:00:00Z",
@@ -259,6 +263,7 @@ mod tests {
         let legacy_seat = SeatInfo {
             seat: w.id("work"),
             label: "work".into(),
+            switched_at: None,
             account: Some(Account {
                 account_uuid: "acc-1".into(),
                 email: Some("a@example.com".into()),
@@ -292,6 +297,7 @@ mod tests {
         let upgraded = SeatInfo {
             seat: w.id("work"),
             label: "work".into(),
+            switched_at: None,
             account: Some(org_account(
                 "acc-1",
                 "org-1",
@@ -414,6 +420,7 @@ mod tests {
             SeatInfo {
                 seat: s_def.clone(),
                 label: "default".into(),
+                switched_at: None,
                 account: Some(org_account(
                     "acc-1",
                     "org-team",
@@ -432,6 +439,7 @@ mod tests {
             SeatInfo {
                 seat: s_wrk.clone(),
                 label: "work".into(),
+                switched_at: None,
                 account: Some(org_account(
                     "acc-1",
                     "org-max",
@@ -504,6 +512,7 @@ mod tests {
         SeatInfo {
             seat: w.id("work"),
             label: "work".into(),
+            switched_at: None,
             account: Some(org_account(
                 "acc-1",
                 org,

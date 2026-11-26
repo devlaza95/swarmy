@@ -93,6 +93,9 @@ statusline -> diag
 statusline -> fleet
 # The reading file is written with fsutil::atomic_write.
 statusline -> fsutil
+# When the vault last switched the seat (`vault::last_switch`): a response after it ran under
+# the seat's login, whatever the session's stale `session-owner` says.
+statusline -> vault
 live -> core
 live -> index
 tui -> agy

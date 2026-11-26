@@ -1114,6 +1114,56 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seen on Claude Code 2.1.332: right after a switch, the running Claude Code refreshes the new
+/// grant and rotates its refresh token. The seat still holds the login the vault put there, so
+/// the switch stays dated (the index and the status line date the login change by it); another
+/// login signed in there ends it.
+#[test]
+fn a_switch_stays_dated_across_a_rotation_of_its_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let spare = seat(t.path(), "spare")?;
+    write_seat(&work, "r-alice", "alice")?;
+    write_seat(&spare, "r-bob", "bob")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.capture(&spare, Some("bob")))?;
+    v.edit(|tx| tx.switch(&work, "bob"))?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert_eq!(st.account_uuid.as_deref(), Some("bob"), "{st:?}");
+    let switched = st.switched_at;
+    assert!(switched.is_some(), "{st:?}");
+
+    let write = |refresh: &str| -> anyhow::Result<()> {
+        let creds = json!({"claudeAiOauth": {
+            "accessToken": format!("acc-{refresh}"), "refreshToken": refresh,
+            "expiresAt": (Utc::now() + chrono::Duration::hours(8)).timestamp_millis()}});
+        std::fs::write(work.credentials_file(), creds.to_string())?;
+        Ok(())
+    };
+    write("r-bob-2")?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert_eq!(
+        st.saved_as.as_deref(),
+        Some("bob"),
+        "the rotation was followed"
+    );
+    assert_eq!(st.switched_at, switched, "{st:?}");
+    // Read paths see the same.
+    assert_eq!(
+        v.seat_states(std::slice::from_ref(&work))?[&work.id].switched_at,
+        switched
+    );
+
+    // A `/login` of someone else: not the vault's login, no switch of the vault's any more.
+    write_seat(&work, "r-carol", "carol")?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    assert_eq!(states[&work.id].switched_at, None, "{:?}", states[&work.id]);
+    Ok(())
+}
+
 /// A grant as Claude Code 2.1.332 writes it after a refresh: a fresh access token, the grant's
 /// own expiry, and (`named`) the account the grant names itself. The profile in `.claude.json`
 /// was read a day ago and names `acc-1/org-1`.

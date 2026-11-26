@@ -69,9 +69,16 @@ impl VaultTx<'_> {
             }
             Some(p) => p.unverified_since.filter(|_| profile_at <= p.profile_at),
         };
+        // The switch stays this seat's while it holds the login the vault put there, rotated or
+        // not (`sync_seat` follows a rotation before this runs); another login ends it.
+        let followed = self
+            .index
+            .logins
+            .iter()
+            .any(|l| l.is_in(&seat.id) && l.meta.fingerprint == fp);
         let switched_at = prev
             .as_ref()
-            .filter(|p| p.fingerprint == fp)
+            .filter(|p| p.fingerprint == fp || followed)
             .and_then(|p| p.switched_at);
         let seen = SeatSeen {
             label: seat.label.clone(),

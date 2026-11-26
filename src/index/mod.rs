@@ -68,12 +68,44 @@ use crate::core::pricing::PriceBook;
 /// the session's `session-owner` record in force at the request (else its first one) decides.
 /// The seat's login history (`seat_accounts`) only fills in for sessions with no owner record:
 /// the login in force at the request, else the seat's earliest known one.
+///
+/// Except after a change of the seat's login (a row naming another account than the row before
+/// it; the seat's first row is no change) for a session that began before it: Claude Code reads
+/// `.credentials.json` again when it changes, so its requests go out under the new login at
+/// once, while its `session-owner` records keep naming the account it started with (verified
+/// on 2.1.332: a vault switch under a running session). From such a change on, the seat's login
+/// decides for that session.
 const SEAT_ACCOUNT_AT: &str = "COALESCE(
+  (SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts
+     AND sa.ts > (SELECT s.first_ts FROM sessions s WHERE s.seat = requests.seat AND s.session_id = requests.session_id)
+     AND (SELECT p.account_uuid FROM seat_accounts p WHERE p.seat = sa.seat AND p.ts < sa.ts ORDER BY p.ts DESC LIMIT 1) <> sa.account_uuid
+     ORDER BY sa.ts DESC LIMIT 1),
   (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat AND o.session_id = requests.session_id AND o.ts <= requests.ts ORDER BY o.ts DESC LIMIT 1),
   (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat AND o.session_id = requests.session_id ORDER BY o.ts ASC LIMIT 1),
   (SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1),
   (SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat ORDER BY sa.ts ASC LIMIT 1),
   requests.account_uuid)";
+
+/// Revision of the rule that picks a request's account (`SEAT_ACCOUNT_AT`); a change
+/// re-attributes every owner-backed request once (`rule_owners`). 2: a login change of the seat
+/// decides for sessions that began before it.
+const OWNER_RULE_REV: &str = "2";
+
+/// When the index was attributed under an older `OWNER_RULE_REV`, the next refresh attributes
+/// the requests with owner records again (`accounts::OWNERS_PENDING`). An index with no requests
+/// yet has nothing to move.
+fn rule_owners(conn: &Connection) -> rusqlite::Result<()> {
+    if schema::meta(conn, "owner_rule_rev")?.as_deref() == Some(OWNER_RULE_REV) {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let any: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM requests)", [], |r| r.get(0))?;
+    if any {
+        schema::set_meta(&tx, accounts::OWNERS_PENDING, "1")?;
+    }
+    schema::set_meta(&tx, "owner_rule_rev", OWNER_RULE_REV)?;
+    tx.commit()
+}
 
 /// Revision of the cwd → project rules; a change recomputes the `projects` table.
 const PROJECTS_REV: &str = "5";
@@ -229,6 +261,9 @@ pub struct SeatInfo {
     pub label: String,
     pub account: Option<Account>,
     pub utilization: Option<Utilization>,
+    /// When the vault last switched the seat's login: the moment a change of its account
+    /// happened, which swarmy would otherwise only date when it sees it.
+    pub switched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -354,6 +389,7 @@ impl Index {
         // Facts migrate, the cache is rebuilt when its version changed; requests read again
         // then follow their seat's login history like any new request (`post_pass`).
         schema::migrate(&conn)?;
+        rule_owners(&conn)?;
         Ok(Index {
             conn,
             session_dirs: HashMap::new(),
@@ -956,6 +992,7 @@ mod tests {
         let info = [SeatInfo {
             seat: Default::default(),
             label: "work".into(),
+            switched_at: None,
             account: Some(crate::index::scenarios::account(
                 "acc-a",
                 "2026-10-01T00:00:00Z",

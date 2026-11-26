@@ -155,8 +155,13 @@ logins. Users run it in a spare terminal, mostly on laptops.
   (`index::write::takes_over`), so any read order gives the same rows.
 - `session-owner` records give the account per turn; subagent files inherit it from the session.
   They decide a request's account (`index::SEAT_ACCOUNT_AT`); a seat's login history
-  (`seat_accounts`, a change dated when swarmy sees it, never at `profileFetchedAt`) only fills
-  in for sessions without one.
+  (`seat_accounts`, a change dated by the vault's switch, else when swarmy sees it, never at
+  `profileFetchedAt`) fills in for sessions without one. They go stale when the seat's login
+  changes under a running session (verified on 2.1.332): Claude Code reads `.credentials.json`
+  again and sends the next requests under the new login, but keeps writing owner records of the
+  account it started with. So after a change of the seat's account, a session begun before it
+  follows the seat (`OWNER_RULE_REV`); the vault keeps `switched_at` across rotations of the
+  login it put there.
 - `.credentials.json`: a login (OAuth grant) is named by the refresh token's fingerprint. Claude
   Code (2.1.332) refreshes the access token every few hours and rotates the refresh token on most
   refreshes; `refreshTokenExpiresAt` stays the grant's (recomputed from its clock, so it moves by
@@ -180,7 +185,9 @@ logins. Users run it in a spare terminal, mostly on laptops.
   are exact. `swarmy statusline` must stay fast (no index, no scan): it writes
   `<data>/statusline/<seat id>.json` (`SeatId`) and prints one line. A reading (`v` 2) names
   its account (the owner of the session's last response, read from the transcript's tail only
-  when the numbers moved; else the seat's `oauthAccount`) and the time its numbers were true (that
+  when the numbers moved; else the seat's `oauthAccount`; for a response after the vault's last
+  switch of the seat, `vault::last_switch`, the seat's `oauthAccount`, or no reading while the
+  vault has not confirmed it) and the time its numbers were true (that
   response's time; a repeat never moves it, an older reading never goes over a newer one). The
   dashboard merges a reading only into the seat's account it names, when newer than
   `.claude.json`'s. `setup` writes only `settings.json` (backup

@@ -1024,6 +1024,7 @@ mod tests {
             seat: Default::default(),
             label: label.into(),
             account: Some(account(acc, since)),
+            switched_at: None,
             utilization: None,
         })
         .collect()

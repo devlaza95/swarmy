@@ -278,8 +278,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     v.edit(|tx| tx.switch(lab, "alex-work"))?;
                 }
             }
-            // Account names come from the saved logins just made.
-            ctx.check_unconfirmed();
+            // What the seats say now (the lab seat holds the work login), with account names
+            // from the saved logins just made: the index then sees the wall's seats as they are
+            // from its first pass, not a login change under the lab seat's sessions a while later.
+            ctx.reload_seat_info()?;
             match record {
                 Some(out) => {
                     let (w, h) = size

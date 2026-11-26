@@ -424,6 +424,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(login),
+            switched_at: None,
             utilization: None,
         }];
         w.append("work", "s1", &[line("m2", now)]);

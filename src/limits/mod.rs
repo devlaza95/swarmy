@@ -363,6 +363,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly("acc-a", fetched, used, resets)),
         };
         let mut idx = w.index("i.sqlite");
@@ -428,6 +429,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly("acc-a", fetched, used, resets)),
         };
         // Two readings stored over time: 10% at 11-18 00:00, 30% at 11-20 00:00.
@@ -510,6 +512,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly(
                 "acc-a",
                 "2026-11-20T00:00:00Z",
@@ -585,6 +588,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly("acc-a", fetched, used, resets)),
         };
         let mut idx = w.index("i.sqlite");
@@ -649,6 +653,7 @@ mod tests {
             seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            switched_at: None,
             utilization: Some(weekly("acc-a", fetched, used, resets)),
         };
         let mut idx = w.index("i.sqlite");
@@ -695,12 +700,14 @@ mod tests {
                     seat: w.id("work"),
                     label: "work".into(),
                     account: Some(acct("acc-a", "a@example.com")),
+                    switched_at: None,
                     utilization: Some(weekly("acc-a", fetched, used, resets)),
                 },
                 SeatInfo {
                     seat: w.id("home"),
                     label: "home".into(),
                     account: Some(acct("acc-b", "b@example.com")),
+                    switched_at: None,
                     utilization: Some(weekly("acc-b", fetched, 10.0, resets)),
                 },
             ]

@@ -277,6 +277,7 @@ impl Ctx {
         let states = v.seat_states(&vault_seats)?;
         for si in &mut self.seat_info {
             if let Some(st) = states.get(&si.seat) {
+                si.switched_at = st.switched_at;
                 if st.unverified_since.is_some() {
                     si.account = None;
                     si.utilization = None;
@@ -340,6 +341,7 @@ impl Ctx {
                 seat: s.id.clone(),
                 label: s.label.clone(),
                 account: cj.account,
+                switched_at: None,
                 utilization: cj.utilization,
             });
         }
@@ -819,6 +821,7 @@ pub fn seat_info_of(
             SeatInfo {
                 seat: s.id.clone(),
                 label: s.label.clone(),
+                switched_at: None,
                 account,
                 utilization: None,
             },
@@ -854,6 +857,7 @@ pub fn seat_info_of(
             seat: s.id.clone(),
             label: s.label.clone(),
             account: cj.account,
+            switched_at: None,
             utilization,
         },
         cj.model_costs,
