@@ -168,8 +168,9 @@ impl VaultTx<'_> {
     ///
     /// One grant in several seats: each seat refreshes its own access token, and the saved copy
     /// takes whichever is newer (`keep_current`). Should one seat rotate the refresh token, the
-    /// login follows that seat; the others then hold a token the vault no longer knows ("not
-    /// saved"), which the next switch saves first like any other.
+    /// login follows that seat; the others then hold an older token the vault no longer knows
+    /// ("not saved", never a rotation: [`is_rotation`] never moves back), which the next
+    /// switch saves first like any other.
     pub(super) fn sync_seat(&mut self, seat: &Seat, s: &SeatLogin) {
         let mounted = self
             .index
@@ -352,7 +353,12 @@ fn expiry_slack() -> chrono::Duration {
 /// - the access token was fresh when the file was written (Claude Code writes new tokens only;
 ///   a backup copied in carries an old one);
 /// - the grant does not expire before the saved one (a rotation never shortens it; see
-///   [`expiry_slack`]).
+///   [`expiry_slack`]);
+/// - it is not older than the saved copy: its access token does not expire earlier (a refresh
+///   issues the next one; Codex's expiry has whole seconds). With one grant in two seats, the
+///   seat that did not refresh still holds the token from before, which passes every other
+///   test; taken for a rotation, it sent the saved login back to that token, and the next look
+///   at the other seat forward again, on every look.
 fn is_rotation(mounted: &Login, old: &LoginMeta, new: &LoginMeta, s: &SeatLogin) -> bool {
     let same_account = if let (Some(a), Some(b)) = (&old.account, &new.account) {
         a == b
@@ -375,5 +381,9 @@ fn is_rotation(mounted: &Login, old: &LoginMeta, new: &LoginMeta, s: &SeatLogin)
         .refresh_expires_at
         .zip(new.refresh_expires_at)
         .is_none_or(|(old, new)| new + expiry_slack() >= old);
-    same_account && same_plan && fresh && not_shorter
+    let forward = old
+        .access_expires_at
+        .zip(new.access_expires_at)
+        .is_none_or(|(old, new)| new >= old);
+    same_account && same_plan && fresh && not_shorter && forward
 }

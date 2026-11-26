@@ -1164,6 +1164,65 @@ fn a_switch_stays_dated_across_a_rotation_of_its_login() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seen on Claude Code 2.1.332: one saved login in two seats, and the Claude Code of one of them
+/// refreshes it and rotates the refresh token. The other seat still holds the token from before,
+/// which looks like a rotation too (same account, same grant expiry, an access token that was
+/// fresh when written), so the saved login used to follow each seat in turn, flipping between
+/// the two tokens on every look (journal and backups filled with "rotated"), and kept whichever
+/// seat was looked at last, the spent token as often as the live one. A rotation only moves
+/// forward: the login follows the seat whose access token is newer, and the other seat's older
+/// token is another login ("not saved"), in whichever order the seats are looked at.
+#[test]
+fn one_login_in_two_seats_follows_the_rotation_and_never_flips_back() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let spare = seat(t.path(), "spare")?;
+    let grant_expires = Utc::now() + chrono::Duration::days(20);
+    let write = |s: &Seat, refresh: &str, access_expires: chrono::DateTime<Utc>| {
+        let creds = json!({"claudeAiOauth": {
+            "accessToken": format!("acc-{refresh}"), "refreshToken": refresh,
+            "expiresAt": access_expires.timestamp_millis(),
+            "refreshTokenExpiresAt": grant_expires.timestamp_millis()}});
+        std::fs::write(s.credentials_file(), creds.to_string())
+    };
+    write_seat(&spare, "r-bob", "bob")?;
+    write(&work, "r-1", Utc::now() + chrono::Duration::hours(2))?;
+    let cj = json!({"oauthAccount": {"accountUuid": "alice", "emailAddress": "alice@example.com"}});
+    std::fs::write(&work.claude_json, cj.to_string())?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.capture(&spare, Some("bob")))?;
+    v.edit(|tx| tx.switch(&spare, "alice"))?;
+    let both = [work.clone(), spare.clone()];
+    v.edit(|tx| tx.seat_states(&both))?;
+    assert_eq!(login(&v, "alice")?.mounted.len(), 2, "one login, two seats");
+
+    // The work seat's Claude Code refreshes: a new refresh token, a later access token.
+    write(&work, "r-2", Utc::now() + chrono::Duration::hours(8))?;
+    let journal_file = v.dir.join("journal.log");
+    let journal = || std::fs::read_to_string(&journal_file).unwrap_or_default();
+    let before = journal().matches("rotated").count();
+    for order in [[&work, &spare], [&spare, &work], [&work, &spare]] {
+        let seats = [order[0].clone(), order[1].clone()];
+        let states = v.edit(|tx| tx.seat_states(&seats))?;
+        assert_eq!(states[&work.id].saved_as.as_deref(), Some("alice"));
+        assert_eq!(
+            states[&spare.id].saved_as, None,
+            "the older token is not saved"
+        );
+        let alice = login(&v, "alice")?.clone();
+        assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-2");
+        assert_eq!(alice.mounted, vec![work.id.clone()]);
+    }
+    assert_eq!(
+        journal().matches("rotated").count() - before,
+        1,
+        "{}",
+        journal()
+    );
+    Ok(())
+}
+
 /// A grant as Claude Code 2.1.332 writes it after a refresh: a fresh access token, the grant's
 /// own expiry, and (`named`) the account the grant names itself. The profile in `.claude.json`
 /// was read a day ago and names `acc-1/org-1`.
