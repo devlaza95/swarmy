@@ -330,7 +330,24 @@ mod tests {
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
-            let mut two = idx.spend_per_minute_by_model(start).unwrap();
+            let hour_from = start + Duration::seconds(25);
+            let burn = idx.spend_per_minute_by_model(start, hour_from).unwrap();
+            let mut two = burn.minutes;
+            let mut hour_one: Vec<(String, f64)> = c
+                .prepare("SELECT model, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1")
+                .unwrap()
+                .query_map([ms(hour_from)], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut hour_two = burn.hour;
+            hour_one.sort_by(|a, b| a.0.cmp(&b.0));
+            hour_two.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(hour_one.len(), hour_two.len(), "{when}");
+            for (a, b) in hour_one.iter().zip(&hour_two) {
+                assert_eq!(a.0, b.0, "{when}");
+                assert!(close(a.1, b.1), "{when}");
+            }
             one.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
             two.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
             assert_eq!(one.len(), two.len(), "{when}");

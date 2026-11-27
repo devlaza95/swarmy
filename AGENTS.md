@@ -27,6 +27,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - **No personal data in git**: no real home paths, user names, emails, account UUIDs or real config
   dir names in code, tests, fixtures, docs or screenshots. Tests use synthetic data; screenshots and
   GIFs come only from `swarmy demo`. Check the staged diff before every commit.
+- **Every fix comes with a test.** It fails before the fix and passes after it, in the same
+  change, on synthetic data. A fix without one is not done.
 - **Never test the vault on real config dirs.** Use temp dirs (see `src/vault/tests.rs`) or a fake
   `HOME`.
 - **Battery budget.** The dashboard must stay around 2 CPU-seconds per minute (≈3.4% of one core)

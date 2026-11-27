@@ -193,24 +193,31 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
     let legend_of: Vec<(String, Color)> =
         series.iter().map(|s| (s.name.clone(), s.colour)).collect();
     let track = th.track;
+    // The chart slides with the clock: the bins are clock minutes, shifted left by how far the
+    // current minute has gone, one dot at a time.
+    let offset = app.snapshot.taken_at.map_or(0.0, crate::live::burn_offset);
+    let totals = minute_totals(burn);
+    let dots = chart.width as usize * 2;
+    let bins = dot_bins(dots, offset, &totals);
+    let right = dots.saturating_sub(1) as f64;
     let canvas = Canvas::default()
         .marker(Marker::Braille)
-        .x_bounds([0.0, 60.0])
+        .x_bounds([0.0, right])
         .y_bounds([0.0, max])
         .background_color(th.bg)
         .paint(move |ctx| {
             // The baseline first: a braille cell takes the colour of what was drawn in it last,
             // so a baseline drawn over the bars would grey their lowest cell.
-            ctx.draw(&CLine::new(0.0, 0.0, 60.0, 0.0, track));
-            for i in 0..60 {
+            ctx.draw(&CLine::new(0.0, 0.0, right, 0.0, track));
+            for (d, bin) in bins.iter().enumerate() {
+                let Some(i) = *bin else { continue };
+                let x = d as f64;
                 let mut y0 = 0.0;
                 for s in &series {
-                    let v = s.minutes[i];
+                    let v = s.minutes.get(i).copied().unwrap_or(0.0);
                     let y1 = y0 + v;
                     if v > 0.0 {
-                        for dx in [0.0, 0.33, 0.66] {
-                            ctx.draw(&CLine::new(i as f64 + dx, y0, i as f64 + dx, y1, s.colour));
-                        }
+                        ctx.draw(&CLine::new(x, y0, x, y1, s.colour));
                     }
                     y0 = y1;
                 }
@@ -308,11 +315,47 @@ fn pack(
     (rows, 0)
 }
 
+/// The spend of each minute, all models together.
+fn minute_totals(burn: &BTreeMap<String, Vec<f64>>) -> Vec<f64> {
+    let n = burn.values().map(Vec::len).max().unwrap_or(0);
+    (0..n)
+        .map(|i| burn.values().filter_map(|v| v.get(i)).sum::<f64>())
+        .collect()
+}
+
 /// The largest minute of all models together: the top of the chart.
 fn peak_minute(burn: &BTreeMap<String, Vec<f64>>) -> f64 {
-    (0..60)
-        .map(|i| burn.values().filter_map(|v| v.get(i)).sum::<f64>())
-        .fold(0.0, f64::max)
+    minute_totals(burn).into_iter().fold(0.0, f64::max)
+}
+
+/// The minute each of `dots` dot columns shows, `None` for none. The chart spans the last 60
+/// minutes; minute `i` covers `[i, i + 1)` of it moved left by `offset` (how far the current
+/// minute has gone), so the bars slide a dot at a time instead of jumping once a minute. A dot
+/// shows the minute under its centre; with three dots or more per minute, the last dot of each
+/// minute stays empty, a gap between the bars. With fewer dots than minutes, a dot shows the
+/// largest of the minutes it covers, so no peak falls between two dots.
+fn dot_bins(dots: usize, offset: f64, totals: &[f64]) -> Vec<Option<usize>> {
+    let per = 60.0 / dots.max(1) as f64; // minutes per dot
+    let at = |u: f64| -> Option<usize> {
+        let i = u.floor();
+        (i >= 0.0 && (i as usize) < totals.len()).then_some(i as usize)
+    };
+    let centre = |d: usize| offset + (d as f64 + 0.5) * per;
+    (0..dots)
+        .map(|d| {
+            if per <= 1.0 {
+                let i = at(centre(d))?;
+                // The last dot of its minute is the gap, when a minute has room for one.
+                let gap = per <= 1.0 / 3.0 && d + 1 < dots && at(centre(d + 1)) != Some(i);
+                (!gap).then_some(i)
+            } else {
+                let u0 = offset + d as f64 * per;
+                let first = u0.floor().max(0.0) as usize;
+                let last = ((u0 + per).ceil() as usize).min(totals.len());
+                (first..last).max_by(|a, b| totals[*a].total_cmp(&totals[*b]))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -323,7 +366,7 @@ mod tests {
 
     /// $ per minute: `at` lists (minute, dollars), the rest spent nothing.
     fn minutes(at: &[(usize, f64)]) -> Vec<f64> {
-        let mut m = vec![0.0; 60];
+        let mut m = vec![0.0; crate::live::BURN_MINUTES];
         for (i, c) in at {
             m[*i] = *c;
         }
@@ -332,6 +375,16 @@ mod tests {
 
     /// The BURN panel alone, drawn into a `w`×`h` buffer from these families' minutes.
     fn draw(w: u16, h: u16, burn: &[(&str, Vec<f64>)]) -> (Buffer, Theme) {
+        draw_at(w, h, burn, None)
+    }
+
+    /// The same, with the snapshot taken at `at` (how far the chart slid into the minute).
+    fn draw_at(
+        w: u16,
+        h: u16,
+        burn: &[(&str, Vec<f64>)],
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (Buffer, Theme) {
         let t = tempfile::tempdir().unwrap();
         let mut app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
         app.boot = None;
@@ -339,7 +392,12 @@ mod tests {
             .iter()
             .map(|(n, v)| (n.to_string(), v.clone()))
             .collect();
+        app.snapshot.burn_hour = burn
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.iter().sum()))
+            .collect();
         app.snapshot.burn_per_hour = burn.iter().flat_map(|(_, v)| v).sum();
+        app.snapshot.taken_at = at;
         let th = app.theme;
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| super::burn(f, &mut app, f.area())).unwrap();
@@ -563,5 +621,83 @@ mod tests {
         let (small, _) = draw(50, 8, &burn);
         let s = text(&small);
         assert!(s.contains("fable-5.2 $30.00/h · opus-5.5 $15.00/h"), "{s}");
+    }
+
+    /// The dots of each minute, in order: the dot columns that show it.
+    fn dots_of(bins: &[Option<usize>], minute: usize) -> Vec<usize> {
+        (0..bins.len())
+            .filter(|d| bins[*d] == Some(minute))
+            .collect()
+    }
+
+    /// The bars slide with the clock a dot at a time: the chart used to step a column a
+    /// minute (and stood still between). 4 dots a minute: minute 30 is on dots 120–122 at the
+    /// turn of the minute (123 is the gap), on 118–120 half a minute later, and the current
+    /// minute (60) comes in at the right edge.
+    #[test]
+    fn the_bars_slide_with_the_clock() {
+        let totals = vec![1.0; crate::live::BURN_MINUTES];
+        let at0 = dot_bins(240, 0.0, &totals);
+        assert_eq!(dots_of(&at0, 30), vec![120, 121, 122]);
+        assert_eq!(at0[123], None, "the gap after minute 30");
+        assert!(
+            dots_of(&at0, 60).is_empty(),
+            "the current minute has just begun"
+        );
+        assert_eq!(dots_of(&at0, 0), vec![0, 1, 2]);
+        let half = dot_bins(240, 0.5, &totals);
+        assert_eq!(dots_of(&half, 30), vec![118, 119, 120]);
+        assert_eq!(
+            dots_of(&half, 60),
+            vec![238, 239],
+            "half of the current minute"
+        );
+        assert_eq!(dots_of(&half, 0), vec![0], "the oldest minute is half out");
+        // Every minute fully in the chart is a bar of three dots and a gap.
+        for i in 1..60 {
+            assert_eq!(dots_of(&half, i).len(), 3, "minute {i}");
+        }
+    }
+
+    /// With fewer dots than minutes, a dot shows the largest minute it covers: a lone peak
+    /// is never lost between two dots.
+    #[test]
+    fn a_narrow_chart_keeps_its_peaks() {
+        for peak in [0, 17, 31, 44, 59] {
+            let mut totals = vec![0.1; crate::live::BURN_MINUTES];
+            totals[peak] = 5.0;
+            for offset in [0.0, 0.3, 0.9] {
+                let bins = dot_bins(40, offset, &totals);
+                if peak == 0 && offset > 0.0 {
+                    continue; // partly out already, may be cut
+                }
+                assert!(bins.contains(&Some(peak)), "{peak} at {offset}: {bins:?}");
+            }
+        }
+    }
+
+    /// Drawn, the bar of one minute moves left as the minute goes on.
+    #[test]
+    fn the_drawn_bar_moves_left_within_the_minute() {
+        use chrono::TimeZone;
+        let minute = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 27, 12, 0, 0)
+            .unwrap();
+        let one = minutes(&[(30, 1.0)]);
+        let first_x = |s: u32| {
+            let at = minute + chrono::Duration::seconds(s.into());
+            let (buf, _) = draw_at(200, 30, &[("opus-5.5", one.clone())], Some(at));
+            let y = bottom_row(&buf) - 2;
+            (0..buf.area.width)
+                .find(|x| {
+                    buf[(*x, y)]
+                        .symbol()
+                        .chars()
+                        .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+                })
+                .expect("the bar")
+        };
+        let (x0, x30, x59) = (first_x(0), first_x(30), first_x(59));
+        assert!(x30 < x0 && x59 < x30, "{x0} > {x30} > {x59}");
     }
 }

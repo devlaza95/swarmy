@@ -442,8 +442,8 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let fresh = s
         .taken_at
         .is_some_and(|t| (Utc::now() - t).num_milliseconds() < 2500);
-    let total_burn: Vec<f64> = (0..60)
-        .map(|i| s.burn.values().map(|v| v[i]).sum())
+    let total_burn: Vec<f64> = (0..crate::live::BURN_MINUTES)
+        .map(|i| s.burn.values().filter_map(|v| v.get(i)).sum())
         .collect();
     let n = |p: &dyn Fn(&State) -> bool| s.count(p);
     let needs = n(&|x| matches!(x, State::NeedsYou(_)));
@@ -477,7 +477,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     ));
     groups.push(("spark", spans.len()));
     if area.width >= 170 {
-        spans.push(spark(&total_burn[36..], th.accent));
+        spans.push(spark(&total_burn[total_burn.len() - 24..], th.accent));
     }
     groups.push(("agents", spans.len()));
     spans.push(Span::styled(

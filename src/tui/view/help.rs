@@ -196,6 +196,11 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             th.accent,
             "SWARM lanes, a minute each: thinking · tool · agents · you",
         ),
+        row(
+            "▀▀▀▀",
+            th.accent,
+            "HISTORY heat map: a strip per weekday, an hour per cell, brighter = more spend",
+        ),
         head("alerts and events"),
         row("⊘", th.warn, "a weekly or 5-hour limit is close or reached"),
         row(

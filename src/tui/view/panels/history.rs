@@ -198,6 +198,9 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
     let cw = (((heat.width as usize).saturating_sub(4)) / 24).max(1);
     let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let mut lines = Vec::new();
+    // A strip per weekday: its hours touch, and the upper half block leaves a gap under each
+    // strip. With a gap between the hours and none between the days, the cells lined up as
+    // columns and read as days.
     for d in [1, 2, 3, 4, 5, 6, 0] {
         let mut spans = vec![Span::styled(format!("{} ", names[d]), faint(app))];
         for hh in grid[d] {
@@ -207,29 +210,21 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 th.fade(th.accent, 0.85 - k * 0.85)
             };
-            let cell = if cw >= 2 {
-                format!("{} ", "█".repeat(cw - 1))
-            } else {
-                "■".into()
-            };
-            spans.push(Span::styled(cell, Style::new().fg(c)));
+            spans.push(Span::styled(HEAT_CELL.repeat(cw), Style::new().fg(c)));
         }
         lines.push(Line::from(spans));
     }
-    let mut hours = String::from("    ");
-    for hh in 0..24 {
-        let l = if hh % 6 == 0 {
-            hh.to_string()
-        } else {
-            String::new()
-        };
-        hours.push_str(&fit(&l, cw));
-    }
-    lines.push(Line::from(Span::styled(hours, faint(app))));
+    lines.push(Line::from(Span::styled(
+        format!("    {}", hour_ticks(cw)),
+        faint(app),
+    )));
     // Colour key of the heat map.
     let mut key = vec![Span::styled("    less ", faint(app))];
     for k in [0.85f32, 0.6, 0.35, 0.0] {
-        key.push(Span::styled("█", Style::new().fg(th.fade(th.accent, k))));
+        key.push(Span::styled(
+            HEAT_CELL,
+            Style::new().fg(th.fade(th.accent, k)),
+        ));
     }
     key.push(Span::styled(
         " more · spend per hour, last 4 weeks, local time",
@@ -237,4 +232,85 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
     ));
     lines.push(Line::from(key));
     put(f, heat, lines);
+}
+
+/// One hour of a weekday's strip in the heat map.
+const HEAT_CELL: &str = "▀";
+
+/// The hours under the heat map's strips, `cw` columns an hour: every third hour when the
+/// labels fit, else every sixth, each label at its hour's first column.
+fn hour_ticks(cw: usize) -> String {
+    let step = if cw >= 2 { 3 } else { 6 };
+    let mut out = String::new();
+    for hh in (0..24).step_by(step) {
+        let at = hh * cw;
+        if out.chars().count() < at {
+            out.push_str(&" ".repeat(at - out.chars().count()));
+        } else if !out.is_empty() {
+            continue;
+        }
+        out.push_str(&hh.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::buffer::Buffer;
+
+    /// The panel alone with spend in every hour of every weekday.
+    fn draw(w: u16, h: u16) -> Buffer {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
+        app.boot = None;
+        app.analytics.heat = (0..7)
+            .flat_map(|d| (0..24).map(move |h| (d.to_string(), h.to_string(), 1.0 + h as f64)))
+            .collect();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| history(f, &mut app, f.area())).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// A weekday's row of the heat map is one unbroken strip of half blocks: the cells had a
+    /// space after each hour and full blocks that touched the rows above and below, so the
+    /// hours lined up as columns and read as days.
+    #[test]
+    fn the_heat_map_is_a_strip_per_weekday() {
+        for (w, h) in [(60, 30), (110, 30), (34, 30)] {
+            let buf = draw(w, h);
+            let rows: Vec<String> = (0..h).map(|y| row(&buf, y)).collect();
+            let strips: Vec<&String> = ["Mon ", "Tue ", "Sun "]
+                .iter()
+                .map(|d| rows.iter().find(|r| r.contains(d)).expect(d))
+                .collect();
+            let cw = ((w as usize - 2 - 4) / 24).max(1);
+            for r in strips {
+                let cells = r.split_once(' ').unwrap().1;
+                assert!(
+                    cells.starts_with(&HEAT_CELL.repeat(24 * cw)),
+                    "{w}x{h}: 24 hours of {cw} touching cells: {r:?}"
+                );
+                assert!(!r.contains('█') && !r.contains('■'), "{r:?}");
+            }
+        }
+    }
+
+    /// The hours under the strips: every third one when there is room, each at its column.
+    #[test]
+    fn hour_ticks_sit_under_their_hours() {
+        assert_eq!(
+            hour_ticks(2),
+            "0     3     6     9     12    15    18    21"
+        );
+        assert_eq!(hour_ticks(1), "0     6     12    18");
+        let t = hour_ticks(4);
+        assert_eq!(t.find("12"), Some(12 * 4));
+        assert_eq!(t.find("21"), Some(21 * 4));
+    }
 }
