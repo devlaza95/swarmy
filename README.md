@@ -177,7 +177,7 @@ Then:
 ```sh
 swarmy demo      # try it on a made-up world first; nothing of yours is read
 swarmy           # the live dashboard
-swarmy doctor    # what it found: config dirs, transcripts, index, limits
+swarmy doctor    # what it found (dirs, transcripts, index, limits) and the next steps
 swarmy setup     # optional: the status line (exact limits) and saved logins
 ```
 

@@ -7,6 +7,7 @@ pub mod explain;
 pub mod guide;
 pub mod limits;
 pub mod models;
+pub mod next_steps;
 pub mod prices;
 pub mod report;
 pub mod setup;
