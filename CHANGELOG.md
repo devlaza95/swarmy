@@ -15,6 +15,16 @@ Plain-language help, a clearer agent card, and a browser view.
   Code live sessions only.
 - Changed: the AGENT card says in words what its state means and what to do about it, shows
   when the agent was last seen, and shows the Claude Code process's CPU and memory.
+- Added: the web view's expanded agent row shows a tool timeline (its latest tool calls with
+  result and duration) and two strips over the agent's life: cost per slice of time, and how
+  full the context was, with a marker where it was compacted. Fetched only for open rows
+  (`GET /api/agent`).
+- Added: a glossary page in the `?` help of the terminal dashboard (Tab turns the pages), the
+  same terms as `swarmy explain`.
+- Added: `swarmy doctor` ends with a NEXT STEPS list: for each problem it found, what it means
+  and the exact command or setting that fixes it.
+- Changed: the web table stays readable in narrow windows (the Project and Activity columns
+  hide below 1280 px and the table scrolls instead of clipping).
 - Changed: `limits` and `report` build their numbers in `app::views`, which the web view reuses.
 
 ## v0.2.8
