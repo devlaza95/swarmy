@@ -3,6 +3,19 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## v0.2.8
+
+BURN moves with the clock; the HISTORY heat map reads by weekday.
+
+- Fixed: BURN counted its minutes from the current second, so every second a few requests moved
+  into the next bar. The bars jittered while the chart crept one column a minute and looked
+  still. The bars are now clock minutes: the chart slides left a dot at a time as the minute
+  goes on, the current minute grows in at the right edge, and on a wide panel each minute is a
+  solid bar with a gap. The rates beside it are still the last 60 minutes to the second.
+- Changed: the weekday × hour heat map in HISTORY drew every hour as a block and a space, so the
+  hours lined up as columns and read as days. Each weekday is now one strip with a gap under
+  it, the hours ticked every three when they fit.
+
 ## v0.2.7
 
 One saved login in two seats stays put.
