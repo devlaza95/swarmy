@@ -14,27 +14,7 @@ pub fn text_width() -> usize {
         .clamp(60, 100)
 }
 
-/// Greedy word wrap on display width. The first line may be `first` columns wide, the others
-/// `rest` (a caller that indents its continuation lines passes the narrower width). Lines come
-/// back without indentation; the caller joins them with its own.
-pub fn wrap(text: &str, first: usize, rest: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let room = if lines.is_empty() { first } else { rest };
-        if !cur.is_empty() && cur.width() + 1 + word.width() > room {
-            lines.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(word);
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
+pub use crate::ui::table::wrap;
 
 /// `name` padded to `name_w`, then `text` wrapped to what is left of `width`, continuation
 /// lines aligned under the first.

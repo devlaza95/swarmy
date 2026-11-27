@@ -1,6 +1,6 @@
 //! Screen composition: the wall (large terminals), the column (medium) and tabs (small), plus
-//! the header and the footer. Overlays (dialogs, toast) are in `overlays.rs`, help and the
-//! legend in `help.rs`.
+//! the header and the footer. Overlays (dialogs, toast) are in `overlays.rs`, help (keys, legend
+//! and glossary pages) in `help.rs`.
 
 mod help;
 mod kit;

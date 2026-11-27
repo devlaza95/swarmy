@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
+mod help;
 mod keys;
 mod limits;
 
@@ -32,6 +33,7 @@ use crate::index::query::Dim;
 use crate::live::{Agent, Snapshot, ToolLine};
 use crate::ui::fmt;
 use crate::vault::{Vault, VaultTx};
+pub use help::{GlossaryAt, HelpPage};
 
 /// Every panel; the number is the key that focuses it and appears in its title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,8 +232,12 @@ pub struct App {
     pub focus: Panel,
     pub zoom: Option<Panel>,
     pub help: bool,
-    /// Help page on small screens: 0 keys, 1 legend (both side by side on wide ones).
-    pub help_page: u8,
+    /// The open help page (keys and legend share one on wide screens).
+    pub help_page: HelpPage,
+    /// Set by drawing the help: the screen is wide enough for keys and legend side by side.
+    pub help_wide: bool,
+    /// The glossary page: the selected term and the first row shown.
+    pub glossary: GlossaryAt,
     /// The ATTENTION item `n`/`N` went to last; the first press starts at the top.
     attn_jumped: Option<usize>,
     pub boot: Option<Boot>,
@@ -307,7 +313,9 @@ impl App {
             focus: Panel::Swarm,
             zoom: None,
             help: false,
-            help_page: 0,
+            help_page: HelpPage::Keys,
+            help_wide: false,
+            glossary: GlossaryAt::default(),
             attn_jumped: None,
             boot: Some(Boot {
                 started: Instant::now(),

@@ -90,7 +90,7 @@ pub enum Command {
         frames: usize,
         #[arg(long, hide = true, default_value = "140x40")]
         size: String,
-        /// Keys to press while recording: `frame:key,frame:key` (key `enter`, `esc` or a character).
+        /// Keys to press while recording: `frame:key,frame:key` (key `enter`, `esc`, `tab` or a character).
         #[arg(long, hide = true, default_value = "")]
         keys: String,
         /// The load of a busy 4K wall (three seats, ten days of history, about 18 agents at
@@ -284,6 +284,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                             let c = match k {
                                 "enter" => '\n',
                                 "esc" => '\x1b',
+                                "tab" => '\t',
                                 k => k.chars().next()?,
                             };
                             Some((f.parse().ok()?, c))

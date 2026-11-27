@@ -14,6 +14,39 @@ const GROUPS: [Dim; 8] = [
     Dim::Session,
 ];
 
+/// What a key does while the help is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpKey {
+    /// The next / previous page.
+    Next,
+    Prev,
+    Close,
+    /// `?` again: the legend on a small screen, else close.
+    Question,
+    /// The glossary's selection, by this many terms.
+    Move(isize),
+}
+
+/// The keys of the help overlay, as a table: a key that is not here does nothing. A page is
+/// 8 terms for PgUp / PgDn; Home and End go past either end and stop there.
+const HELP_KEYS: &[(KeyCode, HelpKey)] = &[
+    (KeyCode::Tab, HelpKey::Next),
+    (KeyCode::Right, HelpKey::Next),
+    (KeyCode::BackTab, HelpKey::Prev),
+    (KeyCode::Left, HelpKey::Prev),
+    (KeyCode::Esc, HelpKey::Close),
+    (KeyCode::Char('q'), HelpKey::Close),
+    (KeyCode::Char('?'), HelpKey::Question),
+    (KeyCode::Down, HelpKey::Move(1)),
+    (KeyCode::Char('j'), HelpKey::Move(1)),
+    (KeyCode::Up, HelpKey::Move(-1)),
+    (KeyCode::Char('k'), HelpKey::Move(-1)),
+    (KeyCode::PageDown, HelpKey::Move(8)),
+    (KeyCode::PageUp, HelpKey::Move(-8)),
+    (KeyCode::Home, HelpKey::Move(-100_000)),
+    (KeyCode::End, HelpKey::Move(100_000)),
+];
+
 impl App {
     // ───────────── keys ─────────────
 
@@ -56,18 +89,7 @@ impl App {
             return false;
         }
         if self.help {
-            match k.code {
-                KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.help_page ^= 1,
-                // `?` again: the legend on small screens, then close.
-                KeyCode::Char('?') if self.help_page == 0 && self.shape == Shape::Tabs => {
-                    self.help_page = 1
-                }
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                    self.help = false;
-                    self.help_page = 0;
-                }
-                _ => {}
-            }
+            self.help_key(k);
             return false;
         }
         // Dialogs of the vault take every key.
@@ -78,6 +100,36 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// A key while the help is open: Tab and the arrows turn its pages, the glossary page
+    /// also moves its selection.
+    fn help_key(&mut self, k: KeyEvent) {
+        let Some((_, key)) = HELP_KEYS.iter().find(|(code, _)| *code == k.code) else {
+            return;
+        };
+        match *key {
+            HelpKey::Next => self.help_page = self.help_page.step(self.help_wide, false),
+            HelpKey::Prev => self.help_page = self.help_page.step(self.help_wide, true),
+            HelpKey::Close => self.close_help(),
+            HelpKey::Question if self.help_page == HelpPage::Keys && self.shape == Shape::Tabs => {
+                self.help_page = HelpPage::Legend
+            }
+            HelpKey::Question => self.close_help(),
+            HelpKey::Move(step) => self.glossary_move(step),
+        }
+    }
+
+    fn close_help(&mut self) {
+        self.help = false;
+        self.help_page = HelpPage::Keys;
+    }
+
+    /// Moves the glossary's selection, on its page only.
+    fn glossary_move(&mut self, step: isize) {
+        if self.help_page == HelpPage::Glossary {
+            self.glossary = self.glossary.moved(step);
+        }
     }
 
     /// Returns true to quit.
@@ -287,6 +339,20 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        // The wheel over the glossary page moves its selection, not the panels behind it.
+        if self.help && self.help_page == HelpPage::Glossary {
+            let step = if m.kind == MouseEventKind::ScrollDown {
+                1
+            } else if m.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                0
+            };
+            if step != 0 {
+                self.glossary_move(step);
+                return;
+            }
+        }
         let hit = self
             .rects
             .iter()
@@ -431,5 +497,172 @@ fn period_key(p: &Period) -> &'static str {
         Period::Days(30) => "30d",
         Period::All => "all",
         _ => "7d",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+
+    fn app() -> App {
+        let t = tempfile::tempdir().unwrap();
+        let mut app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
+        app.boot = None;
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn tab_turns_the_help_pages_and_wraps_round() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('?'));
+        assert!(a.help);
+        assert_eq!(a.help_page, HelpPage::Keys);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Tab);
+            seen.push(a.help_page);
+        }
+        assert_eq!(
+            seen,
+            [HelpPage::Legend, HelpPage::Glossary, HelpPage::Keys],
+            "keys, legend and glossary, then round again"
+        );
+        // Shift-Tab goes the other way; so do the arrows (Right on, Left back).
+        press(&mut a, KeyCode::BackTab);
+        assert_eq!(a.help_page, HelpPage::Glossary);
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.help_page, HelpPage::Legend);
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.help_page, HelpPage::Glossary);
+    }
+
+    /// On a wide screen the keys and the legend are one page: Tab does not stop on a legend
+    /// that looks the same as the keys.
+    #[test]
+    fn on_a_wide_screen_the_legend_is_not_a_page_of_its_own() {
+        let mut a = app();
+        a.help = true;
+        a.help_wide = true;
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.help_page, HelpPage::Glossary);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.help_page, HelpPage::Keys);
+        press(&mut a, KeyCode::BackTab);
+        assert_eq!(a.help_page, HelpPage::Glossary);
+        // The screen was narrow a moment ago and the legend was open: it counts as the keys.
+        a.help_page = HelpPage::Legend;
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.help_page, HelpPage::Glossary);
+    }
+
+    #[test]
+    fn question_mark_still_goes_to_the_legend_on_tabs_then_closes() {
+        let mut a = app();
+        a.shape = Shape::Tabs;
+        a.help = true;
+        press(&mut a, KeyCode::Char('?'));
+        assert!(a.help);
+        assert_eq!(a.help_page, HelpPage::Legend);
+        press(&mut a, KeyCode::Char('?'));
+        assert!(!a.help);
+        assert_eq!(a.help_page, HelpPage::Keys, "help opens on the keys again");
+        // Not on Tabs: `?` closes at once, from any page.
+        a.shape = Shape::Wall;
+        a.help = true;
+        a.help_page = HelpPage::Glossary;
+        press(&mut a, KeyCode::Char('?'));
+        assert!(!a.help);
+        assert_eq!(a.help_page, HelpPage::Keys);
+    }
+
+    #[test]
+    fn the_glossary_selection_moves_inside_the_list() {
+        use crate::ui::glossary::TERMS;
+        let mut a = app();
+        a.help = true;
+        a.help_page = HelpPage::Glossary;
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.glossary.term, 2);
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Char('k'));
+        press(&mut a, KeyCode::Char('k'));
+        assert_eq!(a.glossary.term, 0, "stops at the first term");
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(a.glossary.term, 8);
+        press(&mut a, KeyCode::PageUp);
+        assert_eq!(a.glossary.term, 0);
+        press(&mut a, KeyCode::End);
+        assert_eq!(a.glossary.term, TERMS.len() - 1, "stops at the last term");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.glossary.term, TERMS.len() - 1);
+        press(&mut a, KeyCode::Home);
+        assert_eq!(a.glossary.term, 0);
+    }
+
+    /// The glossary's keys do nothing on the other pages, and no key reaches the panels
+    /// behind the help.
+    #[test]
+    fn the_selection_keys_belong_to_the_glossary_page() {
+        let mut a = app();
+        a.help = true;
+        a.focus = Panel::Swarm;
+        for page in [HelpPage::Keys, HelpPage::Legend] {
+            a.help_page = page;
+            press(&mut a, KeyCode::Down);
+            press(&mut a, KeyCode::Char('j'));
+            press(&mut a, KeyCode::End);
+            assert_eq!(a.glossary.term, 0, "{page:?}");
+            assert_eq!(a.help_page, page);
+        }
+        // A key the table does not know changes nothing, and `t` is not a period change.
+        let period = a.period.clone();
+        press(&mut a, KeyCode::Char('t'));
+        press(&mut a, KeyCode::F(5));
+        assert!(a.help);
+        assert_eq!(a.period, period);
+    }
+
+    #[test]
+    fn closing_help_keeps_the_term_for_next_time() {
+        let mut a = app();
+        a.help = true;
+        a.help_page = HelpPage::Glossary;
+        press(&mut a, KeyCode::PageDown);
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.help);
+        assert_eq!(a.help_page, HelpPage::Keys);
+        assert_eq!(a.glossary.term, 8);
+        // `q` closes the help too (it does not quit while the help is open).
+        a.help = true;
+        let quit = a.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!quit && !a.help);
+    }
+
+    #[test]
+    fn the_wheel_moves_the_glossary_and_nothing_behind_it() {
+        let mut a = app();
+        a.help = true;
+        a.help_page = HelpPage::Glossary;
+        a.on_mouse(wheel(MouseEventKind::ScrollDown));
+        a.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(a.glossary.term, 2);
+        a.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(a.glossary.term, 1);
+        assert!(a.cursor.is_empty(), "no panel behind was scrolled");
     }
 }

@@ -25,13 +25,19 @@ pub(super) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 pub(super) fn dialog<'a>(app: &App, title: &'a str) -> Block<'a> {
     let th = &app.theme;
+    dialog_line(
+        app,
+        Line::from(Span::styled(format!(" {title} "), th.bold(th.accent))),
+    )
+}
+
+/// A dialog frame whose title the caller styles (the help names its pages in it).
+pub(super) fn dialog_line<'a>(app: &App, title: Line<'a>) -> Block<'a> {
+    let th = &app.theme;
     Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(Style::new().fg(th.accent))
-        .title(Line::from(Span::styled(
-            format!(" {title} "),
-            th.bold(th.accent),
-        )))
+        .title(title)
         .style(th.base())
 }
 
