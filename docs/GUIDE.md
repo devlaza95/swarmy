@@ -133,8 +133,9 @@ The web server's security posture, because it exposes real project names:
 - no secrets are ever put into a response: the API serves the same masked views as the CLI.
 
 The glossary (`src/ui/glossary.rs`) is the single source for every plain-language definition: the
-`explain` command, the web Help tab and the web tooltips all read it, and a test fails if the
-page uses a term the glossary lacks.
+`explain` command, the dashboard's help (the GLOSSARY page of `?`, `src/tui/view/help.rs`), the
+web Help tab and the web tooltips all read it, and a test fails if the page uses a term the
+glossary lacks.
 
 ## 7. Module map
 

@@ -138,7 +138,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/limits/` | limit analysis per account (`all_reports`): queries feeding the pure rules of `core::limits` |
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices, compact |
 | `src/tui/` | dashboard: UI loop (`mod.rs`), worker thread (`worker.rs`) on the cadences of `jobs.rs`, analytics passes (`analytics.rs`), state (`app/mod.rs`) and keys (`app/keys.rs`), what needs attention and what gets logged (`alerts.rs`: pure, tested), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
-| `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer (`mod.rs`); dialogs and toast (`overlays.rs`); help and legend (`help.rs`); panels that fill any rect (`panels/`, one file per panel, shared helpers in `panels/mod.rs`); primitives (`kit.rs`) |
+| `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer (`mod.rs`); dialogs and toast (`overlays.rs`); help, legend and glossary pages (`help.rs`; Tab turns them, `app/help.rs` holds which is open); panels that fill any rect (`panels/`, one file per panel, shared helpers in `panels/mod.rs`); primitives (`kit.rs`) |
 | `src/demo.rs` | made-up world for `swarmy demo` and README media (`demo/agy.rs`, `demo/codex.rs`: those harnesses' seats) |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |

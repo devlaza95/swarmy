@@ -315,6 +315,7 @@ pub fn record(
                 let code = match k {
                     '\n' => KeyCode::Enter,
                     '\x1b' => KeyCode::Esc,
+                    '\t' => KeyCode::Tab,
                     c => KeyCode::Char(*c),
                 };
                 app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
