@@ -216,6 +216,22 @@ mod tests {
         assert_eq!(percent_decode("%4"), "%4");
     }
 
+    /// An agent's key is `seat/session/agent` and ends in a slash for a main thread; the page
+    /// sends it percent-encoded and the server gets it back whole, a trailing slash included.
+    #[test]
+    fn an_agent_key_with_slashes_survives_the_query() {
+        let key = "5f8162100223aa24/b3c4d5e6-demo/";
+        let r = parse_request(&req(
+            "/api/agent?key=5f8162100223aa24%2Fb3c4d5e6-demo%2F",
+            "localhost:1",
+        ))
+        .unwrap();
+        assert_eq!(r.path, "/api/agent");
+        assert_eq!(r.param("key"), Some(key));
+        let sub = parse_request(&req("/api/agent?key=a%2Fb%2Fagent-9f2", "localhost:1")).unwrap();
+        assert_eq!(sub.param("key"), Some("a/b/agent-9f2"));
+    }
+
     #[test]
     fn an_empty_value_is_no_value() {
         let r = parse_request(&req("/x?project=&by=day", "localhost:1")).unwrap();

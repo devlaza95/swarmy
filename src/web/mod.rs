@@ -14,6 +14,7 @@
 
 mod api;
 mod http;
+mod timeline;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -210,7 +211,9 @@ fn route(req: Request, port: u16) -> Routed {
     }
     match req.path.as_str() {
         "/api/glossary" => Routed::Done(Response::json(200, &api::glossary())),
-        "/api/status" | "/api/live" | "/api/limits" | "/api/spend" => Routed::Api(req),
+        "/api/status" | "/api/live" | "/api/limits" | "/api/spend" | "/api/agent" => {
+            Routed::Api(req)
+        }
         _unknown => Routed::Done(Response::error(404, "not found")),
     }
 }
@@ -225,6 +228,7 @@ fn answer(hub: &mut Hub, req: &Request) -> Response {
                 "/api/live" => api::live(hub),
                 "/api/limits" => api::limits(hub),
                 "/api/spend" => api::spend(hub, req),
+                "/api/agent" => api::agent(hub, req),
                 other => Err(ApiError::BadRequest(format!("no such call: {other}"))),
             },
         },
@@ -232,6 +236,7 @@ fn answer(hub: &mut Hub, req: &Request) -> Response {
     match result {
         Ok(v) => Response::json(200, &v),
         Err(ApiError::BadRequest(m)) => Response::error(400, &m),
+        Err(ApiError::NotFound(m)) => Response::error(404, &m),
         Err(ApiError::Internal(e)) => Response::error(500, &format!("{e:#}")),
     }
 }
@@ -341,24 +346,38 @@ mod tests {
         }
     }
 
+    /// Every call that needs the worker's data. A new call is added here once, and every guard
+    /// below covers it.
+    const DATA_CALLS: [&str; 5] = [
+        "/api/status",
+        "/api/live",
+        "/api/limits",
+        "/api/spend",
+        "/api/agent",
+    ];
+
     #[test]
     fn a_foreign_host_is_refused_before_anything_else() {
-        let r = done(route(get("/api/live", Some("evil.example:7878")), 7878));
-        assert_eq!(r.status, 421);
+        for path in DATA_CALLS {
+            let r = done(route(get(path, Some("evil.example:7878")), 7878));
+            assert_eq!(r.status, 421, "{path}");
+        }
         let r = done(route(get("/", None), 7878));
         assert_eq!(r.status, 421);
     }
 
     #[test]
     fn a_cross_site_page_cannot_reach_the_api_but_can_load_the_page() {
-        let mut api = get("/api/limits", Some("127.0.0.1:7878"));
-        api.fetch_site = Some("cross-site".into());
-        assert_eq!(done(route(api, 7878)).status, 403);
-        // Same-origin (the page's own fetch) and a typed address (`none`) pass.
-        for site in ["same-origin", "none"] {
-            let mut ok = get("/api/limits", Some("127.0.0.1:7878"));
-            ok.fetch_site = Some(site.into());
-            assert!(matches!(route(ok, 7878), Routed::Api(_)), "{site}");
+        for path in DATA_CALLS {
+            let mut api = get(path, Some("127.0.0.1:7878"));
+            api.fetch_site = Some("cross-site".into());
+            assert_eq!(done(route(api, 7878)).status, 403, "{path}");
+            // Same-origin (the page's own fetch) and a typed address (`none`) pass.
+            for site in ["same-origin", "none"] {
+                let mut ok = get(path, Some("127.0.0.1:7878"));
+                ok.fetch_site = Some(site.into());
+                assert!(matches!(route(ok, 7878), Routed::Api(_)), "{path} {site}");
+            }
         }
         // A link from elsewhere to the page itself is a navigation, not a data read.
         let mut page = get("/", Some("127.0.0.1:7878"));
@@ -368,12 +387,14 @@ mod tests {
 
     #[test]
     fn only_get_is_accepted() {
-        for method in ["POST", "PUT", "DELETE", "HEAD", "OPTIONS"] {
-            let mut req = get("/api/live", Some("localhost:7878"));
-            req.method = method.into();
-            let r = done(route(req, 7878));
-            assert_eq!(r.status, 405, "{method}");
-            assert!(r.extra.contains(&"Allow: GET"));
+        for path in DATA_CALLS {
+            for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                let mut req = get(path, Some("localhost:7878"));
+                req.method = method.into();
+                let r = done(route(req, 7878));
+                assert_eq!(r.status, 405, "{method} {path}");
+                assert!(r.extra.contains(&"Allow: GET"));
+            }
         }
     }
 
@@ -394,7 +415,7 @@ mod tests {
 
     #[test]
     fn data_calls_go_to_the_worker_and_the_rest_is_not_found() {
-        for path in ["/api/status", "/api/live", "/api/limits", "/api/spend"] {
+        for path in DATA_CALLS {
             let routed = route(get(path, Some("localhost:7878")), 7878);
             assert!(matches!(routed, Routed::Api(_)), "{path}");
         }
@@ -402,6 +423,8 @@ mod tests {
             "/api",
             "/api/",
             "/api/vault",
+            "/api/agent/",
+            "/api/agents",
             "/etc/passwd",
             "/../Cargo.toml",
         ] {
@@ -467,6 +490,120 @@ mod tests {
                 crate::ui::glossary::by_name(name).is_some(),
                 "app.js looks up `{name}`, which the glossary does not have"
             );
+        }
+    }
+
+    /// The page may only read. One `fetch`, with no method, body or credentials of its own, and
+    /// no other way to send anything anywhere.
+    #[test]
+    fn the_page_can_only_read() {
+        assert_eq!(
+            APP_JS.matches("fetch(").count(),
+            1,
+            "one place asks the server"
+        );
+        for forbidden in [
+            "method:",
+            "body:",
+            "XMLHttpRequest",
+            "WebSocket",
+            "EventSource",
+            "sendBeacon",
+            "importScripts",
+            "navigator.serviceWorker",
+        ] {
+            assert!(!APP_JS.contains(forbidden), "app.js uses {forbidden}");
+        }
+    }
+
+    /// Every call the page makes is one the server answers, and a path the page builds from
+    /// data does not exist: the page names its calls (`api('agent', ...)`), the server routes
+    /// them.
+    #[test]
+    fn the_page_calls_only_routes_the_server_has() {
+        let mut named: Vec<&str> = Vec::new();
+        for part in APP_JS.split("api('").skip(1) {
+            if let Some((name, _)) = part.split_once('\'') {
+                named.push(name);
+            }
+        }
+        assert!(named.contains(&"agent"), "the timeline call: {named:?}");
+        for name in named {
+            let path = format!("/api/{name}");
+            let routed = route(get(&path, Some("127.0.0.1:7878")), 7878);
+            let known = match routed {
+                Routed::Api(_) => true,
+                Routed::Done(r) => r.status == 200,
+            };
+            assert!(
+                known,
+                "app.js calls {path}, which the server does not answer"
+            );
+        }
+        // Every call site (not the definition) starts with a string: a name, never a path built
+        // from data.
+        for (at, _) in APP_JS.match_indices("api(") {
+            if APP_JS[..at].ends_with("function ") {
+                continue;
+            }
+            assert!(
+                APP_JS[at + 4..].starts_with('\''),
+                "a call to api() is named by a string literal: {}",
+                APP_JS[at..].lines().next().unwrap_or_default()
+            );
+        }
+    }
+
+    /// Text from transcripts goes into the page as text nodes, and style only through the
+    /// CSSOM, which the CSP allows; a style attribute written as a string would be blocked, and
+    /// markup parsed from a string would be the hole `innerHTML` is.
+    #[test]
+    fn the_page_has_no_other_way_to_write_markup_or_style() {
+        for forbidden in [
+            "DOMParser",
+            "createContextualFragment",
+            "srcdoc",
+            "cssText",
+            "setAttribute('style'",
+            "setAttribute(\"style\"",
+            "new Function",
+            "style: '",
+            "style: \"",
+            "style: `",
+            ".href =",
+            "location.assign",
+            "location =",
+        ] {
+            assert!(!APP_JS.contains(forbidden), "app.js uses {forbidden}");
+        }
+        assert!(
+            !INDEX_HTML.contains("style="),
+            "no inline style (the CSP forbids it)"
+        );
+        assert!(
+            !INDEX_HTML.contains("<style"),
+            "no inline style (the CSP forbids it)"
+        );
+    }
+
+    /// The CSP is the same on the page, its two files, the data and the errors, and it is the
+    /// one the page was written for: nothing inline, nothing from another site. Loosening it for
+    /// a feature is a change to this test, which a reviewer sees.
+    #[test]
+    fn the_csp_is_unchanged_and_on_every_kind_of_answer() {
+        const CSP: &str = "Content-Security-Policy: default-src 'none'; script-src 'self'; \
+            style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; \
+            form-action 'none'; frame-ancestors 'none'\r\n";
+        let host = Some("127.0.0.1:7878");
+        let mut answers: Vec<Response> = ["/", "/app.js", "/app.css", "/api/glossary", "/nope"]
+            .iter()
+            .map(|p| done(route(get(p, host), 7878)))
+            .collect();
+        answers.push(Response::error(500, "x"));
+        answers.push(Response::json(200, &serde_json::json!({ "tools": [] })));
+        for r in answers {
+            let text = String::from_utf8_lossy(&r.to_bytes()).into_owned();
+            assert!(text.contains(CSP), "{}: {text}", r.status);
         }
     }
 }

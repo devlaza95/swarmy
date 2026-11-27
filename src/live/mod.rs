@@ -25,8 +25,10 @@ use crate::index::live::{AgentKey, AgentRow, DoneAgent};
 use crate::index::{Index, from_ms, ms};
 
 mod checkout;
+mod detail;
 mod state;
 pub use checkout::Checkout;
+pub use detail::{Detail, compactions};
 pub use state::{Options, State, StateInputs, agent_state};
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +121,9 @@ pub struct Reads {
     /// A session's whole spend, with the session's write sequence and the price fingerprint
     /// it was read under.
     sessions: HashMap<(SeatId, SessionId), (u64, Option<String>, f64)>,
+    /// The tool calls and life of the agents a front end asked about (`detail`), with the
+    /// agent's write sequence they were read at.
+    details: HashMap<AgentOf, (u64, std::sync::Arc<Detail>)>,
 }
 
 #[derive(Clone)]
@@ -413,6 +418,7 @@ pub fn build(
     }
 
     reads.agents = next;
+    reads.settle_details(prev.is_none());
 
     // Live sessions that work in the same checkout (no worktree between them); only those
     // sessions' agents carry the count.

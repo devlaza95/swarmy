@@ -58,6 +58,32 @@ dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .15rem 1r
 dl.facts dt { color: var(--dim); } dl.facts dd { margin: 0; }
 .hint { color: var(--warn); margin: 0 0 .5rem; }
 
+/* The expanded row: the facts on the left, the agent's life and its tool calls on the right. */
+/* In a window narrower than the table, the table scrolls sideways; the row stays as wide as the window and in view. */
+.detail-grid { display: grid; grid-template-columns: minmax(15rem, 22rem) minmax(0, 1fr); gap: .8rem 1.8rem; align-items: start; position: sticky; left: 0; width: min(100%, calc(100vw - 5.2rem)); }
+@media (max-width: 900px) { .detail-grid { grid-template-columns: minmax(0, 1fr); } }
+.pane { display: grid; gap: 1rem; min-width: 0; }
+.pane h4 { margin: 0 0 .35rem; font: 600 .72rem var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--dim); cursor: help; }
+.pane h4 .faint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.cap { margin: .2rem 0 .6rem; font-size: .78rem; color: var(--dim); }
+.axis { display: flex; justify-content: space-between; font: .72rem var(--mono); color: var(--faint); }
+/* A strip of bars. Colour carries meaning: the accent is spend, the cool colour the context, the warning colour a full context or a compaction. */
+.spark { position: relative; display: flex; align-items: flex-end; gap: 1px; height: 2.6rem; border-bottom: 1px solid var(--line); }
+.spark > span { flex: 1 1 0; min-width: 2px; background: var(--accent); opacity: .85; border-radius: 1px 1px 0 0; }
+.spark.ctx > span { background: var(--think); }
+.spark.ctx > span.hot { background: var(--warn); }
+.spark > span.cutline { position: absolute; top: 0; bottom: 0; flex: none; width: 2px; min-width: 0; margin-left: -1px; background: var(--warn); opacity: 1; border-radius: 0; }
+.tools-box { max-height: 14rem; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+ul.tools { list-style: none; margin: 0; padding: 0; }
+li.tool { display: grid; grid-template-columns: 5.2rem 1rem 3.4rem 5.5rem minmax(0, 1fr); gap: 0 .6rem; align-items: baseline; padding: .15rem .6rem; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); }
+li.tool:last-child { border-bottom: 0; }
+li.tool time { font: .78rem var(--mono); }
+li.tool .mark { font-family: var(--mono); text-align: center; }
+li.tool .took { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+li.tool .tname { font: 600 .82rem var(--mono); }
+li.tool .tsum { font: .8rem var(--mono); color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.t-ok .mark { color: var(--good); } .t-failed .mark { color: var(--bad); } .t-running .mark { color: var(--warn); font-weight: 700; } .t-unfinished .mark { color: var(--faint); }
+
 .gauge { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; }
 .gauge > div { height: 100%; border-radius: 5px; background: var(--good); }
 .gauge.lvl-warn > div { background: var(--warn); } .gauge.lvl-bad > div, .gauge.lvl-reached > div { background: var(--bad); }

@@ -26,6 +26,8 @@ const app = {
   status: null,
   gloss: new Map(), // term name -> {short, long, aliases, see}
   expanded: new Set(), // agent keys whose detail row is open
+  detail: new Map(), // open agent key -> its timeline (undefined: loading, null: gone, false: failed)
+  scroll: new Map(), // agent key -> how far its tool list was scrolled, kept over repaints
   spend: { by: 'project', period: 'week' },
   helpFilter: '',
   timer: null,
@@ -81,6 +83,13 @@ function tokens(n) {
   return String(n);
 }
 const count = (n) => Number(n).toLocaleString('en-US');
+const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// How long a tool took: milliseconds under a second, a decimal under ten, then as durations.
+function took(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
+  return duration(ms / 1000);
+}
 
 // A term's one-line meaning, shown as a tooltip on column heads and chips.
 const tip = (term) => (app.gloss.get(term) || {}).short;
@@ -92,7 +101,11 @@ async function api(path, params) {
   const res = await fetch('/api/' + path + q, { headers: { Accept: 'application/json' } });
   let body = null;
   try { body = await res.json(); } catch { /* an error page without JSON */ }
-  if (!res.ok) throw new Error((body && body.error) || `${path}: ${res.status}`);
+  if (!res.ok) {
+    const err = new Error((body && body.error) || `${path}: ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 
@@ -153,15 +166,122 @@ function facts(a) {
   return h('dl', { class: 'facts' }, rows);
 }
 
+// ---- an agent's timeline (the expanded row) --------------------------------------------------
+
+// What a tool call's mark means; the words are its tooltip, the glossary's `tool timeline` has the story.
+const TOOL_MARKS = {
+  ok: ['✓', 'finished'],
+  failed: ['✗', 'failed'],
+  running: ['▶', 'still running'],
+  unfinished: ['·', 'no result, and the agent is no longer at work'],
+};
+const HOT_CONTEXT = 80; // percent: from here the terminal's context gauge turns to the warning colour
+
+// A strip of bars scaled to `max`, each with its own tooltip. Heights go through the CSSOM: the
+// CSP forbids a style attribute. A value above zero keeps a few percent, so that it can be seen.
+function strip(cls, label, values, max, titleOf, classOf) {
+  return h('div', { class: `spark ${cls}`, role: 'img', 'aria-label': label },
+    values.map((v, i) => h('span', {
+      class: classOf ? classOf(v) : null,
+      title: titleOf(v, i),
+      style: { height: v > 0 && max > 0 ? `${Math.max(6, Math.min(100, (v / max) * 100))}%` : '0%' },
+    })));
+}
+
+function lifePane(a, life) {
+  const heading = (extra) => h('h4', { title: tip('life chart') }, 'Life ', h('span', { class: 'faint' }, extra));
+  if (!life) return h('section', {}, heading(''), h('p', { class: 'dim' }, 'No requests yet.'));
+  const n = life.cost.length;
+  const t0 = Date.parse(life.from);
+  const span = Date.parse(life.to) - t0;
+  const slot = (i) => `${clock(t0 + (span * i) / n)} to ${clock(t0 + (span * (i + 1)) / n)}`;
+  const of = life.requests < a.requests ? ` (the last ${count(life.requests)} of ${count(a.requests)})` : '';
+  const spent = a.unpriced
+    ? h('p', { class: 'cap', title: tip('unpriced') }, 'cost unknown: this model has no known price')
+    : [
+        strip('cost', `Cost over the agent's life, ${money(life.total_cost)} in all`, life.cost, Math.max(...life.cost),
+          (c, i) => `${slot(i)}: ${c > 0 ? money(c) : 'no requests'}`),
+        h('p', { class: 'cap' }, `$ per slice of time · ${money(life.total_cost)} in all · the most for one request ${money(life.max_request_cost)}`),
+      ];
+  const last = life.context_pct[n - 1];
+  const context = strip('ctx', `Context over the agent's life, now ${pct(last)} of the window`, life.context_pct, 100,
+    (c, i) => `${slot(i)}: context ${pct(c)}`, (c) => (c >= HOT_CONTEXT ? 'hot' : null));
+  // A compaction is a vertical marker through the context strip, where the context fell to under half.
+  for (const i of life.compactions) {
+    context.append(h('span', { class: 'cutline', title: `${slot(i)}: the context was summarised`, style: { left: `${((i + 0.5) / n) * 100}%` } }));
+  }
+  return h('section', { class: 'life' },
+    heading(`· ${count(life.requests)} request${life.requests === 1 ? '' : 's'} over ${duration(span / 1000)}${of}`),
+    spent, context,
+    h('p', { class: 'cap', title: tip('context') },
+      `context at the end of each slice · now ${pct(last)} of ${tokens(a.context_window)}`,
+      life.compactions.length ? [' · ', h('span', { class: 'warn', title: tip('compaction') }, '│ compaction')] : null),
+    h('div', { class: 'axis' }, h('span', {}, clock(t0)), h('span', {}, 'now')));
+}
+
+function toolsPane(a, tools) {
+  const list = tools.length
+    ? h('div', { class: 'tools-box', tabindex: 0, role: 'region', 'aria-label': 'Recent tool calls, newest first', 'data-key': a.key, 'data-focus': `tools:${a.key}`,
+        onscroll: (e) => app.scroll.set(a.key, e.target.scrollTop) },
+        h('ul', { class: 'tools' }, tools.map((t) => {
+          const [mark, what] = TOOL_MARKS[t.status] || ['?', t.status];
+          const spent = t.status === 'running' ? ago(t.at) : t.took_ms === null ? '' : took(t.took_ms);
+          return h('li', { class: `tool t-${t.status}` },
+            h('time', { datetime: t.at, class: 'faint' }, clock(Date.parse(t.at))),
+            h('span', { class: 'mark', title: what }, mark),
+            h('span', { class: 'took' }, spent),
+            h('span', { class: 'tname' }, t.name),
+            h('span', { class: 'tsum', title: t.summary }, t.summary));
+        })))
+    : h('p', { class: 'dim' }, 'No tool calls recorded for this agent.');
+  return h('section', {},
+    h('h4', { title: tip('tool timeline') }, 'Recent tools ', h('span', { class: 'faint' }, `· ${tools.length}, newest first`)),
+    list);
+}
+
+function timelinePane(a, d) {
+  if (d === undefined) return h('div', { class: 'pane dim' }, 'Loading the timeline…');
+  if (d === null) return h('div', { class: 'pane dim' }, 'This agent has left the list, so its timeline is gone too.');
+  if (d === false) return h('div', { class: 'pane warn' }, 'Could not read the timeline. It is tried again with the next update.');
+  return h('div', { class: 'pane' }, lifePane(a, d.life), toolsPane(a, d.tools));
+}
+
+// One agent's timeline, or what is known of it: a 404 says the agent left the list; any other
+// failure keeps the last good answer (a blip must not blank a row that was fine).
+async function readDetail(key) {
+  try {
+    return await api('agent', { key });
+  } catch (err) {
+    return err.status === 404 ? null : app.detail.get(key) || false;
+  }
+}
+
+// The open rows' timelines, in step with every live answer. Closed rows ask for nothing.
+async function fetchDetails(live) {
+  const open = live.agents.map((a) => a.key).filter((k) => app.expanded.has(k));
+  const got = await Promise.all(open.map(readDetail));
+  app.detail = new Map(open.map((k, i) => [k, got[i]]));
+}
+
 function agentRows(a) {
   const open = app.expanded.has(a.key);
   const toggle = () => {
-    if (app.expanded.has(a.key)) app.expanded.delete(a.key);
-    else app.expanded.add(a.key);
-    paint(); // from the last answer: opening a row needs no new data
+    if (open) {
+      app.expanded.delete(a.key);
+      app.detail.delete(a.key);
+      paint();
+    } else {
+      app.expanded.add(a.key);
+      paint(); // at once, from the last answer; the timeline follows when it arrives
+      readDetail(a.key).then((d) => {
+        if (!app.expanded.has(a.key)) return;
+        app.detail.set(a.key, d);
+        if (app.tab === 'live') paint();
+      });
+    }
   };
   const indent = a.depth ? h('span', { class: 'tree' }, '  '.repeat(a.depth - 1) + '└ ') : null;
-  const lead = h('button', { class: 'row', 'aria-expanded': String(open), 'aria-label': `${a.name}: ${open ? 'hide' : 'show'} details`, onclick: toggle },
+  const lead = h('button', { class: 'row', 'data-focus': `row:${a.key}`, 'aria-expanded': String(open), 'aria-label': `${a.name}: ${open ? 'hide' : 'show'} details`, onclick: toggle },
     indent, h('span', { class: 'name' }, a.name || '(unnamed)'));
   const rows = [
     h('tr', { class: a.main ? 'main' : 'sub' },
@@ -175,12 +295,26 @@ function agentRows(a) {
       h('td', { class: 'num' }, a.unpriced ? '-' : (a.main ? 'Σ' : '') + money(a.main ? a.session_cost : a.cost))),
   ];
   if (open) {
-    rows.push(h('tr', { class: 'detail' }, h('td', { colspan: 8 }, a.hint ? h('p', { class: 'hint' }, a.hint) : null, facts(a))));
+    rows.push(h('tr', { class: 'detail' }, h('td', { colspan: 8 },
+      a.hint ? h('p', { class: 'hint' }, a.hint) : null,
+      h('div', { class: 'detail-grid' }, facts(a), timelinePane(a, app.detail.get(a.key))))));
   }
   return rows;
 }
 
+// The page is rebuilt from the last answer on every update: what a reader was doing in it (the
+// focused row or list, how far a tool list was scrolled) is put back afterwards.
+function restoreView(focused) {
+  for (const el of view().querySelectorAll('.tools-box')) el.scrollTop = app.scroll.get(el.dataset.key) || 0;
+  if (!focused) return;
+  for (const el of view().querySelectorAll('[data-focus]')) {
+    if (el.dataset.focus === focused) { el.focus({ preventScroll: true }); break; }
+  }
+}
+
 function renderLive(d) {
+  const active = document.activeElement;
+  const focused = active && active.dataset ? active.dataset.focus : null;
   const waiting = d.agents.filter((a) => a.state === 'needs_you');
   const head = (text, term, cls) => h('th', { title: tip(term), class: cls }, text);
   const headNum = (text, term) => h('th', { class: 'num', title: tip(term) }, text);
@@ -210,6 +344,7 @@ function renderLive(d) {
            h('td', { class: 'clip' }, r.name), h('td', {}, r.project), h('td', {}, r.model || '-'),
            h('td', { class: 'num dim' }, `${ago(r.finished)} ago`), h('td', { class: 'num' }, money(r.cost))))))]
       : null);
+  restoreView(focused);
 }
 
 // ---- limits ----------------------------------------------------------------------------------
@@ -337,8 +472,10 @@ app.data = {};
 
 async function fetchTab(tab) {
   let data;
-  if (tab === 'live') data = await api('live');
-  else if (tab === 'limits') data = await api('limits');
+  if (tab === 'live') {
+    data = await api('live');
+    if (app.tab === 'live') await fetchDetails(data); // the open rows' timelines, in the same paint
+  } else if (tab === 'limits') data = await api('limits');
   else if (tab === 'spend') data = await api('spend', app.spend);
   else data = await api('glossary');
   app.data[tab] = data;
