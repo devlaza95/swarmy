@@ -2,3 +2,4 @@
 
 pub mod context;
 pub mod seat_use;
+pub mod views;

@@ -166,3 +166,18 @@ model -> core
 model -> errors
 # A seat's id comes from its canonical dir.
 model -> fsutil
+# `swarmy web` is a front end (cli starts it): it starts from the composition root and shows
+# the views the commands show (`Ctx::limit_reports`, `Ctx::spend_report`).
+cli -> web
+web -> app
+# The running sessions' registries and the project resolver the index refresh needs.
+web -> claude
+web -> core
+web -> index
+# The limit analysis's window type, shaped for the page (levels come from core::limits::Level).
+web -> limits
+web -> live
+# Memory and CPU of the running sessions' processes in the live view.
+web -> procs
+# The glossary and the number formats are the ones the commands and the dashboard use.
+web -> ui

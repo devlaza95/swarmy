@@ -8,35 +8,18 @@ use crate::ui::table::{Align, Cell, Table};
 
 use super::{Format, ReportArgs};
 use crate::app::context::Ctx;
+#[cfg(test)]
+use crate::app::views::mask_paths;
 
 pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
     let filter = a.filter.to_filter(ctx, &idx)?;
-    let span = a
-        .period
-        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_ref())?);
-    let mut rows = idx.spend_by(a.by, span, &filter)?;
-    let total = idx.total(span, &filter)?;
-    if a.by == Dim::Account {
-        for r in &mut rows {
-            r.label = ctx.shown_account_name(&r.key);
-        }
-    }
-    if ctx.mask {
-        mask_paths(a.by, &mut rows, |p| ctx.show_path(p));
-    }
-    if a.by == Dim::Weekday {
-        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        for r in &mut rows {
-            r.label = r
-                .key
-                .parse::<usize>()
-                .ok()
-                .and_then(|d| DAYS.get(d))
-                .unwrap_or(&"?")
-                .to_string();
-        }
-    }
+    let rep = ctx.spend_report(&idx, a.by, &a.period, &filter)?;
+    let span = crate::core::period::Span {
+        start: rep.period.start,
+        end: rep.period.end,
+    };
+    let (rows, total) = (rep.rows, rep.total);
     match a.format {
         Format::Json => {
             println!(
@@ -239,31 +222,6 @@ pub fn filter_label(ctx: &Ctx, f: &Filter) -> String {
         String::new()
     } else {
         format!("· {}", parts.join(" "))
-    }
-}
-
-/// `--mask` covers every column that can hold a path, the JSON and CSV `key` too: a project's or
-/// checkout's dir, a branch key (`<dir> ⎇ <branch>`), and a label that fell back to a cwd.
-/// `show` is `Ctx::show_path` (masked, it keeps the last component).
-fn mask_paths(dim: Dim, rows: &mut [Row], show: impl Fn(&str) -> String) {
-    if !matches!(dim, Dim::Project | Dim::Worktree | Dim::Branch) {
-        return;
-    }
-    let path_like = |s: &str| {
-        s.starts_with(['/', '~', '\\']) || s.as_bytes().get(1..3) == Some(b":\\".as_slice())
-    };
-    let mask = |s: &str| {
-        if let Some((dir, branch)) = s.split_once(" ⎇ ").filter(|(d, _)| path_like(d)) {
-            format!("{} ⎇ {branch}", show(dir))
-        } else if path_like(s) {
-            show(s)
-        } else {
-            s.to_string()
-        }
-    };
-    for r in rows {
-        r.key = mask(&r.key);
-        r.label = mask(&r.label);
     }
 }
 

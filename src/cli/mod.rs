@@ -3,6 +3,8 @@
 pub mod accounts;
 pub mod compact;
 pub mod doctor;
+pub mod explain;
+pub mod guide;
 pub mod limits;
 pub mod models;
 pub mod prices;
@@ -98,6 +100,22 @@ pub enum Command {
         /// A Codex-only machine with an empty `~/.claude` (no login, no transcripts).
         #[arg(long, hide = true)]
         codex_only: bool,
+    },
+    /// The dashboard's data in a browser, on this computer only (read-only; Ctrl-C stops it).
+    Web {
+        /// Port on 127.0.0.1 (0: any free port).
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Serve the made-up world of `swarmy demo` instead of your data.
+        #[arg(long)]
+        demo: bool,
+    },
+    /// The first five minutes: what swarmy does, what it touches, what to run first.
+    Guide,
+    /// Plain-language meaning of every word, glyph and number on screen (no term: list them).
+    Explain {
+        /// A word or a glyph, e.g. `stalled`, `≈`, `seat`.
+        term: Vec<String>,
     },
     /// Print shell completions.
     Completions {
@@ -209,6 +227,18 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Jump { list }) => jump(list),
+        Some(Command::Web { port, demo }) => {
+            if demo {
+                // `_world` keeps the made-up world's writer thread alive while serving.
+                let (ctx, _world) = demo_ctx(painter, cli.mask, crate::demo::Load::Demo)?;
+                crate::web::serve(ctx, port)
+            } else {
+                crate::web::serve(crate::app::context::Ctx::load(painter, cli.mask)?, port)
+            }
+        }
+        // Static text: no index, no config, works before anything is set up.
+        Some(Command::Guide) => guide::run(&painter),
+        Some(Command::Explain { term }) => explain::run(&painter, &term),
         Some(Command::Statusline { then }) => {
             // Runs after every model response: no index, no scanning, just record and print.
             let dirs = crate::config::Dirs::resolve()?;
@@ -232,7 +262,6 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             wall,
             codex_only,
         }) => {
-            let dirs = crate::config::Dirs::resolve()?;
             let load = if wall {
                 crate::demo::Load::Wall
             } else if codex_only {
@@ -240,48 +269,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 crate::demo::Load::Demo
             };
-            let demo = crate::demo::start(&dirs.data.join("demo"), load)?;
-            let mut ctx = crate::app::context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
-            ctx.mask = cli.mask;
-            // Saved logins, so the VAULT screen has something to show.
-            {
-                let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
-                for s in ctx.seats.iter().filter(|s| s.harness.supports_vault()) {
-                    v.edit(|tx| tx.capture(s, Some(&format!("alex-{}", s.label))))?;
-                }
-                // A Codex-only machine has no other login: nothing keeps its empty seat shown.
-                if !codex_only {
-                    let spare = crate::claude::credentials::Secret::new(serde_json::json!({
-                        "accessToken": "demo-access-spare", "refreshToken": "demo-refresh-spare",
-                        "refreshTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::days(4)).timestamp_millis()
-                    }));
-                    let acct = crate::claude::config_json::Account {
-                        account_uuid: "acc-demo-spare".into(),
-                        email: Some("alex+spare@example.com".into()),
-                        ..Default::default()
-                    };
-                    v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
-                    // A second Google login for the agy seat.
-                    let team = crate::claude::credentials::Secret::of(
-                        crate::core::harness::Harness::Agy,
-                        serde_json::json!({"token": {"access_token": "demo-agy-access-team", "refresh_token": "demo-agy-refresh-team",
-                                                     "expiry": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
-                                           "auth_method": "consumer", "id_token_email": "alex.team@example.com"}),
-                    );
-                    let team_acct = crate::agy::account::account_of(team.expose());
-                    v.edit(|tx| {
-                        tx.put(&team, None, team_acct.as_ref(), Some("alex-g-team"), None)
-                    })?;
-                }
-                // On the wall, one login serves two seats.
-                if wall && let Some(lab) = ctx.seats.iter().find(|s| s.label == "lab") {
-                    v.edit(|tx| tx.switch(lab, "alex-work"))?;
-                }
-            }
-            // What the seats say now (the lab seat holds the work login), with account names
-            // from the saved logins just made: the index then sees the wall's seats as they are
-            // from its first pass, not a login change under the lab seat's sessions a while later.
-            ctx.reload_seat_info()?;
+            // `_demo` keeps the made-up world's writer thread alive until the arm ends.
+            let (ctx, _demo) = demo_ctx(painter, cli.mask, load)?;
             match record {
                 Some(out) => {
                     let (w, h) = size
@@ -326,6 +315,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(Command::Setup(a)) => setup::run(&ctx, &a),
                 Some(
                     Command::Completions { .. }
+                    | Command::Guide
+                    | Command::Explain { .. }
+                    | Command::Web { .. }
                     | Command::Man
                     | Command::Demo { .. }
                     | Command::Statusline { .. }
@@ -336,6 +328,60 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// A made-up world (no real data is read) as a composition root: `swarmy demo` and `swarmy web
+/// --demo` start from it. The returned [`crate::demo::Demo`] must outlive the context: its
+/// thread keeps writing the world's transcripts.
+pub fn demo_ctx(
+    painter: Painter,
+    mask: bool,
+    load: crate::demo::Load,
+) -> anyhow::Result<(crate::app::context::Ctx, crate::demo::Demo)> {
+    let dirs = crate::config::Dirs::resolve()?;
+    let wall = matches!(load, crate::demo::Load::Wall);
+    let codex_only = matches!(load, crate::demo::Load::CodexOnly);
+    let demo = crate::demo::start(&dirs.data.join("demo"), load)?;
+    let mut ctx = crate::app::context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
+    ctx.mask = mask;
+    // Saved logins, so the VAULT screen has something to show.
+    {
+        let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
+        for s in ctx.seats.iter().filter(|s| s.harness.supports_vault()) {
+            v.edit(|tx| tx.capture(s, Some(&format!("alex-{}", s.label))))?;
+        }
+        // A Codex-only machine has no other login: nothing keeps its empty seat shown.
+        if !codex_only {
+            let spare = crate::claude::credentials::Secret::new(serde_json::json!({
+                "accessToken": "demo-access-spare", "refreshToken": "demo-refresh-spare",
+                "refreshTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::days(4)).timestamp_millis()
+            }));
+            let acct = crate::claude::config_json::Account {
+                account_uuid: "acc-demo-spare".into(),
+                email: Some("alex+spare@example.com".into()),
+                ..Default::default()
+            };
+            v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
+            // A second Google login for the agy seat.
+            let team = crate::claude::credentials::Secret::of(
+                crate::core::harness::Harness::Agy,
+                serde_json::json!({"token": {"access_token": "demo-agy-access-team", "refresh_token": "demo-agy-refresh-team",
+                                             "expiry": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
+                                   "auth_method": "consumer", "id_token_email": "alex.team@example.com"}),
+            );
+            let team_acct = crate::agy::account::account_of(team.expose());
+            v.edit(|tx| tx.put(&team, None, team_acct.as_ref(), Some("alex-g-team"), None))?;
+        }
+        // On the wall, one login serves two seats.
+        if wall && let Some(lab) = ctx.seats.iter().find(|s| s.label == "lab") {
+            v.edit(|tx| tx.switch(lab, "alex-work"))?;
+        }
+    }
+    // What the seats say now (the lab seat holds the work login), with account names
+    // from the saved logins just made: the index then sees the wall's seats as they are
+    // from its first pass, not a login change under the lab seat's sessions a while later.
+    ctx.reload_seat_info()?;
+    Ok((ctx, demo))
 }
 
 /// `swarmy jump`: the oldest session that waits for the user, from the dashboard's summary when
