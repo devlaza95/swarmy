@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::Hub;
 use super::http::Request;
+use super::timeline;
 use crate::app::context::Ctx;
 use crate::core::harness::Harness;
 use crate::core::limits::Level;
@@ -23,6 +24,9 @@ use crate::ui::glossary::{self, Group};
 pub enum ApiError {
     /// The request named something that does not exist: the caller can fix it.
     BadRequest(String),
+    /// The request was well formed but what it asks for is not there (any more): an agent that
+    /// left the list between two calls.
+    NotFound(String),
     Internal(anyhow::Error),
 }
 
@@ -73,10 +77,15 @@ fn shown_name(ctx: &Ctx, s: &str) -> String {
     }
 }
 
+/// The context window of the agent's model, as the AGENT card counts it.
+fn window_of(a: &Agent) -> u64 {
+    a.model.as_deref().map(context_window).unwrap_or(1_000_000)
+}
+
 fn agent_json(ctx: &Ctx, a: &Agent) -> Value {
     let (state, detail) = state_parts(&a.state);
     let quiet = ctx.now - a.last_activity;
-    let window = a.model.as_deref().map(context_window).unwrap_or(1_000_000);
+    let window = window_of(a);
     json!({
         "key": a.key(),
         "name": shown_name(ctx, &a.name),
@@ -148,6 +157,36 @@ pub fn live(hub: &Hub) -> ApiResult {
         )));
     };
     Ok(live_json(&hub.ctx, snap))
+}
+
+/// One agent's expanded row: its latest tool calls and its life. Asked for by the agent's `key`
+/// (as `/api/live` gives it), only for the rows a person opened; `Reads::detail` reads the index
+/// again only when that agent has something new, so a poll of an open row is a lookup.
+pub fn agent(hub: &mut Hub, req: &Request) -> ApiResult {
+    let Some(key) = req.param("key") else {
+        return Err(ApiError::BadRequest(
+            "missing `key`: the agent's key, as /api/live gives it".into(),
+        ));
+    };
+    // The key is only compared with the agents shown now, never parsed or looked up elsewhere.
+    let found = hub
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.agents.iter().find(|a| a.key() == key))
+        .cloned();
+    let Some(a) = found else {
+        return Err(ApiError::NotFound(
+            "no such agent: it may have finished and left the list".into(),
+        ));
+    };
+    let detail = hub.reads.detail(&hub.idx, &a)?;
+    let now = hub.ctx.now;
+    Ok(json!({
+        "key": a.key(),
+        "taken_at": now,
+        "tools": timeline::tool_views(&detail.tools, timeline::is_at_work(&a.state), hub.ctx.mask),
+        "life": timeline::life_view(&detail.life, window_of(&a), now),
+    }))
 }
 
 #[derive(Serialize)]
@@ -351,6 +390,246 @@ mod tests {
             "{msg}"
         );
         assert!(matches!(parse_enum::<Dim>("grouping", "DAY"), Ok(Dim::Day)));
+    }
+
+    // ---- /api/agent: a Hub over a synthetic world in a temp dir ----------------------------------
+
+    use crate::index::scenarios::{World, owner};
+    use crate::ui::style::{ColorChoice, Painter};
+    use chrono::{DateTime, Duration, Utc};
+
+    /// A path no sane tool would be asked about, which a page that built markup from it would
+    /// run.
+    const HOSTILE: &str = "<img src=x onerror=alert(1)>";
+
+    /// One response of the agent: its prompt size and the tools it asks for (id, name, input).
+    fn request(id: &str, at: DateTime<Utc>, prompt: u64, tools: &[(&str, &str, Value)]) -> String {
+        let content: Vec<Value> = tools
+            .iter()
+            .map(|(tid, name, input)| json!({"type": "tool_use", "id": tid, "name": name, "input": input}))
+            .collect();
+        json!({
+            "type": "assistant", "timestamp": at.to_rfc3339(), "cwd": "/w/shop", "sessionId": "s1",
+            "message": {"id": id, "model": "claude-sonnet-5-5", "content": content,
+                "usage": {"input_tokens": prompt, "output_tokens": 100,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    fn result(at: DateTime<Utc>, tool_id: &str, is_error: bool) -> String {
+        json!({
+            "type": "user", "timestamp": at.to_rfc3339(),
+            "message": {"role": "user", "content": [
+                {"tool_use_id": tool_id, "type": "tool_result", "content": "out", "is_error": is_error}]},
+            "toolUseResult": {"stdout": "out"}
+        })
+        .to_string()
+    }
+
+    /// Four requests in the last four minutes, with prompts of 20k, 40k, 120k and 30k tokens
+    /// (the last one a fall to under half of 120k: a compaction) and these tools:
+    /// Read (ok, 1 s), Bash `cargo test` (failed, 10 s), an Edit of `HOSTILE` (ok, 2 s) and
+    /// Bash `sleep 600`, which never got a result.
+    fn world() -> World {
+        let w = World::new(&["work"]);
+        let now = Utc::now();
+        let at = |secs: i64| now - Duration::seconds(secs);
+        let path = |p: &str| json!({ "file_path": p });
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                request(
+                    "m1",
+                    at(240),
+                    20_000,
+                    &[("t1", "Read", path("/w/shop/src/cart.rs"))],
+                ),
+                result(at(239), "t1", false),
+                request(
+                    "m2",
+                    at(180),
+                    40_000,
+                    &[("t2", "Bash", json!({"command": "cargo test"}))],
+                ),
+                result(at(170), "t2", true),
+                request("m3", at(60), 120_000, &[("t3", "Edit", path(HOSTILE))]),
+                result(at(58), "t3", false),
+                request(
+                    "m4",
+                    at(30),
+                    30_000,
+                    &[("t4", "Bash", json!({"command": "sleep 600"}))],
+                ),
+            ],
+        );
+        w
+    }
+
+    /// The context only for a hub: a made-up context over the world's seats, never real ones.
+    fn hub(w: &World) -> Hub {
+        let painter = Painter::new(ColorChoice::Never);
+        let ctx = Ctx::demo(painter, w.seats.clone(), w.dir.path()).unwrap();
+        Hub::new(ctx).unwrap()
+    }
+
+    fn ask(path: &str, key: Option<&str>) -> Request {
+        Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: key
+                .map(|k| ("key".to_string(), k.to_string()))
+                .into_iter()
+                .collect(),
+            host: Some("127.0.0.1:7878".into()),
+            fetch_site: None,
+        }
+    }
+
+    fn key_of_main(hub: &Hub) -> String {
+        let snap = hub.snapshot.as_ref().unwrap();
+        assert_eq!(snap.agents.len(), 1, "one session, one main thread");
+        snap.agents[0].key()
+    }
+
+    #[test]
+    fn an_agents_detail_has_its_tools_newest_first_and_its_life_in_buckets() {
+        let w = world();
+        let mut hub = hub(&w);
+        let key = key_of_main(&hub);
+        let v = agent(&mut hub, &ask("/api/agent", Some(&key)))
+            .ok()
+            .unwrap();
+        assert_eq!(v["key"], key.as_str());
+
+        // Newest first. The session is not running, so the call with no result never finished.
+        let tools = v["tools"].as_array().unwrap();
+        let seen: Vec<(&str, &str, &str, Option<i64>)> = tools
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap(),
+                    t["summary"].as_str().unwrap(),
+                    t["status"].as_str().unwrap(),
+                    t["took_ms"].as_i64(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("Bash", "sleep 600", "unfinished", None),
+                ("Edit", HOSTILE, "ok", Some(2_000)),
+                ("Bash", "cargo test", "failed", Some(10_000)),
+                ("Read", "/w/shop/src/cart.rs", "ok", Some(1_000)),
+            ]
+        );
+
+        // The life: four requests in 48 buckets, the context against the model's window.
+        let life = &v["life"];
+        assert_eq!(life["requests"], 4);
+        let window = context_window("claude-sonnet-5-5") as f64;
+        let ctx_at = |i: usize| life["context_pct"][i].as_f64().unwrap();
+        let pct = |tokens: f64| (tokens / window * 1000.0).round() / 10.0;
+        assert_eq!(life["cost"].as_array().unwrap().len(), 48);
+        assert_eq!(ctx_at(0), pct(20_000.0));
+        assert_eq!(
+            ctx_at(47),
+            pct(30_000.0),
+            "the last request's context, at the end"
+        );
+        assert_eq!(life["compactions"].as_array().unwrap().len(), 1);
+        // The same money as the live row and the dashboard's AGENT card.
+        let live = live(&hub).ok().unwrap();
+        let row = &live["agents"][0];
+        let total = life["total_cost"].as_f64().unwrap();
+        assert!(
+            total > 0.0 && (total - row["cost"].as_f64().unwrap()).abs() < 1e-5,
+            "{total}"
+        );
+        let bars: f64 = life["cost"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_f64)
+            .sum();
+        assert!(
+            (bars - total).abs() < 1e-5,
+            "the buckets add up to the total"
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_result_is_running_while_its_agent_is_at_work() {
+        let w = world();
+        let mut hub = hub(&w);
+        let key = key_of_main(&hub);
+        if let Some(snap) = hub.snapshot.as_mut() {
+            snap.agents[0].state = State::Thinking;
+        }
+        let v = agent(&mut hub, &ask("/api/agent", Some(&key)))
+            .ok()
+            .unwrap();
+        assert_eq!(v["tools"][0]["status"], "running");
+        assert_eq!(v["tools"][1]["status"], "ok", "a result decides");
+    }
+
+    /// A hostile tool path is a string in a JSON body that is served as JSON and never
+    /// sniffed as anything else; the page puts it in a text node (see the guards in
+    /// `web::tests`).
+    #[test]
+    fn a_hostile_tool_summary_stays_a_plain_string_in_a_json_response() {
+        let w = world();
+        let mut hub = hub(&w);
+        let key = key_of_main(&hub);
+        let resp = super::super::answer(&mut hub, &ask("/api/agent", Some(&key)));
+        assert_eq!(resp.status, 200);
+        assert!(resp.content_type.starts_with("application/json"));
+        let bytes = String::from_utf8(resp.to_bytes()).unwrap();
+        assert!(bytes.contains("X-Content-Type-Options: nosniff"));
+        let body: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["tools"][1]["summary"], HOSTILE);
+    }
+
+    #[test]
+    fn mask_hides_what_the_tools_were_asked_but_not_which_tools_ran() {
+        let w = world();
+        let mut hub = hub(&w);
+        hub.ctx.mask = true;
+        let key = key_of_main(&hub);
+        let v = agent(&mut hub, &ask("/api/agent", Some(&key)))
+            .ok()
+            .unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|t| t["summary"] == ""));
+        assert_eq!(tools[3]["name"], "Read");
+        assert!(!v.to_string().contains("cart.rs") && !v.to_string().contains("onerror"));
+    }
+
+    #[test]
+    fn a_missing_or_unknown_key_is_for_the_caller_to_fix() {
+        let w = world();
+        let mut hub = hub(&w);
+        assert!(matches!(
+            agent(&mut hub, &ask("/api/agent", None)),
+            Err(ApiError::BadRequest(m)) if m.contains("key")
+        ));
+        // Gone from the list is not a server fault: a 404 the page takes quietly.
+        assert!(matches!(
+            agent(&mut hub, &ask("/api/agent", Some("0000/none/"))),
+            Err(ApiError::NotFound(_))
+        ));
+        let mut code =
+            |key: Option<&str>| super::super::answer(&mut hub, &ask("/api/agent", key)).status;
+        assert_eq!(code(None), 400);
+        assert_eq!(code(Some("0000/none/")), 404);
+        // The key is compared, not interpreted: paths and SQL are just keys that match nothing.
+        for odd in ["../../etc/passwd", "' OR 1=1 --", "%00", "*", ""] {
+            assert!(matches!(code(Some(odd)), 400 | 404), "{odd}");
+        }
     }
 
     #[test]

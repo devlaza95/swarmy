@@ -92,6 +92,11 @@ card and the web detail rows show. Sub-agents hang under their parent, so a sess
 tree. `live::Reads` caches per-agent reads and only re-reads an agent when the index reports new
 data, which is what keeps the dashboard under its CPU budget.
 
+An agent's latest tool calls and its life (what each request cost, how full the context was) are
+read on request, for one agent at a time: `Reads::detail` in `src/live/detail.rs`, under the same
+rule. The AGENT card of the terminal dashboard and the web view's expanded row show the same two
+things; the web page asks for an agent (`/api/agent?key=…`) only while its row is open.
+
 ## 5. The login vault
 
 The vault stores OAuth logins and switches which one a seat uses. It is the only code that ever
@@ -145,14 +150,15 @@ src/
   index/    SQLite index: ingest, queries, settled-span cache, archive rollups
   core/     pure types and maths: ids, units, periods, pricing, limits
   limits/   per-account limit report built from index + readings
-  live/     the agent tree: states, hints, per-agent read cache
+  live/     the agent tree: states, hints, per-agent read cache (detail.rs: tools and life)
   procs.rs  process table (CPU, memory, children)
   vault/    saved logins and seat switching (the only writer)
   app/      Ctx: the shared model, plus views.rs (report data shared by front ends)
   ui/       glyphs, palette, glossary
   tui/      terminal dashboard
   cli/      subcommands
-  web/      browser dashboard (http.rs parse/respond, api.rs JSON, mod.rs server, assets/)
+  web/      browser dashboard (http.rs parse/respond, api.rs JSON, timeline.rs the open row's
+            data, mod.rs server, assets/)
   demo/     the made-up world behind `swarmy demo` and `swarmy web --demo`
   agy/ codex/   Antigravity and Codex readers (not covered here)
 ```

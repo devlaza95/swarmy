@@ -133,6 +133,18 @@ pub const TERMS: &[Term] = &[
          agents stay on screen for a few minutes under RECENTLY DONE.",
         &["needs you"],
     ),
+    term(
+        "tool timeline",
+        &["tools", "recent tools", "▶", "✗"],
+        Group::States,
+        "an agent's latest tool calls, newest first",
+        "Each line is one call the agent made: when it started, how it ended, how long it \
+         took, the tool and what it was asked (a command, a path, a pattern). ✓ finished, \
+         ✗ failed, ▶ still running, · no result and the agent is no longer at work. The AGENT \
+         card of the terminal dashboard lists the same calls. `--mask` hides what the tools \
+         were asked.",
+        &["working", "life chart"],
+    ),
     // ── Money and context ─────────────────────────────────────────────────────────────────
     term(
         "api-equivalent cost",
@@ -190,11 +202,22 @@ pub const TERMS: &[Term] = &[
         &[],
         Group::Spend,
         "the conversation was summarised to free context",
-        "In the AGENT life chart a vertical marker shows where the context fell to under half \
-         of the previous request's size after being above 50,000 tokens: that is Claude Code \
+        "In the life chart a vertical marker shows where the context fell to under half of the \
+         previous request's size after being above 50,000 tokens: that is Claude Code \
          summarising the conversation. swarmy infers it from the numbers; it is not a recorded \
          event.",
-        &["context"],
+        &["context", "life chart"],
+    ),
+    term(
+        "life chart",
+        &["life", "sparkline"],
+        Group::Spend,
+        "an agent's cost and context from its first request to now",
+        "Two strips of bars: the dollars spent in each slice of time, and how full the context \
+         window was at the end of each slice, from the agent's first request to now (its last \
+         2,000 requests at most). A vertical marker shows a compaction. The AGENT card of the \
+         terminal dashboard draws the same two things; in the web view, hover a bar for its time.",
+        &["context", "compaction", "api-equivalent cost"],
     ),
     term(
         "effort",
