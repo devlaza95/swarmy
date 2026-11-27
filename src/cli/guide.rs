@@ -13,7 +13,8 @@ const STEPS: &[(&str, &str)] = &[
     (
         "swarmy doctor",
         "What swarmy found on this machine (config dirs, transcripts, logins) and whether it \
-         can read it. Run it first when something looks empty.",
+         can read it. Run it first when something looks empty: it ends with NEXT STEPS, what to \
+         do about each problem.",
     ),
     (
         "swarmy",

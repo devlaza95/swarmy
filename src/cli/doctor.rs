@@ -9,6 +9,8 @@ use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 
+use super::explain::text_width;
+use super::next_steps::{self, Findings};
 use crate::app::context::Ctx;
 use crate::index::Index;
 
@@ -94,6 +96,12 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         .iter()
         .filter(|s| s.harness.supports_statusline())
         .count();
+    // What the NEXT STEPS section at the end is made from: each check below adds its finding.
+    let mut found = Findings {
+        no_seats: ctx.seats.is_empty(),
+        unreadable_setup: ctx.problems.len(),
+        ..Findings::default()
+    };
     let with: Vec<&str> = ctx
         .seats
         .iter()
@@ -106,6 +114,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         })
         .map(|s| s.label.as_str())
         .collect();
+    found.no_status_line = claude_seats > 0 && with.is_empty();
     if claude_seats > 0 {
         println!();
         if with.is_empty() {
@@ -214,6 +223,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         .iter()
         .filter(|c| c.config_dir.is_none() && !ctx.seats.iter().any(|s| s.is_default))
         .count();
+    found.unseen_default_dir = unregistered;
     if unregistered > 0 {
         println!(
             "{}",
@@ -238,12 +248,15 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             )
         ))
     );
+    let requests = idx.count(Counted::Requests)?;
+    found.no_transcripts = stats.files_total == 0;
+    found.no_requests = requests == 0;
     println!(
         "{}",
         ok(&format!(
             "{} transcripts · {} requests · {} tool calls · {} sessions · {} agents",
             fmt::count(stats.files_total as u64),
-            fmt::count(idx.count(Counted::Requests)?),
+            fmt::count(requests),
             fmt::count(idx.count(Counted::ToolCalls)?),
             fmt::count(idx.count(Counted::Sessions)?),
             fmt::count(idx.count(Counted::Agents)?)
@@ -258,10 +271,12 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             stats.elapsed.as_secs_f64()
         ))
     );
-    let (empty_lines, hidden) = empty_seats(ctx, &idx, &live_by_seat)?;
-    for line in empty_lines {
-        println!("{}", info(&line));
+    let checked = empty_seats(ctx, &idx, &live_by_seat)?;
+    for line in &checked.lines {
+        println!("{}", info(line));
     }
+    let hidden = checked.hidden;
+    found.signed_out = checked.signed_out;
     let mut ps = ParseStats::default();
     for (t, n) in idx.record_types()? {
         if t == crate::claude::transcript::MALFORMED {
@@ -270,6 +285,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ps.by_type.insert(t, n);
         }
     }
+    found.damaged_records = ps.malformed;
     if ps.malformed > 0 {
         println!(
             "{}",
@@ -279,7 +295,8 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
-    if let Some(n) = idx.meta("rebuild_refused")?.filter(|n| n != "0") {
+    found.rebuild_refused = idx.meta("rebuild_refused")?.filter(|n| n != "0");
+    if let Some(n) = &found.rebuild_refused {
         println!(
             "{}",
             warn(&format!(
@@ -288,7 +305,9 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
-    for (path, error, since) in idx.unreadable_files()? {
+    let unreadable = idx.unreadable_files()?;
+    found.unreadable_files = unreadable.len();
+    for (path, error, since) in unreadable {
         println!(
             "{}",
             warn(&format!(
@@ -315,20 +334,21 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         })
         .map(|(_, t, n)| (t.as_str(), *n))
         .collect();
+    found.unknown_types = unknown.iter().map(|(t, n)| format!("{t} ({n})")).collect();
     if unknown.is_empty() {
         println!("{}", ok("every transcript record type is recognised"));
     } else {
-        let list: Vec<String> = unknown.iter().map(|(t, n)| format!("{t} ({n})")).collect();
         println!(
             "{}",
             warn(&format!(
                 "unrecognised record types (Claude Code format moved on?): {}",
-                list.join(", ")
+                found.unknown_types.join(", ")
             ))
         );
     }
     let week = Period::Days(7).span(ctx.now, None);
     let total = idx.total(week, &Filter::default())?;
+    found.unpriced = total.unpriced;
     if total.unpriced > 0 {
         println!(
             "{}",
@@ -341,6 +361,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let (n, theirs, ours) = idx.cost_crosscheck(week)?;
     if n > 0 && theirs > 0.0 {
         let diff = (ours - theirs) / theirs * 100.0;
+        found.cost_mismatch = diff.abs() > 5.0;
         let line = format!(
             "cost cross-check, {n} sessions of the last 7 days: Claude Code counted {}, transcripts give {} ({:+.1}%; background calls such as titles are not in transcripts)",
             fmt::money(theirs),
@@ -371,13 +392,19 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     println!();
     println!("{}", p.paint("STORAGE", Tone::Header));
     idx.sample_storage(ctx.now.with_timezone(&chrono::Local).date_naive())?;
-    for line in storage(ctx, &mut idx)? {
+    let section = storage(ctx, &mut idx)?;
+    for line in &section.lines {
         println!("{line}");
     }
+    found.index_over_budget = section.over_budget;
+    found.vacuum_waiting = section.vacuum_waiting;
 
     println!();
     println!("{}", p.paint("LIMIT READINGS", Tone::Header));
     let readings = ctx.latest_readings(&idx)?;
+    let claude_in_use = claude_seats > 0 && !hidden.contains(&Harness::Claude);
+    found.no_limit_readings = claude_in_use && readings.is_empty();
+    found.no_status_line &= claude_in_use;
     if readings.is_empty() && hidden.contains(&Harness::Claude) {
         // A machine without Claude Code in use (its seats are empty): nothing to read.
         println!(
@@ -421,7 +448,23 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         }
     );
+
+    println!();
+    println!("{}", p.paint("NEXT STEPS", Tone::Header));
+    print!(
+        "{}",
+        next_steps::render(p, text_width(), &next_steps::steps(&found))
+    );
     Ok(())
+}
+
+/// What the seat check found: lines to print, and the facts the NEXT STEPS are made from.
+struct SeatCheck {
+    lines: Vec<String>,
+    /// The harnesses the dashboard leaves out.
+    hidden: Vec<Harness>,
+    /// Seats in use that hold no login (label, harness).
+    signed_out: Vec<(String, Harness)>,
 }
 
 /// The STORAGE section: the index's size, the raw window and the rollups, growth and the
@@ -434,7 +477,7 @@ fn empty_seats(
     ctx: &Ctx,
     idx: &Index,
     live: &std::collections::HashMap<crate::core::ids::SeatId, Vec<LiveSession>>,
-) -> anyhow::Result<(Vec<String>, Vec<Harness>)> {
+) -> anyhow::Result<SeatCheck> {
     let vault_seats: Vec<crate::claude::seats::Seat> = ctx
         .seats
         .iter()
@@ -446,12 +489,13 @@ fn empty_seats(
     let (states, logins) = match read {
         Ok(r) => r,
         Err(e) => {
-            return Ok((
-                vec![format!(
+            return Ok(SeatCheck {
+                lines: vec![format!(
                     "empty seats not checked: the vault cannot be read ({e:#})"
                 )],
-                Vec::new(),
-            ));
+                hidden: Vec::new(),
+                signed_out: Vec::new(),
+            });
         }
     };
     let uses = ctx.seat_uses(idx, &states, |s| live.get(&s.id).map_or(0, Vec::len))?;
@@ -484,10 +528,30 @@ fn empty_seats(
             ));
         }
     }
-    Ok((out, hidden_harnesses))
+    let signed_out = ctx
+        .seats
+        .iter()
+        .zip(&uses)
+        .filter(|(_, u)| next_steps::in_use_without_login(u))
+        .map(|(s, _)| (s.label.clone(), s.harness))
+        .collect();
+    Ok(SeatCheck {
+        lines: out,
+        hidden: hidden_harnesses,
+        signed_out,
+    })
 }
 
-fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
+/// The STORAGE section's lines, and the two findings the NEXT STEPS are made from.
+struct StorageSection {
+    lines: Vec<String>,
+    /// The index would pass its size budget within 12 months.
+    over_budget: bool,
+    /// Why the one-time VACUUM has not run, when it waits.
+    vacuum_waiting: Option<String>,
+}
+
+fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<StorageSection> {
     let p = &ctx.painter;
     let ok = |s: &str| format!("{} {s}", p.paint("[ OK ]", Tone::Good));
     let warn = |s: &str| format!("{} {s}", p.paint("[WARN]", Tone::Warn));
@@ -546,7 +610,8 @@ fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
         hb(o.in_12_months),
         ctx.config.storage.budget_mb
     );
-    out.push(if o.in_12_months > budget {
+    let over_budget = o.in_12_months > budget;
+    out.push(if over_budget {
         warn(&growth)
     } else {
         ok(&growth)
@@ -602,7 +667,8 @@ fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
             "auto_compact = false: the dashboard does not compact; `swarmy compact` does",
         ));
     }
-    if let Some(why) = idx.vacuum_skipped()? {
+    let vacuum_waiting = idx.vacuum_skipped()?;
+    if let Some(why) = &vacuum_waiting {
         out.push(warn(&format!(
             "auto-vacuum off: the one-time VACUUM {why}; `swarmy compact --vacuum` runs it now"
         )));
@@ -621,7 +687,11 @@ fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
             fmt::count(d.rows)
         )));
     }
-    Ok(out)
+    Ok(StorageSection {
+        lines: out,
+        over_budget,
+        vacuum_waiting,
+    })
 }
 
 #[cfg(test)]
@@ -629,11 +699,134 @@ mod tests {
     use super::*;
     use crate::config::{Config, Dirs};
     use crate::core::pricing::PriceBook;
+    use crate::index::SeatInfo;
     use crate::index::archive_scenarios::{NOW, populate, refresh};
     use crate::index::compact::CompactOpts;
-    use crate::index::scenarios::{World, at};
+    use crate::index::scenarios::{World, account, at};
     use crate::procs::ProcTable;
     use crate::ui::style::{ColorChoice, Painter};
+
+    /// A context over the world's seats; `seat_info` says which of them know their account.
+    fn ctx_of(w: &World, seat_info: Vec<SeatInfo>, config: Config) -> Ctx {
+        Ctx {
+            dirs: Dirs {
+                data: w.dir.path().join("data"),
+                config: w.dir.path().join("config"),
+                home: w.dir.path().to_path_buf(),
+            },
+            config,
+            seats: w.seats.clone(),
+            seat_info,
+            prices: PriceBook::builtin(),
+            procs: ProcTable::empty(),
+            painter: Painter::new(ColorChoice::Never),
+            mask: false,
+            now: at(NOW),
+            login_labels: Default::default(),
+            login_tiers: Default::default(),
+            problems: Vec::new(),
+        }
+    }
+
+    fn seat_info(w: &World, label: &str, known_account: bool) -> SeatInfo {
+        SeatInfo {
+            seat: w.id(label),
+            label: label.into(),
+            account: known_account.then(|| account("acc-a", "2026-10-01T00:00:00Z")),
+            switched_at: None,
+            utilization: None,
+        }
+    }
+
+    /// The seats `doctor` says hold no login: the ones in use (read transcripts) without an
+    /// account. An unused seat is left out (the dashboard hides it), and so is one with an account.
+    #[test]
+    fn a_seat_in_use_without_a_login_becomes_a_next_step() {
+        let w = World::new(&["work", "home", "lab", "spare"]);
+        populate(&w);
+        let mut idx = w.index("i.sqlite");
+        refresh(&w, &mut idx);
+        let info = vec![
+            seat_info(&w, "work", true),
+            seat_info(&w, "home", false),
+            seat_info(&w, "lab", false),
+            seat_info(&w, "spare", false),
+        ];
+        let ctx = ctx_of(&w, info, Config::default());
+        let check = empty_seats(&ctx, &idx, &Default::default()).unwrap();
+        assert_eq!(
+            check.signed_out,
+            [
+                ("home".to_string(), Harness::Claude),
+                ("lab".to_string(), Harness::Claude)
+            ]
+        );
+        assert!(
+            check.lines.iter().any(|l| l.starts_with("seat 'spare'")),
+            "{:?}",
+            check.lines
+        );
+        let found = Findings {
+            signed_out: check.signed_out,
+            ..Findings::default()
+        };
+        let text = next_steps::render(&ctx.painter, 100, &next_steps::steps(&found));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("seat 'home' (Claude Code) holds no login"),
+            "{text}"
+        );
+        assert!(
+            text.contains("seat 'lab' (Claude Code) holds no login"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("seat 'work'") && !text.contains("seat 'spare'"),
+            "{text}"
+        );
+    }
+
+    /// The two storage findings the NEXT STEPS read: the budget and the waiting VACUUM.
+    #[test]
+    fn the_storage_section_reports_what_the_next_steps_need() {
+        let w = World::new(&["work", "home", "lab"]);
+        populate(&w);
+        let mut idx = w.index("i.sqlite");
+        refresh(&w, &mut idx);
+        let ctx = ctx_of(&w, Vec::new(), Config::default());
+        let fine = storage(&ctx, &mut idx).unwrap();
+        assert!(!fine.over_budget);
+        assert_eq!(fine.vacuum_waiting, None);
+        // A budget nothing fits in: over it, and the warning line says so.
+        let mut tight = Config::default();
+        tight.storage.budget_mb = 0;
+        let ctx = ctx_of(&w, Vec::new(), tight);
+        let over = storage(&ctx, &mut idx).unwrap();
+        assert!(over.over_budget);
+        assert!(
+            over.lines.iter().any(|l| l.contains("[WARN] growth")),
+            "{:?}",
+            over.lines
+        );
+        idx.vacuum_to_incremental(true, None, false)
+            .unwrap()
+            .unwrap_err();
+        let waits = storage(&ctx, &mut idx).unwrap();
+        assert_eq!(
+            waits.vacuum_waiting.as_deref(),
+            Some("waits for mains power")
+        );
+        // Both reach the section as the steps for them.
+        let found = Findings {
+            index_over_budget: over.over_budget,
+            vacuum_waiting: waits.vacuum_waiting,
+            ..Findings::default()
+        };
+        let text = next_steps::render(&ctx.painter, 100, &next_steps::steps(&found));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("`swarmy compact --dry-run`"), "{text}");
+        assert!(text.contains("VACUUM waits for mains power"), "{text}");
+    }
 
     #[test]
     fn the_storage_section() {
@@ -646,25 +839,8 @@ mod tests {
         .unwrap();
         let mut idx = w.index("i.sqlite");
         refresh(&w, &mut idx);
-        let ctx = Ctx {
-            dirs: Dirs {
-                data: w.dir.path().join("data"),
-                config: w.dir.path().join("config"),
-                home: w.dir.path().to_path_buf(),
-            },
-            config: Config::default(),
-            seats: w.seats.clone(),
-            seat_info: Vec::new(),
-            prices: PriceBook::builtin(),
-            procs: ProcTable::empty(),
-            painter: Painter::new(ColorChoice::Never),
-            mask: false,
-            now: at(NOW),
-            login_labels: Default::default(),
-            login_tiers: Default::default(),
-            problems: Vec::new(),
-        };
-        let text = |idx: &mut Index| storage(&ctx, idx).unwrap().join("\n");
+        let ctx = ctx_of(&w, Vec::new(), Config::default());
+        let text = |idx: &mut Index| storage(&ctx, idx).unwrap().lines.join("\n");
         let before = text(&mut idx);
         assert!(before.contains("auto-vacuum off"), "{before}");
         assert!(before.contains("nothing rolled up yet"), "{before}");
