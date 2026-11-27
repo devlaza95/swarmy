@@ -39,6 +39,15 @@ pub struct AgentRow {
 type CostAt = (i64, String, f64);
 
 /// Which agent a per-agent read is about.
+/// What `Index::spend_per_minute_by_model` read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MinuteSpend {
+    /// (minute index from the start, model, cost).
+    pub minutes: Vec<(i64, String, f64)>,
+    /// Each model's spend since the cutoff.
+    pub hour: Vec<(String, f64)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AgentKey<'a> {
     pub seat: &'a SeatId,
@@ -386,18 +395,20 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Spend per minute and model since `start`: (minute index from `start`, model, cost).
+    /// Spend per minute and model since `start`: (minute index from `start`, model, cost),
+    /// and each model's spend since `hour_from` (the BURN chart's bins and its rates).
     /// Runs every second over the last hour: the settled rows of that hour are kept between
     /// calls (`settled`), only the last quarter hours are read again.
     pub fn spend_per_minute_by_model(
         &self,
         start: DateTime<Utc>,
-    ) -> anyhow::Result<Vec<(i64, String, f64)>> {
+        hour_from: DateTime<Utc>,
+    ) -> anyhow::Result<MinuteSpend> {
         // The kept rows start an hour before the horizon, so they cover `start` until the
         // horizon moves.
         let from = settled::horizon(self.now()) - chrono::Duration::hours(1);
         let span = Span {
-            start: from.min(start),
+            start: from.min(start).min(hour_from),
             end: DateTime::<Utc>::MAX_UTC,
         };
         let read = |c: &rusqlite::Connection, s: Span| -> anyhow::Result<Rc<Vec<CostAt>>> {
@@ -410,17 +421,24 @@ impl Index {
             Ok(Rc::new(rows.collect::<Result<_, _>>()?))
         };
         let (old, new) = self.settled_read(&format!("burn_rows|{}", ms(span.start)), span, read)?;
-        let t0 = ms(start);
+        let (t0, h0) = (ms(start), ms(hour_from));
         let mut by: HashMap<(i64, &str), f64> = HashMap::new();
+        let mut hour: HashMap<&str, f64> = HashMap::new();
         for (ts, model, cost) in old.iter().flat_map(|o| o.iter()).chain(new.iter()) {
             if *ts >= t0 {
                 *by.entry(((ts - t0) / 60_000, model.as_str())).or_default() += cost;
             }
+            if *ts >= h0 {
+                *hour.entry(model.as_str()).or_default() += cost;
+            }
         }
-        Ok(by
-            .into_iter()
-            .map(|((i, m), c)| (i, m.to_string(), c))
-            .collect())
+        Ok(MinuteSpend {
+            minutes: by
+                .into_iter()
+                .map(|((i, m), c)| (i, m.to_string(), c))
+                .collect(),
+            hour: hour.into_iter().map(|(m, c)| (m.to_string(), c)).collect(),
+        })
     }
 
     /// Everything spent since `since` (its settled part kept between calls, `settled`).

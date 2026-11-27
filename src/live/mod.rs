@@ -138,9 +138,11 @@ pub struct Snapshot {
     pub taken_at: Option<DateTime<Utc>>,
     /// Ordered as a forest: each main thread followed by its descendants.
     pub agents: Vec<Agent>,
-    /// USD per minute for the last 60 minutes, per model (`models::short_name`: `opus-5.5`,
-    /// `gem-4-neon`).
+    /// USD per clock minute, per model (`models::short_name`: `opus-5.5`, `gem-4-neon`):
+    /// [`BURN_MINUTES`] of them from [`burn_start`], the last one the minute now in.
     pub burn: BTreeMap<String, Vec<f64>>,
+    /// USD per model over the last 60 minutes, to the second: the rates beside the chart.
+    pub burn_hour: BTreeMap<String, f64>,
     pub burn_per_hour: f64,
     pub today_cost: f64,
     pub errors_last_hour: Vec<(String, u64)>,
@@ -170,14 +172,32 @@ impl Snapshot {
     /// nothing are left out.
     pub fn burn_by_model(&self) -> Vec<(&str, f64)> {
         let mut v: Vec<(&str, f64)> = self
-            .burn
+            .burn_hour
             .iter()
-            .map(|(fam, mins)| (fam.as_str(), mins.iter().sum::<f64>()))
+            .map(|(m, r)| (m.as_str(), *r))
             .filter(|(_, r)| *r > 0.0)
             .collect();
         v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
         v
     }
+}
+
+/// The BURN chart's bins: whole clock minutes, the first one cut by the hour's start, the last
+/// one the minute now in, still filling.
+pub const BURN_MINUTES: usize = 61;
+
+/// The start of the BURN chart's first bin: the clock minute an hour before the one `now` is
+/// in. The bins stay put while a minute lasts and step once when it turns (counted from `now`,
+/// every second moved a few requests into the next bin and the bars jittered).
+pub fn burn_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    let minute = DateTime::from_timestamp(now.timestamp().div_euclid(60) * 60, 0).unwrap_or(now);
+    minute - Duration::minutes(60)
+}
+
+/// How far `now` is into its clock minute, from 0 up to 1: how far the chart slid left since
+/// its bins last stepped.
+pub fn burn_offset(now: DateTime<Utc>) -> f64 {
+    (now - burn_start(now) - Duration::minutes(60)).num_milliseconds() as f64 / 60_000.0
 }
 
 pub fn build(
@@ -507,17 +527,23 @@ pub fn build(
         ..Default::default()
     };
 
-    // Burn per minute by model, last 60 minutes.
-    let start = now - Duration::minutes(60);
-    let mut total = 0.0;
-    for (i, model, c) in idx.spend_per_minute_by_model(start)? {
-        if (0..60).contains(&i) {
+    // Burn per clock minute by model, and each model's last 60 minutes.
+    let burn = idx.spend_per_minute_by_model(burn_start(now), now - Duration::minutes(60))?;
+    for (i, model, c) in burn.minutes {
+        if (0..BURN_MINUTES as i64).contains(&i) {
             let name = crate::core::models::short_name(&model);
-            snap.burn.entry(name).or_insert_with(|| vec![0.0; 60])[i as usize] += c;
-            total += c;
+            snap.burn
+                .entry(name)
+                .or_insert_with(|| vec![0.0; BURN_MINUTES])[i as usize] += c;
         }
     }
-    snap.burn_per_hour = total;
+    for (model, c) in burn.hour {
+        *snap
+            .burn_hour
+            .entry(crate::core::models::short_name(&model))
+            .or_default() += c;
+    }
+    snap.burn_per_hour = snap.burn_hour.values().sum();
     let midnight =
         crate::core::period::local_midnight(now.with_timezone(&chrono::Local).date_naive());
     snap.today_cost = idx.spend_since(midnight)?;
@@ -562,7 +588,7 @@ pub fn build(
             });
         }
     }
-    snap.errors_last_hour = idx.api_error_counts(start)?;
+    snap.errors_last_hour = idx.api_error_counts(now - Duration::minutes(60))?;
     Ok(snap)
 }
 
@@ -806,20 +832,11 @@ mod tests {
 
     #[test]
     fn the_burn_per_model_adds_up_to_the_burn_per_hour() {
-        // opus-5.5: $1.50 + $0.25 over the hour = $1.75/h; gem-4-neon: $0.30; gem-4-hydrogen
-        // spent nothing.
+        // opus-5.5: $1.75 in the hour; gem-4-neon: $0.30; gem-4-hydrogen spent nothing.
         let mut snap = Snapshot::default();
-        let mins = |v: &[(usize, f64)]| {
-            let mut m = vec![0.0; 60];
-            for (i, c) in v {
-                m[*i] = *c;
-            }
-            m
-        };
-        snap.burn
-            .insert("opus-5.5".into(), mins(&[(3, 1.5), (59, 0.25)]));
-        snap.burn.insert("gem-4-neon".into(), mins(&[(10, 0.3)]));
-        snap.burn.insert("gem-4-hydrogen".into(), mins(&[]));
+        snap.burn_hour.insert("opus-5.5".into(), 1.75);
+        snap.burn_hour.insert("gem-4-neon".into(), 0.3);
+        snap.burn_hour.insert("gem-4-hydrogen".into(), 0.0);
         snap.burn_per_hour = 2.05;
         let rates = snap.burn_by_model();
         assert_eq!(rates, vec![("opus-5.5", 1.75), ("gem-4-neon", 0.3)]);
@@ -864,6 +881,75 @@ mod tests {
             last_request_ts: None,
             lane: Vec::new(),
         }
+    }
+
+    /// The BURN chart's bins are clock minutes. They were counted from the current second, so
+    /// every second a few requests went into the next bin and the bars jittered while the chart
+    /// hardly moved. Now a request keeps its bin while the minute lasts, every bin steps one to
+    /// the left when it turns, and the rates are still the last 60 minutes to the second.
+    #[test]
+    fn burn_bins_are_clock_minutes() {
+        use crate::core::pricing::PriceBook;
+        use crate::index::scenarios::{World, assistant, owner};
+        // A whole minute in the past, so every request below is too.
+        let base = burn_start(Utc::now()) + Duration::minutes(50);
+        assert_eq!(burn_start(base), base - Duration::minutes(60));
+        let at = |id: &str, t: DateTime<Utc>| {
+            let t = t.to_rfc3339();
+            assistant(id, &t, "claude-sonnet-5-5", "/w/shop", (20_000, 2_000), &[])
+        };
+        let w = World::new(&["work"]);
+        // Three requests of the same size, so of the same cost c.
+        let early = base - Duration::minutes(60) + Duration::seconds(30);
+        let mid = base - Duration::minutes(30) + Duration::seconds(10);
+        let late = base - Duration::minutes(2) + Duration::seconds(50);
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                at("m1", early),
+                at("m2", mid),
+                at("m3", late),
+            ],
+        );
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let procs = crate::procs::ProcTable::empty();
+        let opts = Options::default();
+        let snap = |now: DateTime<Utc>| {
+            let s = build(&idx, &[], &procs, &opts, now, None, &mut Reads::default()).unwrap();
+            assert_eq!(s.burn.len(), 1, "one model");
+            let bins = s.burn.values().next().unwrap().clone();
+            assert_eq!(bins.len(), BURN_MINUTES);
+            (bins, s.burn_per_hour)
+        };
+        let lit =
+            |bins: &[f64]| -> Vec<usize> { (0..bins.len()).filter(|i| bins[*i] > 0.0).collect() };
+        let (a, rate_a) = snap(base + Duration::seconds(5));
+        let (b, rate_b) = snap(base + Duration::seconds(45));
+        let (c, _) = snap(base + Duration::seconds(60));
+        // From base − 60 min: early (+30 s) in bin 0, mid (+30 min 10 s) in 30, late
+        // (+58 min 50 s) in 58.
+        assert_eq!(lit(&a), vec![0, 30, 58]);
+        assert_eq!(a, b, "the bins stay put within the minute");
+        // From base − 59 min: early is out of the chart, the others one bin to the left.
+        assert_eq!(lit(&c), vec![29, 57]);
+        assert_eq!(c[29], a[30]);
+        // At :05 the hour reaches back to base − 60 min + 5 s and holds early (at +30 s); at :45
+        // it no longer does: 3c, then 2c.
+        let cost = a[30];
+        assert!(cost > 0.0);
+        assert!(
+            (rate_a - 3.0 * cost).abs() < 1e-12,
+            "{rate_a} vs 3 × {cost}"
+        );
+        assert!(
+            (rate_b - 2.0 * cost).abs() < 1e-12,
+            "{rate_b} vs 2 × {cost}"
+        );
+        assert!((burn_offset(base + Duration::seconds(45)) - 0.75).abs() < 1e-9);
+        assert_eq!(burn_offset(base), 0.0);
     }
 
     /// Review L7: a session that shows up between two heavy ticks has its spend at once.
