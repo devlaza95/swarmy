@@ -1,6 +1,7 @@
 //! Terminal output shared by the commands and the dashboard: colours, number formats, tables, bars.
 
 pub mod fmt;
+pub mod glossary;
 pub mod mask;
 pub mod style;
 pub mod table;

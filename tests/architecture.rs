@@ -299,7 +299,7 @@ fn counts() -> BTreeMap<&'static str, usize> {
         // is an input there, so a pass reads one instant and tests can fix it.
         if !matches!(
             m.as_str(),
-            "app" | "cli" | "tui" | "main" | "demo" | "statusline"
+            "app" | "cli" | "tui" | "web" | "main" | "demo" | "statusline"
         ) {
             *c.entry("clock_reads_below_front_ends").or_default() +=
                 n("Utc::now()") + n("Local::now()");

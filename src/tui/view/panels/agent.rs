@@ -10,6 +10,7 @@ use ratatui::widgets::canvas::{Canvas, Line as CLine};
 
 use super::{dim, faint};
 use crate::core::models::{context_window, short_name};
+use crate::live::State;
 use crate::tui::app::{App, Panel};
 use crate::tui::view::kit::*;
 use crate::ui::fmt;
@@ -66,7 +67,7 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
             },
         )
     } else {
-        let ch = 13.min(inner.height);
+        let ch = 17.min(inner.height);
         (
             Rect {
                 height: ch,
@@ -93,6 +94,23 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(a.name.clone(), th.bold(th.fg)),
     ])];
     lines.push(kv("state", activity(&a.state), th.state(&a.state)));
+    if let Some(mut h) = a
+        .state
+        .hint(a.is_main(), &fmt::duration(now - a.last_activity))
+    {
+        // Only the dashboard can jump there.
+        if matches!(a.state, State::NeedsYou(_)) {
+            h.push_str(if a.pane.is_some() {
+                " · J jumps to its terminal"
+            } else {
+                " · switch to its terminal"
+            });
+        }
+        lines.push(Line::from(vec![
+            Span::styled(fit("", kw), faint(app)),
+            Span::styled(h, dim(app)),
+        ]));
+    }
     lines.push(kv(
         "since",
         format!(
@@ -176,6 +194,16 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         format!("{} · {} requests", fmt::usd(a.cost), fmt::count(a.requests))
     };
     lines.push(kv("cost", cost, th.fg));
+    lines.push(kv(
+        "last seen",
+        format!(
+            "{} ago · {} request{}",
+            fmt::duration(now - a.last_activity),
+            fmt::count(a.requests),
+            if a.requests == 1 { "" } else { "s" }
+        ),
+        th.fg,
+    ));
     let win = a.model.as_deref().map(context_window).unwrap_or(1_000_000);
     let frac = a.context_tokens as f64 / win as f64;
     let mut ctx = vec![Span::styled(fit("context", kw), faint(app))];
@@ -186,10 +214,28 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         &th,
     ));
     ctx.push(Span::styled(
-        format!(" {} of {}", fmt::tokens(a.context_tokens), fmt::tokens(win)),
+        format!(
+            " {} of {}{}",
+            fmt::tokens(a.context_tokens),
+            fmt::tokens(win),
+            if frac >= 0.8 { " · filling up" } else { "" }
+        ),
         dim(app),
     ));
     lines.push(Line::from(ctx));
+    if a.is_main()
+        && let Some(pid) = a.pid
+    {
+        lines.push(kv(
+            "process",
+            format!(
+                "pid {pid} · cpu {:.0}% · {} MB with its children",
+                a.cpu,
+                a.memory / 1_048_576
+            ),
+            th.fg,
+        ));
+    }
     if let Some(p) = &a.pane {
         lines.push(kv(
             p.terminal(),

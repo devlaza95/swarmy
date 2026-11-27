@@ -26,3 +26,4 @@ pub(crate) mod terminal;
 pub(crate) mod tui;
 pub(crate) mod ui;
 pub(crate) mod vault;
+pub(crate) mod web;

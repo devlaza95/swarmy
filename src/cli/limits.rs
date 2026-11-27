@@ -4,10 +4,9 @@
 use chrono::Local;
 
 use crate::app::context::Ctx;
-use crate::core::ids::ProjectKey;
 use crate::core::limits::Share;
 use crate::core::units::{Pct, Usd};
-use crate::limits::{WindowReport, all_reports};
+use crate::limits::WindowReport;
 use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
@@ -16,21 +15,7 @@ use super::Format;
 
 pub fn run(ctx: &Ctx, format: Format, top: usize) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
-    let mut reports = all_reports(&ctx.limits_inputs(&idx)?, &idx)?;
-    if ctx.mask {
-        // The analysis is unmasked; what is printed is masked here. Shares name projects by
-        // their dir: the last component only.
-        for r in &mut reports {
-            r.name = ctx.shown_account_name(r.account.as_str());
-            for w in &mut r.windows {
-                w.reference = w.reference_id.as_deref().map(|a| ctx.shown_account_name(a));
-                for s in &mut w.shares {
-                    s.project = ProjectKey::from_stored(ctx.show_path(s.project.as_str()));
-                    s.name = ctx.show_path(&s.name);
-                }
-            }
-        }
-    }
+    let reports = ctx.limit_reports(&idx)?;
     if format == Format::Json {
         println!("{}", serde_json::to_string_pretty(&reports)?);
         return Ok(());

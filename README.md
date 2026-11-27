@@ -24,6 +24,11 @@ swarmy is an observer, not a launcher: it never starts, prompts or controls an a
 your agents the way you do now (plain terminals, tmux, [herdr](#how-it-compares), claude-squad,
 worktrees) and put swarmy in a spare terminal next to them.
 
+New here? Run `swarmy guide` for a five-minute tour, `swarmy explain <word>` for what any word
+or glyph on screen means, or `swarmy web --demo` to look around in a browser on made-up data
+(`swarmy web` on your own, loopback only and read-only). How the numbers are built from Claude
+Code's files is in [docs/GUIDE.md](docs/GUIDE.md).
+
 <p align="center">
   <img src="docs/img/boot.gif" width="812" alt="swarmy starting up: the swarm assembles into the dashboard">
 </p>

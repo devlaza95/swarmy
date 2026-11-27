@@ -30,6 +30,21 @@ pub enum State {
 }
 
 impl State {
+    /// One plain line for the states that ask something of you or say why nothing moves; the
+    /// busy states (a tool running, the model thinking) explain themselves and get none.
+    /// `quiet_for` is the time since the last activity, already formatted by the front end.
+    pub fn hint(&self, is_main: bool, quiet_for: &str) -> Option<String> {
+        match self {
+            State::NeedsYou(_) => Some("waiting for you".into()),
+            State::Stalled => Some(format!("no activity for {quiet_for} · check its terminal")),
+            State::Idle if is_main => Some("waiting for your next prompt".into()),
+            State::Idle => Some("between steps".into()),
+            State::Done => Some("finished its task".into()),
+            State::Gone => Some("the Claude Code process has exited".into()),
+            State::Tool { .. } | State::Thinking | State::WaitingAgents(_) => None,
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         matches!(
             self,
@@ -438,5 +453,40 @@ mod tests {
             );
             assert_eq!(got, want.map(|(s, at)| (s, t(at))), "{name}");
         }
+    }
+
+    #[test]
+    fn a_hint_says_what_the_waiting_agent_needs() {
+        assert_eq!(
+            State::NeedsYou("permission".into())
+                .hint(true, "1m")
+                .as_deref(),
+            Some("waiting for you")
+        );
+        let stalled = State::Stalled.hint(true, "25m").unwrap_or_default();
+        assert!(stalled.contains("25m"), "{stalled}");
+    }
+
+    #[test]
+    fn busy_states_need_no_hint() {
+        assert_eq!(State::Thinking.hint(true, "0s"), None);
+        assert_eq!(State::WaitingAgents(2).hint(true, "0s"), None);
+        let tool = State::Tool {
+            name: "Bash".into(),
+            summary: "ls".into(),
+        };
+        assert_eq!(tool.hint(false, "0s"), None);
+    }
+
+    #[test]
+    fn idle_means_different_things_for_a_main_thread_and_a_subagent() {
+        assert_eq!(
+            State::Idle.hint(true, "0s").as_deref(),
+            Some("waiting for your next prompt")
+        );
+        assert_eq!(
+            State::Idle.hint(false, "0s").as_deref(),
+            Some("between steps")
+        );
     }
 }

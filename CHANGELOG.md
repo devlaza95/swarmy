@@ -3,6 +3,20 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+Plain-language help, a clearer agent card, and a browser view.
+
+- Added: `swarmy guide` (a five-minute tour), `swarmy explain <word>` (what any word or glyph
+  on screen means, from one glossary shared with the web view).
+- Added: `swarmy web [--port N] [--demo]`, a read-only browser dashboard with Live, Limits,
+  Spend and Help views. It listens on 127.0.0.1 only, answers GET only, checks the Host header
+  and rejects cross-site requests, and sends a strict Content-Security-Policy. It shows Claude
+  Code live sessions only.
+- Changed: the AGENT card says in words what its state means and what to do about it, shows
+  when the agent was last seen, and shows the Claude Code process's CPU and memory.
+- Changed: `limits` and `report` build their numbers in `app::views`, which the web view reuses.
+
 ## v0.2.8
 
 BURN moves with the clock; the HISTORY heat map reads by weekday.
