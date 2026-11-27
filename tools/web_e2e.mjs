@@ -39,6 +39,10 @@ await new Promise((r) => setTimeout(r, 3500)); // a poll happens; the row stays 
 ok('live: an open row survives the next poll', (await page.$$('tr.detail')).length === 1);
 await first.click().catch(() => {});
 
+await page.setViewport({ width: 1024, height: 900 });
+await new Promise((r) => setTimeout(r, 300));
+const mid = await page.evaluate(() => { const b = document.querySelector('table').parentElement; return b.scrollWidth <= b.clientWidth + 1; });
+ok('1024px: all visible columns fit without scrolling', mid);
 await page.setViewport({ width: 780, height: 900 });
 await new Promise((r) => setTimeout(r, 300));
 const narrow = await page.evaluate(() => {
