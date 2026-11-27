@@ -167,9 +167,9 @@ function agentRows(a) {
     h('tr', { class: a.main ? 'main' : 'sub' },
       h('td', {}, stateCell(a)),
       h('td', { class: 'clip' }, lead),
-      h('td', { class: 'clip' }, a.project),
-      h('td', {}, a.model ? `${a.model}${a.effort ? ' ' + a.effort : ''}` : '-'),
-      h('td', { class: `clip mono${a.state === 'needs_you' ? ' warn' : ''}` }, activityText(a)),
+      h('td', { class: 'clip opt' }, a.project),
+      h('td', { class: 'nowrap' }, a.model ? `${a.model}${a.effort ? ' ' + a.effort : ''}` : '-'),
+      h('td', { class: `clip opt mono${a.state === 'needs_you' ? ' warn' : ''}` }, activityText(a)),
       h('td', { class: 'num' }, ago(a.since)),
       h('td', { class: 'num' }, pct(a.context_pct)),
       h('td', { class: 'num' }, a.unpriced ? '-' : (a.main ? 'Σ' : '') + money(a.main ? a.session_cost : a.cost))),
@@ -182,14 +182,14 @@ function agentRows(a) {
 
 function renderLive(d) {
   const waiting = d.agents.filter((a) => a.state === 'needs_you');
-  const head = (text, term) => h('th', { title: tip(term) }, text);
+  const head = (text, term, cls) => h('th', { title: tip(term), class: cls }, text);
   const headNum = (text, term) => h('th', { class: 'num', title: tip(term) }, text);
   const table = d.agents.length
-    ? h('table', {},
+    ? h('div', { class: 'scroll' }, h('table', {},
         h('thead', {}, h('tr', {},
-          head('State', 'working'), head('Agent'), head('Project', 'project'), head('Model', 'effort'),
-          head('Activity'), headNum('In state'), headNum('Context', 'context'), headNum('Cost', 'session total'))),
-        h('tbody', {}, d.agents.map(agentRows)))
+          head('State', 'working'), head('Agent'), head('Project', 'project', 'opt'), head('Model', 'effort'),
+          head('Activity', undefined, 'opt'), headNum('In state'), headNum('Context', 'context'), headNum('Cost', 'session total'))),
+        h('tbody', {}, d.agents.map(agentRows))))
     : h('p', { class: 'empty' }, 'No agents are running or were active recently. Start Claude Code in a terminal and they appear here.');
   const done = d.recent_done.slice(0, 8);
   show(
